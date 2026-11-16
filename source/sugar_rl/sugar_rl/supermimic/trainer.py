@@ -1,0 +1,779 @@
+"""Unified SuperMimic Trainer for SUGAR Stage 1 (Refiner) and Stage 2 (Tracker).
+
+Replaces:
+- Stage 1 RSL-RL `OnPolicyRunner` (PPO) -> `SuperMimicTrainer` (stage="refiner")
+- Stage 2 SUGAR `BCPPO` -> `SuperMimicTrainer` (stage="tracker" + annealed Refiner-Teacher BC in imagination)
+
+Algorithm per iteration:
+1. Collect `steps_per_env` (default 24) transitions in IsaacLab (mixed deterministic + exploratory envs),
+   pushing transitions into GPU `HOIReplayBuffer` (preserving true `ep_id` while flagging reset/push breaks)
+   and building GAE(gamma, lam) targets with exact current-step timeout value bootstrap.
+2. Train `JointWorldModel` via `k=8`-step autoregressive rollout (local state Huber loss + contact BCE).
+3. Train `SuperMimicCritic` ensemble on real simulator TD(lambda) targets (zero model value bias).
+4. Train `SuperMimicPolicy` via `H=32`-step differentiable rollout through frozen `JointWorldModel`
+   + analytical SUGAR human-object rewards (aligned with `ref[t_cur]`) + smooth soft terminations
+   + value-clipped frozen `SuperMimicCritic` tail bootstrap (+ annealed Teacher BC in Tracker mode).
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+from .hoi_task import (
+    PRIVILEGED_OBS_DIM,
+    TRACKER_OBS_DIM,
+    resolve_task_profile,
+)
+from .networks import JointWorldModel, SuperMimicCritic, SuperMimicPolicy
+from .replay import HOIReplayBuffer
+
+
+@dataclass
+class SuperMimicTrainCfg:
+    """Hyperparameters for SuperMimic x SUGAR training (PyTorch 2.7 compatible)."""
+
+    stage: str = "auto"                              # "auto" | "refiner" | "tracker"
+    steps_per_env: int = 24                          # Matches SUGAR num_steps_per_env=24 for 1:1 iteration parity
+    replay_capacity: int = 256                       # Ring buffer length per env on GPU (256 * 2048 ~= 524k steps)
+    collect_det_frac: float = 0.25                   # First 25% envs run deterministic actions (protects init_pool)
+
+    # World model settings
+    wm_hidden_dims: tuple[int, ...] = (512, 512, 512)
+    wm_seq_len: int = 8                              # Autoregressive unroll horizon k for world model training
+    wm_updates_per_iter: int = 8
+    wm_batch_size: int = 1024
+    wm_lr: float = 1e-3
+    wm_contact_loss_weight: float = 0.2
+    wm_obj_loss_weight: float = 1.5
+    wm_warmup_iters: int = 8                         # Fit WM & Critic (and pure BC if Tracker) before enabling BPTT
+
+    # Policy BPTT settings
+    policy_hidden_dims: tuple[int, ...] = (512, 256, 128)
+    use_ref_residual: bool = True
+    init_noise_std: float = 0.20
+    imagination_horizon: int = 32                    # H=32 step differentiable imagination rollout
+    policy_updates_per_iter: int = 4
+    policy_batch_size: int = 512
+    policy_lr: float = 3e-4
+    bptt_grad_decay: float = 0.98                    # Mild state Jacobian damping across 32 steps for stability
+    entropy_coef: float = 1e-3
+    value_clip_range: tuple[float, float] = (-25.0, 15.0)  # Protects long BPTT runs from OOD critic spikes
+
+    # Critic TD(lambda) settings
+    critic_hidden_dims: tuple[int, ...] = (512, 256, 128)
+    critic_heads: int = 2
+    critic_epochs: int = 4
+    critic_minibatches: int = 4
+    critic_lr: float = 5e-4
+    gamma: float = 0.99
+    lam: float = 0.95
+
+    # Stage 2 Tracker Teacher-BC distillation settings (replaces BCPPO)
+    bc_init_coef: float = 1.0
+    bc_min_coef: float = 0.05
+    bc_anneal_iters: int = 3500                      # Reaches bc_min_coef at 70% of standard 5001-iter run
+
+    # Checkpointing & logging
+    max_grad_norm: float = 1.0
+    save_interval: int = 500
+    enable_tensorboard: bool = True
+    compile_models: bool = False                     # Optional torch.compile; False by default for IsaacSim safety
+    compile_backend: str = "inductor"                # Backend passed to `torch.compile` when `compile_models=True`
+
+
+def _unwrap_compiled(module: nn.Module) -> nn.Module:
+    """Return underlying `nn.Module` if wrapped by `torch.compile` (`OptimizedModule`)."""
+    return getattr(module, "_orig_mod", module)
+
+
+def _strip_compiled_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Strip `_orig_mod.` prefix from state_dict keys so compiled & eager checkpoints interoperate."""
+    return {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+
+
+def load_supermimic_policy(
+    ckpt_path: str | Path, device: torch.device | str = "cuda"
+) -> SuperMimicPolicy:
+    """Load a self-contained `SuperMimicPolicy` from a saved `.pt` checkpoint for inference or Teacher BC."""
+    payload = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+    if not isinstance(payload, dict) or "policy_state_dict" not in payload:
+        raise ValueError(
+            f"Checkpoint '{ckpt_path}' is not a SuperMimic checkpoint (missing 'policy_state_dict')."
+        )
+    policy = SuperMimicPolicy(
+        obs_dim=int(payload["obs_dim"]),
+        action_dim=int(payload.get("action_dim", 29)),
+        hidden_dims=tuple(payload.get("hidden_dims", (512, 256, 128))),
+        use_ref_residual=bool(payload.get("use_ref_residual", True)),
+    ).to(device)
+    policy.load_state_dict(_strip_compiled_prefix(payload["policy_state_dict"]))
+    if "joint_names" in payload and payload["joint_names"] is not None:
+        policy.joint_names = list(payload["joint_names"])
+    policy.eval()
+    for p in policy.parameters():
+        p.requires_grad_(False)
+    return policy
+
+
+def _freeze_params(module: nn.Module, freeze: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad_(not freeze)
+
+
+class SuperMimicTrainer:
+    """End-to-end Model-Based BPTT trainer for SUGAR Refiner and Tracker stages."""
+
+    def __init__(
+        self,
+        bridge: Any,
+        log_dir: str | Path,
+        cfg: SuperMimicTrainCfg | None = None,
+        teacher_ckpt: str | Path | None = None,
+    ) -> None:
+        self.bridge = bridge
+        self.task = bridge.task
+        self.fk = bridge.fk
+        self.device = bridge.device
+        self.num_envs = bridge.num_envs
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.cfg = cfg or SuperMimicTrainCfg()
+
+        # Auto-detect Refiner vs Tracker strictly from policy observation dimension
+        obs_policy_sample = bridge.current_obs_dict["policy"]
+        policy_obs_dim = int(obs_policy_sample.shape[-1])
+        if self.cfg.stage == "auto":
+            if policy_obs_dim == TRACKER_OBS_DIM:
+                self.stage = "tracker"
+            elif policy_obs_dim == PRIVILEGED_OBS_DIM:
+                self.stage = "refiner"
+                if teacher_ckpt is not None:
+                    print(
+                        f"[SuperMimic Trainer] WARNING: Ignoring `--teacher_ckpt={teacher_ckpt}` "
+                        f"because policy obs dim is {policy_obs_dim} (Stage 1 Refiner mode)."
+                    )
+            else:
+                raise ValueError(
+                    f"Unsupported policy observation dim {policy_obs_dim}; "
+                    f"expected {PRIVILEGED_OBS_DIM} (Refiner) or {TRACKER_OBS_DIM} (Tracker)."
+                )
+        else:
+            self.stage = self.cfg.stage
+
+        # Ensure stage-dependent reward profile nuances (e.g. PushBox Tracker) match even on mock bridges
+        if getattr(self.bridge, "env", None) is None or getattr(self.bridge.env, "reward_manager", None) is None:
+            stage_prof = resolve_task_profile(self.task.profile.task_name, stage=self.stage)
+            self.task.profile.undesired_weight = stage_prof.undesired_weight
+            self.task.profile.undesired_threshold = stage_prof.undesired_threshold
+
+        critic_obs_dim = int(bridge.current_obs_dict.get("critic", obs_policy_sample).shape[-1])
+        assert (
+            critic_obs_dim == PRIVILEGED_OBS_DIM
+        ), f"Expected {PRIVILEGED_OBS_DIM}-D critic obs, got {critic_obs_dim}"
+
+        # Joint error-propagation weights from G1 kinematic tree
+        self.joint_weights = self.fk.compute_joint_weights().to(self.device)
+
+        # Build World Model, Actor, Critic (retaining uncompiled references for clean attribute/checkpoint access)
+        self._raw_world_model = JointWorldModel(hidden_dims=self.cfg.wm_hidden_dims).to(self.device)
+        self._raw_policy = SuperMimicPolicy(
+            obs_dim=policy_obs_dim,
+            action_dim=29,
+            hidden_dims=self.cfg.policy_hidden_dims,
+            default_joint_pos=self.fk.default_joint_pos,
+            action_scale=self.fk.action_scale,
+            use_ref_residual=self.cfg.use_ref_residual,
+            init_std=self.cfg.init_noise_std,
+        ).to(self.device)
+        self._raw_critic = SuperMimicCritic(
+            obs_dim=critic_obs_dim,
+            hidden_dims=self.cfg.critic_hidden_dims,
+            num_heads=self.cfg.critic_heads,
+        ).to(self.device)
+
+        self.world_model: nn.Module = self._raw_world_model
+        self.policy: nn.Module = self._raw_policy
+        self.critic: nn.Module = self._raw_critic
+
+        # Optional frozen Refiner Teacher for Stage 2 Tracker distillation
+        self.teacher_policy: SuperMimicPolicy | None = None
+        if self.stage == "tracker" and teacher_ckpt is not None:
+            print(f"[SuperMimic Trainer] Loading frozen Refiner Teacher from: {teacher_ckpt}")
+            self.teacher_policy = load_supermimic_policy(teacher_ckpt, device=self.device)
+
+        if self.cfg.compile_models and hasattr(torch, "compile"):
+            self._raw_world_model.enable_compile(backend=self.cfg.compile_backend)
+            self._raw_policy.enable_compile(backend=self.cfg.compile_backend)
+            self._raw_critic.enable_compile(backend=self.cfg.compile_backend)
+
+        self.wm_opt = torch.optim.AdamW(self._raw_world_model.parameters(), lr=self.cfg.wm_lr, weight_decay=1e-5)
+        self.policy_opt = torch.optim.AdamW(self._raw_policy.parameters(), lr=self.cfg.policy_lr, weight_decay=1e-5)
+        self.critic_opt = torch.optim.AdamW(self._raw_critic.parameters(), lr=self.cfg.critic_lr, weight_decay=1e-5)
+
+        # GPU Ring Replay Buffer + Domain Randomization Context xi
+        self.replay = HOIReplayBuffer(
+            capacity=self.cfg.replay_capacity,
+            num_envs=self.num_envs,
+            device=self.device,
+        )
+        self.replay.set_env_xi(self.bridge.extract_xi())
+
+        # Monotonic GPU episode continuity counter per env (zero CPU-GPU syncs)
+        self._ep_step_counter: int = 0
+        self._env_index_vec = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
+        self.env_ep_ids = self._env_index_vec.clone()
+        self.det_env_count = int(self.num_envs * self.cfg.collect_det_frac)
+
+        # Optional TensorBoard writer
+        self.tb_writer = None
+        if self.cfg.enable_tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+
+                self.tb_writer = SummaryWriter(log_dir=str(self.log_dir), flush_secs=10)
+                print(f"[SuperMimic Trainer] TensorBoard logging enabled -> {self.log_dir}")
+            except Exception as exc:
+                print(f"[SuperMimic Trainer] WARNING: TensorBoard disabled ({exc})")
+                self.tb_writer = None
+
+        self.current_iter: int = 0
+
+    def current_bc_coef(self, iteration: int) -> float:
+        if self.teacher_policy is None:
+            return 0.0
+        progress = min(1.0, float(iteration) / max(1, self.cfg.bc_anneal_iters))
+        coef = self.cfg.bc_init_coef * (1.0 - progress) + self.cfg.bc_min_coef * progress
+        return float(max(self.cfg.bc_min_coef, coef))
+
+    # ------------------------------------------------------------------
+    # Phase 1: Real Environment Rollout Collection
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def collect_rollout(self) -> tuple[Tensor, Tensor, dict[str, float]]:
+        """Collect `steps_per_env` transitions and compute GAE returns for Critic."""
+        T = self.cfg.steps_per_env
+        N = self.num_envs
+        get_air_fn = getattr(self.bridge, "get_feet_air_time", None)
+
+        critic_obs_buf = torch.empty((T, N, PRIVILEGED_OBS_DIM), dtype=torch.float32, device=self.device)
+        rewards_buf = torch.empty((T, N), dtype=torch.float32, device=self.device)
+        dones_buf = torch.empty((T, N), dtype=torch.bool, device=self.device)
+        values_buf = torch.empty((T, N), dtype=torch.float32, device=self.device)
+
+        for t in range(T):
+            obs_dict = self.bridge.current_obs_dict
+            obs_pol = obs_dict["policy"]
+            obs_crit = obs_dict.get("critic", obs_pol)
+
+            s_pre = self.bridge.get_joint_state()
+            prev_act = self.bridge.get_last_action()
+            m_id, t_step = self.bridge.get_motion_cursor()
+            feet_air = get_air_fn() if callable(get_air_fn) else None
+
+            # Update running normalizers with fresh on-policy simulator observations
+            self._raw_policy.obs_rms.update(obs_pol)
+            v_pred = self.critic(obs_crit, update_rms=True, pessimistic=False)
+
+            # Mixed deterministic + stochastic exploration (protects first 25% init_pool envs)
+            act_stoch, act_det = self._raw_policy.act(obs_pol, deterministic=False, update_rms=False)
+            if self.det_env_count > 0:
+                action = torch.cat([act_det[: self.det_env_count], act_stoch[self.det_env_count :]], dim=0)
+            else:
+                action = act_stoch
+
+            _, sim_rew, dones, timeouts, pushed, _ = self.bridge.step(action)
+            s_post = self.bridge.get_joint_state()
+            contacts = self.bridge.get_ground_truth_contacts()
+
+            # Bootstrap timeout terminations using CURRENT step value `v_pred` ( matching RSL-RL;
+            # `next_obs_dict` for reset envs already belongs to the newly reset episode!)
+            if timeouts.any():
+                sim_rew = sim_rew + self.cfg.gamma * v_pred * timeouts.float()
+
+            # Preserve true episode ID of `s_pre` for 5-frame history, while marking broken transitions
+            valid_trans = ~(dones | pushed)
+            self.replay.add(
+                state=s_pre,
+                action=action,
+                prev_action=prev_act,
+                next_state=s_post,
+                contact=contacts,
+                motion_id=m_id,
+                time_step=t_step,
+                ep_id=self.env_ep_ids,
+                valid_transition=valid_trans,
+                feet_air_time=feet_air,
+            )
+
+            # Advance episode IDs ONLY for environments that actually reset (`dones`), with zero GPU-CPU sync
+            self._ep_step_counter += N
+            self.env_ep_ids = torch.where(dones, self._env_index_vec + self._ep_step_counter, self.env_ep_ids)
+
+            critic_obs_buf[t].copy_(obs_crit)
+            rewards_buf[t].copy_(sim_rew)
+            dones_buf[t].copy_(dones)
+            values_buf[t].copy_(v_pred)
+
+        # Compute GAE(gamma, lambda) returns for Critic training
+        last_obs_crit = self.bridge.current_obs_dict.get("critic", self.bridge.current_obs_dict["policy"])
+        next_value = self.critic(last_obs_crit, update_rms=False, pessimistic=False)
+
+        advantages = torch.zeros_like(rewards_buf)
+        gae = torch.zeros(N, dtype=torch.float32, device=self.device)
+        for t in reversed(range(T)):
+            not_done = (~dones_buf[t]).float()
+            v_next = next_value if t == T - 1 else values_buf[t + 1]
+            delta = rewards_buf[t] + self.cfg.gamma * v_next * not_done - values_buf[t]
+            gae = delta + self.cfg.gamma * self.cfg.lam * not_done * gae
+            advantages[t] = gae
+
+        returns_buf = advantages + values_buf
+        stats = {
+            "collect/sim_step_reward": float(rewards_buf.mean().item()),
+            "collect/reset_rate": float(dones_buf.float().mean().item()),
+        }
+        return critic_obs_buf.reshape(T * N, -1), returns_buf.reshape(T * N), stats
+
+    # ------------------------------------------------------------------
+    # Phase 2: Autoregressive Joint World Model Update
+    # ------------------------------------------------------------------
+
+    def update_world_model(self) -> dict[str, float]:
+        if self.replay.size < 2:
+            return {}
+
+        self.world_model.train()
+        agg_tensors: dict[str, Tensor] = {}
+        k_req = self.cfg.wm_seq_len
+        actual_updates = 0
+
+        for _ in range(self.cfg.wm_updates_per_iter):
+            batch = self.replay.sample_wm_sequences(self.cfg.wm_batch_size, seq_len=k_req)
+            if batch is None:
+                continue
+            eff_k = int(batch.actions.shape[1])
+            s_cur = batch.s_init
+            loss_state_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+            loss_contact_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+            last_metrics: dict[str, Tensor] = {}
+
+            for t in range(eff_k):
+                s_cur, c_logits = self._raw_world_model.step(
+                    self.task,
+                    s_cur,
+                    batch.actions[:, t],
+                    batch.xi,
+                    update_rms=(t == 0),
+                )
+                l_s, last_metrics = self.task.world_model_state_loss(
+                    s_cur,
+                    batch.next_states[:, t],
+                    self.joint_weights,
+                    obj_loss_weight=self.cfg.wm_obj_loss_weight,
+                )
+                l_c = F.binary_cross_entropy_with_logits(c_logits, batch.contacts[:, t])
+                loss_state_sum = loss_state_sum + l_s
+                loss_contact_sum = loss_contact_sum + l_c
+
+            total_loss = (loss_state_sum + self.cfg.wm_contact_loss_weight * loss_contact_sum) / float(eff_k)
+
+            self.wm_opt.zero_grad(set_to_none=True)
+            total_loss.backward()
+            grad_norm = nn.utils.clip_grad_norm_(self._raw_world_model.parameters(), self.cfg.max_grad_norm)
+            if torch.isfinite(grad_norm):
+                self.wm_opt.step()
+
+            actual_updates += 1
+            agg_tensors["wm/total_loss"] = agg_tensors.get(
+                "wm/total_loss", torch.zeros_like(total_loss)
+            ) + total_loss.detach()
+            c_avg = (loss_contact_sum / float(eff_k)).detach()
+            agg_tensors["wm/contact_bce"] = agg_tensors.get("wm/contact_bce", torch.zeros_like(c_avg)) + c_avg
+            for key, val in last_metrics.items():
+                agg_tensors[key] = agg_tensors.get(key, torch.zeros_like(val)) + val
+
+        if actual_updates == 0:
+            return {}
+        denom = float(actual_updates)
+        return {key: float((val / denom).item()) for key, val in agg_tensors.items()}
+
+    # ------------------------------------------------------------------
+    # Phase 3: Ensemble Critic Update
+    # ------------------------------------------------------------------
+
+    def update_critic(self, critic_obs_flat: Tensor, returns_flat: Tensor) -> dict[str, float]:
+        self.critic.train()
+        total_samples = critic_obs_flat.shape[0]
+        mb_size = max(64, total_samples // self.cfg.critic_minibatches)
+        loss_accum = torch.zeros((), dtype=torch.float32, device=self.device)
+        n_steps = 0
+
+        for _ in range(self.cfg.critic_epochs):
+            perm = torch.randperm(total_samples, device=self.device)
+            for start in range(0, total_samples, mb_size):
+                idx = perm[start : start + mb_size]
+                obs_mb = critic_obs_flat[idx]
+                ret_mb = returns_flat[idx]
+
+                preds = self._raw_critic.forward_all(obs_mb, update_rms=False)  # (H_heads, B)
+                target = ret_mb.unsqueeze(0).expand_as(preds)
+                loss = F.smooth_l1_loss(preds, target, beta=1.0)
+
+                self.critic_opt.zero_grad(set_to_none=True)
+                loss.backward()
+                grad_norm = nn.utils.clip_grad_norm_(self._raw_critic.parameters(), self.cfg.max_grad_norm)
+                if torch.isfinite(grad_norm):
+                    self.critic_opt.step()
+
+                loss_accum = loss_accum + loss.detach()
+                n_steps += 1
+
+        return {"critic/loss": float((loss_accum / float(max(1, n_steps))).item())}
+
+    # ------------------------------------------------------------------
+    # Phase 4: 32-Step Differentiable World-Model BPTT (+ Tracker BC)
+    # ------------------------------------------------------------------
+
+    def update_policy(self, iteration: int) -> dict[str, float]:
+        if self.replay.size < 2:
+            return {}
+
+        warmup_only = iteration < self.cfg.wm_warmup_iters
+        if warmup_only and self.teacher_policy is None:
+            return {"policy/warmup_skip": 1.0}
+
+        self.policy.train()
+        self.world_model.eval()
+        self.critic.eval()
+        _freeze_params(self._raw_world_model, True)
+        _freeze_params(self._raw_critic, True)
+
+        is_tracker = self.stage == "tracker"
+        bc_coef = self.current_bc_coef(iteration)
+        H = 1 if warmup_only else self.cfg.imagination_horizon
+        v_min, v_max = self.cfg.value_clip_range
+
+        ret_accum = torch.zeros((), dtype=torch.float32, device=self.device)
+        bc_accum = torch.zeros((), dtype=torch.float32, device=self.device)
+        surv_accum = torch.zeros((), dtype=torch.float32, device=self.device)
+        obj_rew_accum = torch.zeros((), dtype=torch.float32, device=self.device)
+
+        try:
+            for _ in range(self.cfg.policy_updates_per_iter):
+                starts = self.replay.sample_imagination_starts(
+                    self.cfg.policy_batch_size, need_history=is_tracker
+                )
+                B = starts.states.shape[0]
+                s_cur = starts.states
+                prev_a = starts.prev_actions
+                m_ids = starts.motion_ids
+                t_0 = starts.time_steps
+                xi = starts.xi
+                feet_air_cur = starts.feet_air_time
+                prev_feet_gnd: Tensor | None = None
+
+                hist_cur = (
+                    self.task.init_tracker_history_from_states(
+                        starts.hist_states, starts.hist_last_actions, xi=xi
+                    )
+                    if is_tracker
+                    else None
+                )
+
+                imagined_return = torch.zeros(B, dtype=torch.float32, device=self.device)
+                bc_loss_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+                discount_weight = torch.ones(B, dtype=torch.float32, device=self.device)
+                step_obj_rew_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+
+                for tau in range(H):
+                    t_cur = t_0 + tau
+                    fk_cur = self.task.run_fk(s_cur)
+                    ref_cur = self.bridge.motion_ref.get_frame(m_ids, t_cur)
+
+                    if is_tracker:
+                        cmd_36 = ref_cur.tracker_command_36()
+                        obs_pol = self.task.build_tracker_obs(
+                            s_cur, cmd_36, hist_cur, fk_res=fk_cur, add_noise=True
+                        )
+                    else:
+                        ref_fut_cur = self.bridge.motion_ref.get_future_window(m_ids, t_cur)
+                        obs_pol = self.task.build_privileged_obs(
+                            s_cur, prev_a, ref_fut_cur, fk_res=fk_cur, xi=xi
+                        )
+
+                    a_cur, a_mean = self._raw_policy.act(obs_pol, deterministic=False, update_rms=False)
+
+                    # Stage 2 Teacher Distillation in Imagination (SuperMimic Refiner -> SuperMimic Tracker)
+                    if self.teacher_policy is not None:
+                        t_ref_adapter = self.bridge.teacher_motion_ref or self.bridge.motion_ref
+                        teacher_fut = t_ref_adapter.get_future_window(m_ids, t_cur)
+                        with torch.no_grad():
+                            obs_teacher = self.task.build_privileged_obs(
+                                s_cur, prev_a, teacher_fut, fk_res=fk_cur, xi=xi
+                            )
+                            a_teacher = self.teacher_policy.act_inference(obs_teacher)
+                        step_bc = ((a_mean - a_teacher) ** 2).mean(dim=-1)
+                        bc_loss_sum = bc_loss_sum + (discount_weight.detach() * step_bc).mean()
+
+                    if warmup_only:
+                        break
+
+                    # Differentiable 1-step human-object rollout
+                    s_next, c_logits = self._raw_world_model.step(
+                        self.task, s_cur, a_cur, xi, fk_res=fk_cur, update_rms=False
+                    )
+                    fk_next = self.task.run_fk(s_next)
+
+                    # Evaluate `s_next` against `ref_cur = ref[t_cur]` (exact SUGAR post-step reward/term order)
+                    r_step, p_term, r_info = self.task.compute_reward_and_termination(
+                        s_prev=s_cur,
+                        s_next=s_next,
+                        raw_action=a_cur,
+                        prev_raw_action=prev_a,
+                        ref_cur=ref_cur,
+                        contact_logits=c_logits,
+                        fk_next=fk_next,
+                        xi=xi,
+                        feet_air_time=feet_air_cur,
+                        prev_feet_gnd=prev_feet_gnd,
+                        time_steps=t_cur,
+                    )
+                    step_obj_rew_sum = step_obj_rew_sum + r_info["rew/tracking_obj"].mean()
+                    feet_air_cur = r_info["next_feet_air_time"]
+                    prev_feet_gnd = r_info["curr_feet_gnd"]
+
+                    t_next = t_cur + 1
+                    traj_done = self.bridge.motion_ref.is_done(m_ids, t_next)
+                    imagined_return = imagined_return + discount_weight * r_step
+
+                    # If reference clip finishes naturally (`t_cur + 1 >= len`), value-clipped bootstrap
+                    if traj_done.any():
+                        ref_fut_done = self.bridge.motion_ref.get_future_window(m_ids, t_next)
+                        obs_crit_done = self.task.build_privileged_obs(
+                            s_next, a_cur, ref_fut_done, fk_res=fk_next, xi=xi
+                        )
+                        v_done = self.critic(obs_crit_done, update_rms=False, pessimistic=True).clamp(v_min, v_max)
+                        imagined_return = (
+                            imagined_return
+                            + discount_weight * self.cfg.gamma * (1.0 - p_term) * v_done * traj_done.float()
+                        )
+
+                    discount_weight = (
+                        discount_weight
+                        * self.cfg.gamma
+                        * (1.0 - p_term)
+                        * (~traj_done).float()
+                    )
+
+                    if is_tracker:
+                        hist_cur = self.task.advance_tracker_history(hist_cur, s_next, a_cur, xi=xi)
+
+                    # Mild Jacobian decay across 32 steps prevents exploding gradients
+                    alpha = self.cfg.bptt_grad_decay
+                    s_cur = s_next * alpha + s_next.detach() * (1.0 - alpha)
+                    prev_a = a_cur
+
+                if not warmup_only:
+                    # Value-clipped tail bootstrap V(s_H) via frozen ensemble Critic
+                    ref_fut_tail = self.bridge.motion_ref.get_future_window(m_ids, t_0 + H)
+                    obs_tail = self.task.build_privileged_obs(s_cur, prev_a, ref_fut_tail, xi=xi)
+                    v_tail = self.critic(obs_tail, update_rms=False, pessimistic=True).clamp(v_min, v_max)
+                    imagined_return = imagined_return + discount_weight * v_tail
+
+                bc_term = bc_loss_sum / float(H)
+                entropy = 0.5 * (1.0 + torch.log(2.0 * torch.pi * self._raw_policy.std() ** 2)).sum()
+
+                if warmup_only:
+                    policy_loss = bc_term
+                else:
+                    policy_loss = (
+                        -imagined_return.mean()
+                        + bc_coef * bc_term
+                        - self.cfg.entropy_coef * entropy
+                    )
+
+                self.policy_opt.zero_grad(set_to_none=True)
+                policy_loss.backward()
+                grad_norm = nn.utils.clip_grad_norm_(self._raw_policy.parameters(), self.cfg.max_grad_norm)
+                if torch.isfinite(grad_norm):
+                    self.policy_opt.step()
+
+                ret_accum = ret_accum + imagined_return.mean().detach()
+                bc_accum = bc_accum + bc_term.detach()
+                surv_accum = surv_accum + discount_weight.mean().detach()
+                obj_rew_accum = obj_rew_accum + (step_obj_rew_sum / float(max(1, H))).detach()
+        finally:
+            _freeze_params(self._raw_world_model, False)
+            _freeze_params(self._raw_critic, False)
+
+        denom = float(max(1, self.cfg.policy_updates_per_iter))
+        metrics = {
+            "policy/imagined_return": float((ret_accum / denom).item()),
+            "policy/tail_survival_weight": float((surv_accum / denom).item()),
+            "policy/imagined_obj_rew": float((obj_rew_accum / denom).item()),
+            "policy/action_std": float(self._raw_policy.std().mean().detach().item()),
+        }
+        if self.teacher_policy is not None:
+            metrics["policy/bc_loss"] = float((bc_accum / denom).item())
+            metrics["policy/bc_coef"] = bc_coef
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Checkpointing & Main Training Loop
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, path: str | Path, iteration: int) -> None:
+        raw_pol = _unwrap_compiled(self._raw_policy)
+        raw_crit = _unwrap_compiled(self._raw_critic)
+        raw_wm = _unwrap_compiled(self._raw_world_model)
+
+        # Sync latest nominal actuator buffers before saving
+        raw_pol.sync_actuator_buffers(self.fk.default_joint_pos, self.fk.action_scale)
+        payload = {
+            "format": "supermimic_sugar_v2",
+            "stage": self.stage,
+            "task_name": self.task.profile.task_name,
+            "joint_names": list(self.fk.env_joint_names),
+            "iteration": iteration,
+            "next_iteration": iteration + 1,
+            "obs_dim": raw_pol.obs_dim,
+            "action_dim": raw_pol.action_dim,
+            "hidden_dims": raw_pol.hidden_dims,
+            "use_ref_residual": raw_pol.use_ref_residual,
+            "cfg": asdict(self.cfg),
+            "policy_state_dict": _strip_compiled_prefix(raw_pol.state_dict()),
+            "critic_state_dict": _strip_compiled_prefix(raw_crit.state_dict()),
+            "world_model_state_dict": _strip_compiled_prefix(raw_wm.state_dict()),
+            "policy_opt_state_dict": self.policy_opt.state_dict(),
+            "critic_opt_state_dict": self.critic_opt.state_dict(),
+            "wm_opt_state_dict": self.wm_opt.state_dict(),
+        }
+        os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, str(path))
+
+    def load_checkpoint(self, path: str | Path) -> int:
+        payload = torch.load(str(path), map_location=self.device, weights_only=False)
+        _unwrap_compiled(self._raw_policy).load_state_dict(_strip_compiled_prefix(payload["policy_state_dict"]))
+        _unwrap_compiled(self._raw_critic).load_state_dict(_strip_compiled_prefix(payload["critic_state_dict"]))
+        _unwrap_compiled(self._raw_world_model).load_state_dict(
+            _strip_compiled_prefix(payload["world_model_state_dict"])
+        )
+        if "policy_opt_state_dict" in payload:
+            self.policy_opt.load_state_dict(payload["policy_opt_state_dict"])
+        if "critic_opt_state_dict" in payload:
+            self.critic_opt.load_state_dict(payload["critic_opt_state_dict"])
+        if "wm_opt_state_dict" in payload:
+            self.wm_opt.load_state_dict(payload["wm_opt_state_dict"])
+
+        if "next_iteration" in payload:
+            self.current_iter = int(payload["next_iteration"])
+        else:
+            self.current_iter = int(payload.get("iteration", -1)) + 1
+        return self.current_iter
+
+    def auto_resume(self) -> Path | None:
+        """Resume from `model_latest.pt` (or highest valid `model_<iter>.pt`) in `self.log_dir` if present."""
+        candidates: list[Path] = []
+        latest_p = self.log_dir / "model_latest.pt"
+        if latest_p.is_file():
+            candidates.append(latest_p)
+
+        numbered: list[tuple[int, Path]] = []
+        for p in self.log_dir.glob("model_*.pt"):
+            stem_num = p.stem.removeprefix("model_")
+            if stem_num.isdigit():
+                numbered.append((int(stem_num), p))
+        numbered.sort(key=lambda item: item[0], reverse=True)
+        candidates.extend(p for _, p in numbered)
+
+        for cand in candidates:
+            try:
+                next_it = self.load_checkpoint(cand)
+                print(f"[SuperMimic] Auto-resumed from {cand} (next_iteration={next_it})", flush=True)
+                return cand
+            except Exception as exc:
+                print(f"[SuperMimic] WARNING: Skipping unreadable checkpoint '{cand}' ({exc})", flush=True)
+        return None
+
+    def learn(self, max_iterations: int) -> Path:
+        """Run full SuperMimic training loop for `max_iterations` and save SUGAR-compatible `model_*.pt`."""
+        start_iter = self.current_iter
+        steps_per_iter = self.cfg.steps_per_env * self.num_envs
+        print(
+            f"[SuperMimic Trainer] Starting stage='{self.stage}' | task='{self.task.profile.task_name}' | "
+            f"envs={self.num_envs} | horizon={self.cfg.imagination_horizon} | "
+            f"iters={start_iter}..{max_iterations}"
+        )
+
+        last_ckpt_path = self.log_dir / f"model_{max(0, max_iterations - 1)}.pt"
+        if start_iter >= max_iterations:
+            if not last_ckpt_path.is_file():
+                self.save_checkpoint(last_ckpt_path, iteration=max(0, max_iterations - 1))
+                print(f"[SuperMimic] Saved checkpoint -> {last_ckpt_path} (iter={max(0, max_iterations - 1)})")
+            if self.tb_writer is not None:
+                self.tb_writer.flush()
+                self.tb_writer.close()
+            return last_ckpt_path
+
+        min_warmup_steps = max(self.cfg.wm_seq_len, 5)
+        if start_iter > 0 and self.replay.size < min_warmup_steps:
+            while self.replay.size < min_warmup_steps:
+                self.collect_rollout()
+
+        for it in range(start_iter, max_iterations):
+            t0 = time.perf_counter()
+            critic_obs_flat, returns_flat, c_stats = self.collect_rollout()
+            wm_stats = self.update_world_model()
+            crit_stats = self.update_critic(critic_obs_flat, returns_flat)
+            pol_stats = self.update_policy(it)
+            dt = max(1e-6, time.perf_counter() - t0)
+
+            self.current_iter = it + 1
+            total_timesteps = (it + 1) * steps_per_iter
+            fps = int(steps_per_iter / dt)
+
+            all_metrics = {**c_stats, **wm_stats, **crit_stats, **pol_stats, "perf/fps": float(fps)}
+            if self.tb_writer is not None:
+                for k, v in all_metrics.items():
+                    self.tb_writer.add_scalar(k, v, it)
+                if it % 10 == 0 or it == max_iterations - 1:
+                    self.tb_writer.flush()
+
+            if it % 10 == 0 or it == max_iterations - 1:
+                bc_str = (
+                    f" | bc={pol_stats.get('policy/bc_loss', 0.0):.4f} (w={pol_stats.get('policy/bc_coef', 0.0):.2f})"
+                    if "policy/bc_loss" in pol_stats
+                    else ""
+                )
+                print(
+                    f"Learning iteration {it}/{max_iterations} | Total timesteps: {total_timesteps} | "
+                    f"FPS: {fps} | sim_rew={c_stats['collect/sim_step_reward']:.4f} | "
+                    f"img_ret={pol_stats.get('policy/imagined_return', 0.0):.3f} | "
+                    f"wm_pos={wm_stats.get('wm/pos_err_mm', 0.0):.1f}mm | "
+                    f"wm_obj={wm_stats.get('wm/obj_err_mm', 0.0):.1f}mm | "
+                    f"v_loss={crit_stats['critic/loss']:.4f}{bc_str}"
+                )
+
+            if (it > 0 and it % self.cfg.save_interval == 0) or (it == max_iterations - 1):
+                ckpt_p = self.log_dir / f"model_{it}.pt"
+                self.save_checkpoint(ckpt_p, iteration=it)
+                self.save_checkpoint(self.log_dir / "model_latest.pt", iteration=it)
+                last_ckpt_path = ckpt_p
+                print(f"[SuperMimic] Saved checkpoint -> {ckpt_p} (iter={it})", flush=True)
+
+        if self.tb_writer is not None:
+            self.tb_writer.flush()
+            self.tb_writer.close()
+        return last_ckpt_path
