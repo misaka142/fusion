@@ -105,6 +105,13 @@ class TaskRewardProfile:
     feet_air_time_weight: float = 5.0
     feet_air_time_threshold: float = 0.5
     avoid_feet_obj_weight: float = 0.0
+    # Fine object placement term (`motion_obj_pos_place` in env cfg); synced from the live env, 0 = disabled
+    place_weight: float = 0.0
+    place_std: float = 0.08
+    place_window: int = 25
+    # Feet swing z-height tracking (`motion_feet_height` in env cfg); synced from the live env, 0 = disabled
+    feet_height_weight: float = 0.0
+    feet_height_std: float = 0.06
 
 
 TASK_PROFILES: dict[str, TaskRewardProfile] = {
@@ -161,6 +168,22 @@ def resolve_task_profile(task_id_or_name: str, stage: str | None = None) -> Task
     return prof_copy
 
 
+def compute_release_mask(contact_label: Tensor, lengths: Tensor, window: int) -> Tensor:
+    """(M, T) float mask that is 1 within `window` frames of a reference release (contact 1 -> 0)
+    and on every no-contact frame after the first release, inside each clip's valid length."""
+    lab = contact_label.float()
+    M, T = lab.shape
+    t_idx = torch.arange(T, device=lab.device).unsqueeze(0)
+    valid = t_idx < lengths.view(-1, 1)
+    lab = lab * valid.float()
+    # release at frame t: label[t-1] = 1 and label[t] = 0 (padding beyond the clip never counts)
+    rel = torch.zeros_like(lab)
+    rel[:, 1:] = lab[:, :-1] * (1.0 - lab[:, 1:]) * valid[:, 1:].float()
+    near = F.max_pool1d(rel.unsqueeze(1), kernel_size=2 * window + 1, stride=1, padding=window).squeeze(1)
+    after = (torch.cumsum(rel, dim=1) > 0).float() * (1.0 - lab)
+    return torch.clamp(near + after, max=1.0) * valid.float()
+
+
 # -----------------------------------------------------------------------------
 # Reference trajectory data structures (env-origin normalized world frame)
 # -----------------------------------------------------------------------------
@@ -180,6 +203,7 @@ class RefFrame:
     obj_lin_vel_w: Tensor     # (B, 3)
     obj_ang_vel_w: Tensor     # (B, 3)
     contact_label: Tensor     # (B,) or (B, 1) float in {0.0, 1.0}
+    release_mask: Tensor | None = None  # (B,) float, 1 around / after reference release (fine placement window)
 
     def tracker_command_36(self) -> Tensor:
         """Build 36-D single-frame Tracker reference command `[q_ref(29), v_b(3), w_b(3), contact(1)]`."""
@@ -247,6 +271,10 @@ class SugarHOITask:
         self.ori_term_temp = ori_term_temp
         self.anchor_idx = fk.anchor_tracked_idx  # 7 (`torso_link`)
         self.ee_indices = [SUGAR_TRACKED_BODY_NAMES.index(n) for n in SUGAR_EE_TERMINATION_BODY_NAMES]
+        self.feet_indices = [
+            SUGAR_TRACKED_BODY_NAMES.index("left_ankle_roll_link"),
+            SUGAR_TRACKED_BODY_NAMES.index("right_ankle_roll_link"),
+        ]
 
     # ------------------------------------------------------------------
     # 1. State packing / unpacking & kinematics
@@ -440,14 +468,38 @@ class SugarHOITask:
         )
 
     @staticmethod
-    def world_model_state_loss(
-        s_pred: Tensor,
-        s_true: Tensor,
-        joint_weights: Tensor,
-        vel_loss_scale: float = 0.1,
-        obj_loss_weight: float = 1.5,
-    ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Compute local-frame Huber loss between predicted and ground-truth joint states."""
+    def compute_state_delta(s_prev: Tensor, s_next: Tensor) -> Tensor:
+        """Exact inverse of `apply_delta`: 82-D local delta that maps `s_prev` to `s_next`."""
+        (
+            p0, q0, j0, v0, w0, jd0, op0, oq0, ov0, ow0,
+        ) = SugarHOITask.unpack_state(s_prev)
+        (
+            p1, q1, j1, v1, w1, jd1, op1, oq1, ov1, ow1,
+        ) = SugarHOITask.unpack_state(s_next)
+        R_h_inv = heading_inv_rotmat(q0)
+
+        def _h(x: Tensor) -> Tensor:
+            return torch.einsum("bij,bj->bi", R_h_inv, x)
+
+        return torch.cat(
+            [
+                _h(p1 - p0),
+                quat_to_axis_angle(quat_mul(quat_conj(q0), q1)),
+                j1 - j0,
+                _h(v1 - v0),
+                _h(w1 - w0),
+                jd1 - jd0,
+                _h(op1 - op0),
+                quat_to_axis_angle(quat_mul(quat_conj(oq0), oq1)),
+                _h(ov1 - ov0),
+                _h(ow1 - ow0),
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
+    def state_error(s_pred: Tensor, s_true: Tensor) -> Tensor:
+        """82-D error of a predicted state in the true state's heading frame (same layout as the delta)."""
         (
             p_hat, q_hat_rot, j_hat, v_hat, w_hat, jd_hat,
             op_hat, oq_hat, ov_hat, ow_hat,
@@ -456,39 +508,89 @@ class SugarHOITask:
             p_gt, q_gt_rot, j_gt, v_gt, w_gt, jd_gt,
             op_gt, oq_gt, ov_gt, ow_gt,
         ) = SugarHOITask.unpack_state(s_true)
-
         R_h_inv = heading_inv_rotmat(q_gt_rot)
+
+        def _h(x: Tensor) -> Tensor:
+            return torch.einsum("bij,bj->bi", R_h_inv, x)
+
+        return torch.cat(
+            [
+                _h(p_hat - p_gt),
+                quat_to_axis_angle(quat_mul(quat_conj(q_gt_rot), q_hat_rot)),
+                j_hat - j_gt,
+                _h(v_hat - v_gt),
+                _h(w_hat - w_gt),
+                jd_hat - jd_gt,
+                _h(op_hat - op_gt),
+                quat_to_axis_angle(quat_mul(quat_conj(oq_gt), oq_hat)),
+                _h(ov_hat - ov_gt),
+                _h(ow_hat - ow_gt),
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
+    def world_model_state_loss(
+        s_pred: Tensor,
+        s_true: Tensor,
+        joint_weights: Tensor,
+        err_std: Tensor,
+        obj_loss_weight: float = 1.5,
+        step_mask: Tensor | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Squared state error normalized per dimension by the std of the true one-step delta (as in allmimic).
+
+        `joint_weights` (29,) weight the q / qd dims; `err_std` (82,) is the per-dim delta std;
+        `step_mask` (B,) masks out any post-reset/push tail slots without host syncs.
+        """
+        e = SugarHOITask.state_error(s_pred, s_true) / err_std.view(1, -1)
         jw = joint_weights.view(1, 29)
-        jw_sqrt = torch.sqrt(jw)
+        ones6 = jw.new_ones(1, 6)
+        w_rob = torch.cat([ones6, jw, ones6, jw], dim=-1)  # (1, 70)
+        per_rob = (w_rob * e[:, :ROBOT_DELTA_DIM] ** 2).mean(dim=-1)
+        per_obj = (e[:, ROBOT_DELTA_DIM:] ** 2).mean(dim=-1)
+        pos_err = (s_pred[:, 0:3] - s_true[:, 0:3]).detach().norm(dim=-1)
+        obj_err = (s_pred[:, 71:74] - s_true[:, 71:74]).detach().norm(dim=-1)
 
-        # Robot position & geodesic axis-angle error
-        err_p = torch.einsum("bij,bj->bi", R_h_inv, p_hat - p_gt)
-        err_rot = quat_to_axis_angle(quat_mul(quat_conj(q_gt_rot), q_hat_rot))
-        err_j = (j_hat - j_gt) * jw_sqrt
-        err_v = torch.einsum("bij,bj->bi", R_h_inv, v_hat - v_gt) * vel_loss_scale
-        err_w = torch.einsum("bij,bj->bi", R_h_inv, w_hat - w_gt) * vel_loss_scale
-        err_jd = (jd_hat - jd_gt) * jw_sqrt * vel_loss_scale
+        if step_mask is not None:
+            m = step_mask.float().reshape(-1)
+            denom = m.sum().clamp_min(1.0)
+            loss_rob = (per_rob * m).sum() / denom
+            loss_obj = (per_obj * m).sum() / denom
+            pos_mm = (pos_err * m).sum() / denom * 1000.0
+            obj_mm = (obj_err * m).sum() / denom * 1000.0
+        else:
+            loss_rob = per_rob.mean()
+            loss_obj = per_obj.mean()
+            pos_mm = pos_err.mean() * 1000.0
+            obj_mm = obj_err.mean() * 1000.0
 
-        # Object position, rotation & velocity errors
-        err_op = torch.einsum("bij,bj->bi", R_h_inv, op_hat - op_gt)
-        err_orot = quat_to_axis_angle(quat_mul(quat_conj(oq_gt), oq_hat))
-        err_ov = torch.einsum("bij,bj->bi", R_h_inv, ov_hat - ov_gt) * vel_loss_scale
-        err_ow = torch.einsum("bij,bj->bi", R_h_inv, ow_hat - ow_gt) * vel_loss_scale
-
-        rob_vec = torch.cat([err_p, err_rot, err_j, err_v, err_w, err_jd], dim=-1)
-        obj_vec = torch.cat([err_op, err_orot, err_ov, err_ow], dim=-1)
-
-        loss_rob = F.smooth_l1_loss(rob_vec, torch.zeros_like(rob_vec), beta=0.05)
-        loss_obj = F.smooth_l1_loss(obj_vec, torch.zeros_like(obj_vec), beta=0.05)
         total = loss_rob + obj_loss_weight * loss_obj
 
         metrics = {
             "wm/loss_robot": loss_rob.detach(),
             "wm/loss_obj": loss_obj.detach(),
-            "wm/pos_err_mm": (p_hat - p_gt).detach().norm(dim=-1).mean() * 1000.0,
-            "wm/obj_err_mm": (op_hat - op_gt).detach().norm(dim=-1).mean() * 1000.0,
+            "wm/pos_err_mm": pos_mm,
+            "wm/obj_err_mm": obj_mm,
         }
         return total, metrics
+
+    def max_step_reward(self) -> float:
+        """Upper bound of the positive per-step reward (scaled by `step_dt`), used for the value clip."""
+        tracking = 0.125 + 0.25 * 6     # joint pos, anchor pos/ori, body pos/ori/lin vel/ang vel
+        obj = 0.5 * 4                   # obj pos/ori/lin vel/ang vel
+        interaction = 0.25 * 2          # obj2body pos/ori
+        prof = self.profile
+        total = (
+            tracking
+            + obj
+            + interaction
+            + prof.hoi_weight
+            + prof.avoid_feet_obj_weight
+            + max(0.0, prof.place_weight)
+            + max(0.0, prof.feet_height_weight)
+        )
+        return float(total * self.step_dt)
 
     # ------------------------------------------------------------------
     # 3. Differentiable Observation Builders (100% aligned with SUGAR)
@@ -744,6 +846,7 @@ class SugarHOITask:
         feet_air_time: Tensor | None = None,
         prev_feet_gnd: Tensor | None = None,
         time_steps: Tensor | None = None,
+        include_air_time_penalty: bool = True,
         *,
         ref_next: RefFrame | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
@@ -859,14 +962,36 @@ class SugarHOITask:
         r_avoid_feet = self.profile.avoid_feet_obj_weight * (1.0 - p_feet_obj)
         r_undesired = self.profile.undesired_weight * expected_undesired_count
 
+        # Fine object placement (`motion_obj_pos_place`): narrow kernel only around / after the reference release
+        if self.profile.place_weight != 0.0 and ref_target.release_mask is not None:
+            r_place = (
+                self.profile.place_weight
+                * torch.exp(-err_op / (self.profile.place_std**2))
+                * ref_target.release_mask.float().reshape(-1)
+            )
+        else:
+            r_place = torch.zeros_like(c_label)
+
+        # Ankle vertical swing height tracking (`motion_feet_height`): mirrored with env RewardsCfg
+        if self.profile.feet_height_weight != 0.0:
+            err_feet_z = (
+                (body_pos_rel_w[:, self.feet_indices, 2] - fk_next.tracked_pos_w[:, self.feet_indices, 2]) ** 2
+            ).mean(dim=-1)
+            r_feet_height = self.profile.feet_height_weight * torch.exp(
+                -err_feet_z / (self.profile.feet_height_std**2)
+            )
+        else:
+            r_feet_height = torch.zeros_like(c_label)
+
         # Feet horizontal slide penalty (`contact_pos_w[:, 2:4]` are left/right ankle_roll_link)
         v_lf_xy = torch.sqrt((fk_next.contact_lin_vel_w[:, 2, :2] ** 2).sum(dim=-1) + 1e-8)
         v_rf_xy = torch.sqrt((fk_next.contact_lin_vel_w[:, 3, :2] ** 2).sum(dim=-1) + 1e-8)
         r_feet_slide = self.profile.feet_slide_weight * (v_lf_xy * p_lf_gnd + v_rf_xy * p_rf_gnd)
 
-        # Differentiable `feet_air_time_min_penalty` (weight=5.0, threshold=0.5s, active after 50 steps)
+        # Differentiable `feet_air_time_min_penalty`; omitted in imagination (`include_air_time_penalty=False`)
+        # so contact head probabilities do not receive spurious "never touch down" gradients.
         curr_feet_gnd = torch.stack([p_lf_gnd, p_rf_gnd], dim=-1)  # (B, 2)
-        if feet_air_time is not None and self.profile.feet_air_time_weight != 0.0:
+        if include_air_time_penalty and feet_air_time is not None and self.profile.feet_air_time_weight != 0.0:
             if prev_feet_gnd is None:
                 prev_feet_gnd = (feet_air_time <= 1e-4).float()
             p_first_contact = (1.0 - prev_feet_gnd) * curr_feet_gnd
@@ -916,6 +1041,8 @@ class SugarHOITask:
             + r_o2b_ori
             + r_hoi_contact
             + r_avoid_feet
+            + r_place
+            + r_feet_height
             + r_undesired
             + r_feet_slide
             + r_feet_air_time
@@ -960,6 +1087,8 @@ class SugarHOITask:
             "rew/tracking_human": (r_joint_pos + r_anc_pos + r_anc_ori + r_body_pos + r_body_ori).detach(),
             "rew/tracking_obj": (r_obj_pos + r_obj_ori + r_obj_vel + r_obj_ang).detach(),
             "rew/interaction": (r_o2b_pos + r_o2b_ori + r_hoi_contact).detach(),
+            "rew/place": r_place.detach(),
+            "rew/feet_height": r_feet_height.detach(),
             "rew/feet_air_time": r_feet_air_time.detach(),
             "rew/reg": (r_act_rate + r_jlimit + r_jacc + r_jtorque + r_feet_slide + r_feet_air_time + r_undesired).detach(),
             "err/anchor_pos": d_anc_pos.detach(),

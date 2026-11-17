@@ -1,13 +1,15 @@
 import argparse
 import glob
 import os
-import numpy as np
-import torch
-import numpy as np
-from tqdm import tqdm
-import zarr
 import pickle
-import matplotlib.pyplot as plt
+import shutil
+import numpy as np
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(x):
+        return x
 
 def matrix_from_quat_np(quaternions: np.ndarray) -> np.ndarray:
     # w, x, y, z
@@ -202,9 +204,45 @@ def main():
     parser.add_argument("--task_name", type=str, required=True, choices=['CarryBox','KickBox', 'PickBottle', 'PushBox', 'SitChair', 'StandBottle'])
     parser.add_argument("--lin_vel_thresh", type=float, default=0.05)
     parser.add_argument("--ang_vel_thresh", type=float, default=0.1)
+    parser.add_argument(
+        "--max_final_obj_err",
+        type=float,
+        default=None,
+        help="Keep only rollouts whose final object position error to the reference target is below this (m).",
+    )
 
     args = parser.parse_args()
     npz_file_paths = collect_npz_files(f'{args.data_dir}/raw_npz/trajectory_complete')
+
+    # Report placement accuracy distribution & optionally filter by `--max_final_obj_err` (Review Step 0.5 / 3.3-a)
+    if len(npz_file_paths) > 0:
+        final_errs = []
+        kept = []
+        for p in npz_file_paths:
+            with np.load(p, allow_pickle=True) as d:
+                if 'obj_pos_b' in d.files and 'target_obj_pos_b' in d.files:
+                    err = float(np.linalg.norm(d['obj_pos_b'][-1] - d['target_obj_pos_b'][-1]))
+                    final_errs.append(err)
+                else:
+                    err = 0.0
+            if args.max_final_obj_err is None or err < args.max_final_obj_err:
+                kept.append(p)
+        if len(final_errs) > 0:
+            arr_e = np.asarray(final_errs, dtype=np.float64)
+            print(
+                f"[Placement Stats] raw={len(arr_e)} | "
+                f"median={np.median(arr_e):.4f}m | mean={arr_e.mean():.4f}m | "
+                f"p90={np.percentile(arr_e, 90):.4f}m | max={arr_e.max():.4f}m"
+            )
+        if args.max_final_obj_err is not None:
+            print(f"[Filter] final obj err < {args.max_final_obj_err:.3f} m: kept {len(kept)} / {len(npz_file_paths)}")
+            npz_file_paths = kept
+
+    # Clean existing `rl_dataset` directory before writing so stale unfiltered rollouts never leak through
+    rl_dataset_dir = os.path.join(args.data_dir, 'rl_dataset')
+    if os.path.isdir(rl_dataset_dir):
+        shutil.rmtree(rl_dataset_dir)
+    os.makedirs(rl_dataset_dir, exist_ok=True)
 
     if args.task_name == 'SitChair':
         stabilize_initial_frames_flag = True

@@ -30,6 +30,7 @@ from .hoi_task import (
     SugarHOITask,
     TRACKER_OBS_DIM,
     XI_DIM,
+    compute_release_mask,
     resolve_task_profile,
 )
 from .urdf_kinematics import FastTreeKinematics
@@ -98,6 +99,8 @@ class MotionReferenceAdapter:
         self.obj_lin_vel: Tensor = motion_loader.obj_lin_vel
         self.obj_ang_vel: Tensor = motion_loader.obj_ang_vel
         self.contact_label: Tensor = motion_loader.contact_label
+        self.release_mask: Tensor = torch.zeros_like(self.contact_label, dtype=torch.float32)
+        self.set_release_window(25)
 
         if anchor_only and hasattr(motion_loader, "_body_pos_w") and hasattr(motion_loader, "_body_indexes"):
             raw_anc_idx = int(motion_loader._body_indexes[anchor_body_idx])
@@ -114,6 +117,10 @@ class MotionReferenceAdapter:
             self.body_ang_vel_w = motion_loader.body_ang_vel_w.contiguous()
             self.anchor_pos_w = self.body_pos_w[:, :, anchor_body_idx]
             self.anchor_quat_w = self.body_quat_w[:, :, anchor_body_idx]
+
+    def set_release_window(self, window: int) -> None:
+        """Precompute the fine-placement mask (same definition as the env's `motion_obj_pos_place` term)."""
+        self.release_mask = compute_release_mask(self.contact_label, self.lengths, int(window))
 
     def clamp_timesteps(self, motion_ids: Tensor, time_steps: Tensor) -> Tensor:
         max_t = (self.lengths[motion_ids] - 1).clamp_min(0)
@@ -138,6 +145,7 @@ class MotionReferenceAdapter:
             obj_lin_vel_w=self.obj_lin_vel[motion_ids, t],
             obj_ang_vel_w=self.obj_ang_vel[motion_ids, t],
             contact_label=self.contact_label[motion_ids, t].float(),
+            release_mask=self.release_mask[motion_ids, t],
         )
 
     def get_future_window(self, motion_ids: Tensor, time_steps: Tensor) -> RefFutureWindow:
@@ -302,6 +310,22 @@ class SugarEnvBridge:
                 self.profile.feet_air_time_threshold = float(fa.params["threshold"])
         elif term_names and "feet_air_time" not in cfg_map:
             self.profile.feet_air_time_weight = 0.0
+        if "motion_obj_pos_place" in cfg_map:
+            pl = cfg_map["motion_obj_pos_place"]
+            self.profile.place_weight = float(pl.weight)
+            params = getattr(pl, "params", None) or {}
+            self.profile.place_std = float(params.get("std", self.profile.place_std))
+            self.profile.place_window = int(params.get("window", self.profile.place_window))
+        elif term_names:
+            self.profile.place_weight = 0.0
+        if "motion_feet_height" in cfg_map:
+            fh = cfg_map["motion_feet_height"]
+            self.profile.feet_height_weight = float(fh.weight)
+            fh_params = getattr(fh, "params", None) or {}
+            self.profile.feet_height_std = float(fh_params.get("std", self.profile.feet_height_std))
+        elif term_names:
+            self.profile.feet_height_weight = 0.0
+        self.motion_ref.set_release_window(self.profile.place_window)
 
     def _resolve_foot_shape_indices(self, total_shapes: int) -> list[int]:
         """Locate PhysX collision shape indices belonging to left/right `ankle_roll_link`."""

@@ -110,6 +110,23 @@ class RewardsCfg(BaseRewardsCfg):
             "threshold": 0.1,
         },
     )
+    # Fine placement precision (std 8 cm) around / after the reference release; `motion_obj_pos` (std 0.3 m)
+    # barely distinguishes 0 from 10 cm, so the box used to be put down far from the target.
+    motion_obj_pos_place = RewTerm(
+        func=mdp.motion_obj_pos_place_exp,
+        weight=1.0,
+        params={"command_name": "motion", "std": 0.08, "window": 25},
+    )
+    # Ankle vertical swing clearance tracking (consistent across simulator env and SuperMimic imagination).
+    motion_feet_height = RewTerm(
+        func=mdp.motion_feet_height_error_exp,
+        weight=0.25,
+        params={
+            "command_name": "motion",
+            "std": 0.06,
+            "body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+        },
+    )
 
 @configclass
 class TerminationsCfg(BaseTerminationsCfg):

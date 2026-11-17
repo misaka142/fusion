@@ -37,26 +37,38 @@ class RunningMeanStd(nn.Module):
         self.register_buffer("count", torch.tensor(1e-4, dtype=torch.float64))
 
     @torch.no_grad()
-    def update(self, x: Tensor) -> None:
+    def update(self, x: Tensor, mask: Tensor | None = None) -> None:
         flat = x.detach().reshape(-1, self.mean.shape[-1]).float()
         if flat.shape[0] < 2:
             return
-        batch_mean = flat.mean(dim=0)
-        batch_var = flat.var(dim=0, unbiased=False)
-        batch_count = float(flat.shape[0])
+        if mask is None:
+            batch_mean = flat.mean(dim=0)
+            batch_var = flat.var(dim=0, unbiased=False)
+            batch_count = torch.tensor(float(flat.shape[0]), dtype=torch.float64, device=flat.device)
+            active = torch.ones((), dtype=torch.bool, device=flat.device)
+        else:
+            w = mask.detach().reshape(-1, 1).float().clamp(0.0, 1.0)
+            w_sum = w.sum()
+            active = w_sum >= 2.0
+            denom = w_sum.clamp_min(1.0)
+            batch_mean = (flat * w).sum(dim=0) / denom
+            batch_var = (((flat - batch_mean) ** 2) * w).sum(dim=0) / denom
+            batch_count = w_sum.to(torch.float64)
 
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
+        safe_tot = tot_count.float().clamp_min(1e-6)
+        bc_f = batch_count.float()
 
-        new_mean = self.mean + delta * (batch_count / tot_count.float())
+        new_mean = self.mean + delta * (bc_f / safe_tot)
         m_a = self.var * self.count.float()
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + (delta * delta) * (self.count.float() * batch_count / tot_count.float())
-        new_var = (m2 / tot_count.float()).clamp_min(1e-6)
+        m_b = batch_var * bc_f
+        m2 = m_a + m_b + (delta * delta) * (self.count.float() * bc_f / safe_tot)
+        new_var = (m2 / safe_tot).clamp_min(1e-6)
 
-        self.mean.copy_(new_mean)
-        self.var.copy_(new_var)
-        self.count.copy_(tot_count)
+        self.mean.copy_(torch.where(active, new_mean, self.mean))
+        self.var.copy_(torch.where(active, new_var, self.var))
+        self.count.copy_(torch.where(active, tot_count, self.count))
 
     def forward(self, x: Tensor) -> Tensor:
         std = torch.sqrt(self.var + self.eps)
@@ -101,6 +113,8 @@ class JointWorldModel(nn.Module):
         self.in_dim = state_feat_dim + action_dim * 2 + xi_dim
         self.feat_rms = RunningMeanStd(state_feat_dim)
         self.xi_rms = RunningMeanStd(xi_dim)
+        # Output normalizer: the head predicts the delta in units of the true one-step delta std (allmimic `out_norm`)
+        self.delta_rms = RunningMeanStd(delta_dim)
 
         self.trunk = _build_mlp(self.in_dim, hidden_dims, out_dim=None)
         last_h = hidden_dims[-1]
@@ -123,6 +137,14 @@ class JointWorldModel(nn.Module):
         if hasattr(torch, "compile"):
             self._core_fn = torch.compile(self._core_forward, **compile_kwargs)
 
+    def delta_std(self, floor: float = 1e-4) -> Tensor:
+        """Per-dim std of the true one-step delta (also the WM loss normalizer)."""
+        return self.delta_rms.var.sqrt().clamp_min(floor)
+
+    @torch.no_grad()
+    def update_delta_stats(self, true_delta: Tensor, mask: Tensor | None = None) -> None:
+        self.delta_rms.update(true_delta, mask=mask)
+
     def forward_delta(
         self,
         state_feat: Tensor,
@@ -137,7 +159,8 @@ class JointWorldModel(nn.Module):
         f_norm = self.feat_rms(state_feat)
         xi_norm = self.xi_rms(xi)
         x = torch.cat([f_norm, raw_action.clamp(-10.0, 10.0), pd_error.clamp(-5.0, 5.0), xi_norm], dim=-1)
-        return self._core_fn(x)
+        delta_n, contact_logits = self._core_fn(x)
+        return delta_n * self.delta_std() + self.delta_rms.mean, contact_logits
 
     def step(
         self,
@@ -179,6 +202,7 @@ class SuperMimicPolicy(nn.Module):
         min_std: float = 0.02,
         max_std: float = 1.0,
         action_limit: float = 8.0,
+        residual_mask: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
@@ -201,6 +225,11 @@ class SuperMimicPolicy(nn.Module):
             action_scale = torch.ones(action_dim, dtype=torch.float32)
         self.register_buffer("default_joint_pos", default_joint_pos.clone().float())
         self.register_buffer("action_scale", action_scale.clone().float())
+        # 1 = residual on the reference joint target, 0 = absolute action around the default pose
+        # (allmimic #20: legs absolute, upper body residual)
+        if residual_mask is None:
+            residual_mask = torch.ones(action_dim, dtype=torch.float32)
+        self.register_buffer("residual_mask", residual_mask.clone().float())
         self._core_fn = self._core_forward
 
     def _core_forward(self, obs_n: Tensor) -> Tensor:
@@ -229,7 +258,7 @@ class SuperMimicPolicy(nn.Module):
             # In both PrivilegedCfg and TrackerCfg/Inference, obs_raw[:, 0:29] is current ref_joint_pos!
             q_ref = obs_raw[..., 0 : self.action_dim]
             ref_bias = (q_ref - self.default_joint_pos) / self.action_scale.clamp_min(1e-6)
-            return ref_bias + residual
+            return ref_bias * self.residual_mask + residual
         return residual
 
     def act(

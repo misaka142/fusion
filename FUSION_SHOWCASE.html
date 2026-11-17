@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SuperMimic × SUGAR 项目可视化逐帧精讲（本地离线交互版）</title>
+  <style>
+    :root[data-theme="dark"] {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --content: #0b1220;
+      --border: #334155;
+      --fg: #f8fafc;
+      --muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-fg: #ffffff;
+      --secondary: #334155;
+      --code: #38bdf8;
+      --c1: #3b82f6;
+      --c2: #10b981;
+      --c3: #f59e0b;
+      --c4: #ef4444;
+      --c5: #8b5cf6;
+      --c6: #06b6d4;
+    }
+    :root[data-theme="light"] {
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --content: #f1f5f9;
+      --border: #cbd5e1;
+      --fg: #0f172a;
+      --muted: #475569;
+      --primary: #2563eb;
+      --primary-fg: #ffffff;
+      --secondary: #e2e8f0;
+      --code: #0284c7;
+      --c1: #2563eb;
+      --c2: #059669;
+      --c3: #d97706;
+      --c4: #dc2626;
+      --c5: #7c3aed;
+      --c6: #0891b2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px 16px 48px;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.6;
+    }
+    .container { max-width: 1160px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+    .subbox { background: var(--content); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+    h1 { margin: 6px 0; font-size: 22px; }
+    h2 { margin: 0 0 6px; font-size: 17px; }
+    h3 { margin: 0 0 6px; font-size: 15px; }
+    p { margin: 4px 0; }
+    code { font-family: Consolas, Monaco, monospace; color: var(--code); font-size: 0.92em; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+      background: var(--secondary); color: var(--fg);
+    }
+    .row-between { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+    .btn-group { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      cursor: pointer; border: 1px solid var(--border); border-radius: 8px;
+      padding: 7px 13px; font-size: 13px; font-weight: 600;
+      background: var(--secondary); color: var(--fg); transition: all 0.15s;
+    }
+    button:hover { opacity: 0.9; }
+    button.active { background: var(--primary); color: var(--primary-fg); border-color: var(--primary); }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .grid-5 { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 10px; }
+    .grid-6 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+    .tab-panel { display: none; flex-direction: column; gap: 18px; }
+    .tab-panel.active { display: flex; }
+    canvas { width: 100%; height: auto; display: block; }
+    .tensor-bar {
+      width: 100%; height: 44px; border-radius: 9px; overflow: hidden;
+      display: flex; border: 1px solid var(--border); cursor: pointer; user-select: none;
+    }
+    .tensor-seg {
+      height: 100%; display: flex; align-items: center; justify-content: center;
+      color: #fff; font-family: monospace; font-size: 12px; font-weight: 700;
+      border-right: 1px solid rgba(0,0,0,0.2); transition: transform 0.15s;
+    }
+    .tensor-seg:hover { transform: scaleY(1.1); }
+    input[type="text"] {
+      padding: 7px 12px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--content); color: var(--fg); font-size: 13px; width: 260px;
+    }
+    input[type="range"] { accent-color: var(--primary); cursor: pointer; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="card">
+      <div class="row-between">
+        <div>
+          <div class="badge">Unitree G1 (29-DoF) • 可微世界模型 32-Step BPTT • 扩散规划 + MuJoCo Sim2Sim</div>
+          <h1>SuperMimic × SUGAR 全身人-物交互项目：零基础可视化逐帧讲解台</h1>
+          <p class="muted">从第一性原理出发，交互式拆解 6 阶段数据流、32 步脑内物理推演、890/510 维张量账本与 500Hz 跨引擎控制闭环。</p>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;">
+          <button id="theme-toggle">切换浅色 / 深色模式</button>
+          <span class="muted" style="font-family:monospace;">本地测试: 10/10 + Sim2Sim: 5/5 PASS</span>
+        </div>
+      </div>
+
+      <div class="subbox" style="margin-top:14px;font-size:12.5px;">
+        <strong>源码与验证边界声明（面试必知）：</strong>
+        全身交互任务环境（<code>sugar_rl/tasks</code>）与高层扩散生成器（<code>sugar_il</code>）来自 <strong>SUGAR 官方开源仓库</strong>；
+        因 SuperMimic 官方代码尚未开源，<code>sugar_rl/supermimic</code> 为依据论文算法原理自行重构的<strong>非官方融合实现</strong>。本地已完成 15 项自动化单元与 MuJoCo 跨引擎测试验证，完整 5001 轮长训练需在 Google Colab GPU 上执行验证。
+      </div>
+
+      <nav class="btn-group" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);" id="main-tabs">
+        <button data-tab="tab-overview" class="tab-btn active">1. 全局直觉 & 6大任务沙盘</button>
+        <button data-tab="tab-pipeline" class="tab-btn">2. 6阶段模块衔接探索器</button>
+        <button data-tab="tab-bptt" class="tab-btn">3. 32步世界模型 BPTT 动画</button>
+        <button data-tab="tab-tensors" class="tab-btn">4. 张量每一维解剖显微镜</button>
+        <button data-tab="tab-sim2sim" class="tab-btn">5. 多频逐帧慢放 & Sim2Sim</button>
+        <button data-tab="tab-interview" class="tab-btn">6. 黑话词典 & 面试12题闪卡</button>
+      </nav>
+    </header>
+
+    <!-- TAB 1 -->
+    <section id="tab-overview" class="tab-panel active">
+      <div class="grid-3">
+        <div class="card">
+          <div class="muted" style="font-weight:700;">痛点 1 → 第一级火箭 Refiner</div>
+          <h3>人类动捕视频“违反物理规律”</h3>
+          <p class="muted">原始动捕换算到机器人后会出现<strong>脚踩进地板（穿模）、箱子悬空</strong>。<strong>解法：</strong>开“上帝视角”（偷看未来 8 帧共 890 维特权信息），在物理引擎里用世界模型 BPTT 把动作修稳，筛出 100% 物理可行的精炼轨迹库 <code>rl_dataset</code>。</p>
+        </div>
+        <div class="card">
+          <div class="muted" style="font-weight:700;">痛点 2 → 第二级火箭 Tracker</div>
+          <h3>真实部署“不能偷看未来”</h3>
+          <p class="muted">实战没有未来参考轨迹。<strong>解法：</strong>关掉上帝视角！只看眼下 <strong>36 维单帧指令 + 过去 5 帧传感器历史 + 9 维相对物体位姿（共 510 维）</strong>，融合 32 步世界模型物理奖励与冻结 Stage 1 老师的动态退火蒸馏，练成指哪打哪的“运动小脑”。</p>
+        </div>
+        <div class="card">
+          <div class="muted" style="font-weight:700;">痛点 3 → 第三级火箭 Generator</div>
+          <h3>新场景“没有现成剧本可抄”</h3>
+          <p class="muted">箱子随便放、终点随便指怎么动？<strong>解法：</strong>用 12 层 Transformer <strong>扩散策略（Diffusion Policy）</strong>充当“规划大脑”，每 0.4 秒看一眼箱子和终点，16 步 DDIM 去噪生成未来 36 维全身指令序列喂给小脑执行！</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <h2>交互沙盘：Unitree G1 全身移动操作 6 大任务规格与受力点</h2>
+            <p class="muted">点击任务按钮切换，观察躯干锚点、接触力传感器模式与物理摩擦/阻尼设定</p>
+          </div>
+          <div class="btn-group" id="task-selector"></div>
+        </div>
+        <div class="grid-2" style="margin-top:14px;align-items:center;">
+          <div class="subbox"><canvas id="task-canvas" width="520" height="270"></canvas></div>
+          <div id="task-detail-panel"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>代码仓库四大阵营结构图（点击模块查看内部文件职责）</h2>
+        <div class="grid-4" style="margin-top:10px;" id="repo-cards"></div>
+        <div class="subbox" style="margin-top:12px;font-size:13px;" id="repo-detail-box"></div>
+      </div>
+    </section>
+
+    <!-- TAB 2 -->
+    <section id="tab-pipeline" class="tab-panel">
+      <div class="card">
+        <h2>全链路 6 大阶段：数据是怎么一环扣一环流动的？</h2>
+        <p class="muted">点击第 1 ~ 6 站节点，检查“输入什么 → 跑哪个脚本 → 吐出什么文件给下一站”</p>
+        <div class="grid-6" style="margin:14px 0;" id="stage-stepper"></div>
+        <div class="subbox" id="stage-detail-card"></div>
+      </div>
+
+      <div class="card">
+        <h3>面试高频追问：为什么 Stage 3 训练 Tracker 时要同时传两个动作文件夹？</h3>
+        <div class="grid-3" style="margin-top:10px;font-size:13px;">
+          <div class="subbox">
+            <strong>1. 给盲打学生看：精炼库 <code>rl_dataset</code></strong>
+            <p class="muted">学生只有单帧盲观测，必须喂经过 Stage 2 物理引擎实测不摔倒的轨迹，确保跟踪目标 100% 物理可达。</p>
+          </div>
+          <div class="subbox">
+            <strong>2. 给冻结老师看：原始库 <code>data/&lt;TASK&gt;</code></strong>
+            <p class="muted">老师 <code>refiner.pt</code> 是在 Stage 1 看着原始动捕未来 8 帧训出来的，按 <code>motion_id</code> 对齐喂原始轨迹可避免输入分布偏移。</p>
+          </div>
+          <div class="subbox">
+            <strong>3. 显存省 14 倍技巧：<code>anchor_only=True</code></strong>
+            <p class="muted">给老师拼 890 维观测只需第 7 号刚体 <code>torso_link</code> 未来位姿，无需缓存其余 13 个刚体，显存直接省 14 倍！</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3 -->
+    <section id="tab-bptt" class="tab-panel">
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <h2>核心算法可视化：传统无模型 PPO vs SuperMimic 32 步世界模型想象 BPTT</h2>
+            <p class="muted">拖动推演帧滑块或暂停观察“一阶解析物理梯度”如何顺着时间链条传回第 0 步动作</p>
+          </div>
+          <div class="btn-group" style="align-items:center;">
+            <button id="bptt-play-btn" class="active">暂停动画</button>
+            <label class="subbox" style="padding:5px 10px;font-size:12.5px;display:flex;align-items:center;gap:8px;">
+              推演帧 τ:
+              <input id="bptt-step-slider" type="range" min="0" max="32" value="18" />
+              <span id="bptt-step-label" style="font-family:monospace;font-weight:700;">18/32</span>
+            </label>
+          </div>
+        </div>
+        <div class="subbox" style="margin:14px 0;"><canvas id="bptt-canvas" width="960" height="320"></canvas></div>
+        <div class="grid-5" style="font-size:12.5px;">
+          <div class="subbox"><strong>① k=8 自回归训模型</strong><p class="muted">世界模型用自己预测的 <code>ŝ</code> 连滚 8 步算 Huber 误差，抵抗多步漂移。</p></div>
+          <div class="subbox"><strong>② 零角泰勒安全梯度</strong><p class="muted">用 <code>atan2</code> + 二阶泰勒展开替代 <code>acos</code>，0 误差求导绝不爆 NaN。</p></div>
+          <div class="subbox"><strong>③ 0.98 雅可比衰减</strong><p class="muted"><code>0.98*s+0.02*s.detach()</code> 前向不变，跨 32 步保留 52% 梯度防爆炸。</p></div>
+          <div class="subbox"><strong>④ Sigmoid 软终止</strong><p class="muted">5 项死亡判据转平滑存活率连乘，快失稳时自动掐断后续回报拉回安全区。</p></div>
+          <div class="subbox"><strong>⑤ 双头悲观截断 Critic</strong><p class="muted">仅在真实数据训 Critic，32步末尾取 <code>min(V1,V2)</code> 并截断在 [-25,15]。</p></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <h3>Stage 3 师生蒸馏动态退火曲线（Teacher BC Annealing）</h3>
+            <p class="muted">前期权重 1.0 手把手教，第 3500 轮（70%）退火至 0.05，把主导权交还给世界模型物理梯度</p>
+          </div>
+          <label style="font-size:13px;display:flex;align-items:center;gap:8px;">
+            训练轮数:
+            <input id="anneal-slider" type="range" min="0" max="5000" step="50" value="1500" />
+            <span id="anneal-readout" style="font-family:monospace;font-weight:700;">iter=1500 (bc_coef=0.59)</span>
+          </label>
+        </div>
+        <div class="subbox" style="margin-top:10px;"><canvas id="anneal-canvas" width="920" height="170"></canvas></div>
+      </div>
+    </section>
+
+    <!-- TAB 4 -->
+    <section id="tab-tensors" class="tab-panel">
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <h2>张量解剖显微镜：精确到每一维的物理含义与参考系</h2>
+            <p class="muted">先选择上方向量，再<strong>点击彩色比例条中的任意分段</strong>查看下标切片与防坑说明</p>
+          </div>
+          <div class="btn-group" id="tensor-selector"></div>
+        </div>
+        <div class="row-between" style="margin-top:14px;font-size:13px;">
+          <strong id="tensor-title"></strong>
+          <span id="tensor-total-dim" style="font-family:monospace;"></span>
+        </div>
+        <div class="tensor-bar" style="margin-top:8px;" id="tensor-bar"></div>
+        <div class="btn-group" style="margin-top:10px;" id="tensor-chips"></div>
+        <div class="subbox" style="margin-top:14px;font-size:13px;" id="slice-inspector"></div>
+      </div>
+    </section>
+
+    <!-- TAB 5 -->
+    <section id="tab-sim2sim" class="tab-panel">
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <h2>部署期“逐帧慢放器”：10Hz 扩散大脑 × 50Hz 跟踪小脑 × 500Hz 物理肌肉</h2>
+            <p class="muted">点击“+2ms 单步物理步进”或拖动时间轴，看清每一毫秒哪一层在干活</p>
+          </div>
+          <div class="btn-group" style="align-items:center;">
+            <button id="sim-step-2ms">+2ms (1物理子步)</button>
+            <button id="sim-step-20ms" class="active">+20ms (1控制步)</button>
+            <label class="subbox" style="padding:5px 10px;font-size:12.5px;display:flex;align-items:center;gap:8px;">
+              t =
+              <input id="sim-time-slider" type="range" min="0" max="250" value="0" />
+              <span id="sim-time-label" style="font-family:monospace;font-weight:700;">0.000 s</span>
+            </label>
+          </div>
+        </div>
+        <div class="subbox" style="margin:14px 0;"><canvas id="sim-timeline-canvas" width="960" height="230"></canvas></div>
+        <div class="subbox" style="font-size:13px;" id="sim-frame-log"></div>
+      </div>
+
+      <div class="card">
+        <h3>从云端 IsaacLab (PhysX) 到本地 Windows MuJoCo：4 大跨引擎对齐硬核细节</h3>
+        <div class="grid-2" style="margin-top:10px;font-size:13px;">
+          <div class="subbox">
+            <strong>1. 关节顺序双向置换（BFS ↔ SDK DFS）</strong>
+            <p class="muted">IsaacLab 与扩散模型输出按广度优先（BFS）排 29 关节；MuJoCo 按深度优先（左腿6→右腿6→腰3→左臂7→右臂7）排列。通过关节名建立 <code>bfs_to_pol_idx</code> 精确双射。</p>
+          </div>
+          <div class="subbox">
+            <strong>2. 自由基座角速度局部系对齐（误差 1.19e-7）</strong>
+            <p class="muted">MuJoCo <code>&lt;freejoint&gt;</code> 的 <code>qvel[3:6]</code> 原生即为骨盆局部系角速度（无需像 IsaacLab 那样二次乘逆旋转），配合 <code>torso_link</code> 锚点实现极高精度同构。</p>
+          </div>
+          <div class="subbox">
+            <strong>3. 500Hz 隐式 PD + 转子惯量 Armature</strong>
+            <p class="muted">启用 <code>implicitfast</code> 积分器搭配带力矩限幅 <code>forcerange</code> 的位置执行器，写入 4 款宇树电机的转子惯量 <code>armature</code>，根除手腕/脚踝高频震荡。</p>
+          </div>
+          <div class="subbox">
+            <strong>4. 橡胶手高摩擦碰撞 + 椅子凹面多 Box 分解</strong>
+            <p class="muted">显式开启左右 <code>rubber_hand</code> 碰撞体保障抱箱/抓瓶摩擦力，并将椅子拆解为座面+椅背+四腿 6 个 Box 防止单一凸包封死座面。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 6 -->
+    <section id="tab-interview" class="tab-panel">
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <h2>面试官 12 连环夺命深挖闪卡（点击题目展开标准话术与源码定位）</h2>
+            <p class="muted">先自己默想回答，再点开核对，勾选右侧“已吃透”统计通关进度</p>
+          </div>
+          <div class="subbox" style="font-family:monospace;font-size:13px;" id="qa-progress">通关进度: 0 / 12</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:10px;margin-top:14px;" id="qa-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="row-between">
+          <div>
+            <h2>黑话粉碎机：专业术语与缩写速查词典</h2>
+            <p class="muted">输入关键字实时筛选（如 BPTT、SE(2)、四元数、GAE、DDIM、BFS）</p>
+          </div>
+          <input id="term-search" type="text" placeholder="搜索术语: BPTT / 四元数 / Zarr..." />
+        </div>
+        <div class="grid-2" style="margin-top:14px;" id="term-grid"></div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    function themeColors() {
+      const s = getComputedStyle(document.documentElement);
+      const get = (k) => s.getPropertyValue(k).trim();
+      return {
+        fg: get('--fg'), muted: get('--muted'), border: get('--border'), card: get('--card'),
+        primary: get('--primary'), c1: get('--c1'), c2: get('--c2'), c3: get('--c3'),
+        c4: get('--c4'), c5: get('--c5'), c6: get('--c6'),
+        success: get('--c2'), error: get('--c4')
+      };
+    }
+
+    document.getElementById('theme-toggle').onclick = () => {
+      const root = document.documentElement;
+      root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+      drawAllCanvases();
+    };
+
+    const tabBtns = document.querySelectorAll('.tab-btn');
+    const tabPanels = document.querySelectorAll('.tab-panel');
+    let activeTabId = 'tab-overview';
+    tabBtns.forEach(btn => {
+      btn.onclick = () => {
+        activeTabId = btn.dataset.tab;
+        tabBtns.forEach(b => b.classList.toggle('active', b === btn));
+        tabPanels.forEach(p => p.classList.toggle('active', p.id === activeTabId));
+        drawAllCanvases();
+      };
+    });
+
+    const TASKS = [
+      { name: 'CarryBox', cn: '双手抱箱搬运', obj: 'small_box (0.50 kg)', hoiMode: 'hands (双手橡胶掌同时接触)', useTarget: true, damping: '0.01', friction: '(0.75, 0.008, 0.0005)', desc: '走向小箱子弯腰抱起并搬往绿色目标虚影。非期望碰撞惩罚极严（weight=-1.0, thresh=0.1N），防止靠肚子顶着箱子走。', sceneType: 'carry' },
+      { name: 'PushBox', cn: '双手推大箱子', obj: 'big_box (0.75 kg)', hoiMode: 'hands + 禁脚踢惩罚', useTarget: true, damping: '0.01', friction: '(0.55, 0.005, 0.0005)', desc: '弯腰用双手推动大箱子至目标点，开启 avoid_feet_obj_weight=1.0 禁止用脚踢；Tracker 阶段强化非期望碰撞惩罚至 -1.0。', sceneType: 'push' },
+      { name: 'KickBox', cn: '单脚平衡踢箱', obj: 'big_box (0.75 kg)', hoiMode: 'feet (左右脚踝接触)', useTarget: false, damping: '0.01', friction: '(0.55, 0.005, 0.0005)', desc: '单腿支撑全身平衡，另一腿发力踢出大箱子；专门关闭脚底滑动惩罚（feet_slide=0）允许支撑脚微调卸力。', sceneType: 'kick' },
+      { name: 'PickBottle', cn: '蹲姿拾取水瓶', obj: 'bottle (0.75 kg, 双圆柱)', hoiMode: 'hands (手掌精细抓握)', useTarget: false, damping: '0.20', friction: '(0.85, 0.010, 0.0005)', desc: '深蹲对准高摩擦水瓶抓起并恢复直立，0.20 旋转角阻尼模拟真实瓶体防滚飞特性。', sceneType: 'pick' },
+      { name: 'StandBottle', cn: '横躺水瓶扶正', obj: 'bottle (初始横躺)', hoiMode: 'hands (双膝允许触地)', useTarget: false, damping: '0.20', friction: '(0.85, 0.010, 0.0005)', desc: '水瓶初始横躺离地仅 4.5cm，将双膝列入接触白名单允许跪姿辅助把水瓶扶正立稳。', sceneType: 'stand' },
+      { name: 'SitChair', cn: '转身对准坐椅', obj: 'chair (3.00 kg, 6-Box)', hoiMode: 'sit (臀部 pelvis/hip 接触)', useTarget: false, damping: '0.05', friction: '(0.85, 0.010, 0.0010)', desc: '向后对准身后 (-0.48m) 的 3kg 椅子稳稳坐下，Stage 2 自动抹平椅子初始落地微抖动帧。', sceneType: 'sit' }
+    ];
+    let curTaskIdx = 0;
+
+    function renderTaskSection() {
+      const sel = document.getElementById('task-selector');
+      sel.innerHTML = '';
+      TASKS.forEach((t, i) => {
+        const b = document.createElement('button');
+        b.className = i === curTaskIdx ? 'active' : '';
+        b.textContent = `${t.name} (${t.cn})`;
+        b.onclick = () => { curTaskIdx = i; renderTaskSection(); drawTaskCanvas(); };
+        sel.appendChild(b);
+      });
+      const t = TASKS[curTaskIdx];
+      document.getElementById('task-detail-panel').innerHTML = `
+        <div class="row-between" style="border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:8px;">
+          <strong>${t.name} — ${t.cn}</strong>
+          <span class="badge">use_target = ${t.useTarget ? 'True' : 'False'}</span>
+        </div>
+        <p class="muted">${t.desc}</p>
+        <div class="grid-2" style="margin-top:10px;font-size:12.5px;">
+          <div class="subbox"><div class="muted">交互物体</div><strong>${t.obj}</strong></div>
+          <div class="subbox"><div class="muted">接触检测模式</div><strong>${t.hoiMode}</strong></div>
+          <div class="subbox"><div class="muted">摩擦系数</div><strong>${t.friction}</strong></div>
+          <div class="subbox"><div class="muted">角阻尼</div><strong>${t.damping} N·m·s/rad</strong></div>
+        </div>
+      `;
+    }
+
+    function drawTaskCanvas() {
+      const cv = document.getElementById('task-canvas');
+      if (!cv) return;
+      const ctx = cv.getContext('2d');
+      const W = cv.width, H = cv.height, gY = 225;
+      const c = themeColors();
+      const t = TASKS[curTaskIdx];
+      ctx.clearRect(0, 0, W, H);
+      ctx.strokeStyle = c.border; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(25, gY); ctx.lineTo(W - 25, gY); ctx.stroke();
+      ctx.fillStyle = c.muted; ctx.font = '12px sans-serif';
+      ctx.fillText('地面 (z = 0.0m)', 30, gY + 20);
+
+      let pelvis = { x: 170, y: 145 }, torso = { x: 175, y: 95 }, head = { x: 178, y: 70 };
+      let lFoot = { x: 155, y: gY }, rFoot = { x: 185, y: gY }, lKnee = { x: 162, y: 185 }, rKnee = { x: 182, y: 185 };
+      let handTarget = { x: 235, y: 140 }, contactPts = [];
+
+      if (t.sceneType === 'carry') {
+        torso = { x: 190, y: 105 }; head = { x: 198, y: 80 }; handTarget = { x: 242, y: 142 };
+        ctx.fillStyle = c.c3; ctx.fillRect(235, 122, 42, 42);
+        ctx.setLineDash([5, 4]); ctx.strokeStyle = c.success; ctx.strokeRect(390, gY - 42, 42, 42); ctx.setLineDash([]);
+        ctx.fillStyle = c.success; ctx.fillText('绿色目标虚影 target_vis', 350, gY - 50);
+        contactPts.push({ x: 238, y: 142, label: '双手橡胶掌接触' });
+      } else if (t.sceneType === 'push') {
+        pelvis = { x: 145, y: 150 }; torso = { x: 175, y: 112 }; head = { x: 188, y: 90 };
+        lFoot = { x: 120, y: gY }; rFoot = { x: 165, y: gY }; handTarget = { x: 230, y: 162 };
+        ctx.fillStyle = c.c3; ctx.fillRect(230, gY - 62, 62, 62);
+        ctx.setLineDash([5, 4]); ctx.strokeStyle = c.success; ctx.strokeRect(395, gY - 62, 62, 62); ctx.setLineDash([]);
+        contactPts.push({ x: 230, y: 162, label: '双手推箱 (禁脚踢)' });
+      } else if (t.sceneType === 'kick') {
+        rKnee = { x: 200, y: 168 }; rFoot = { x: 242, y: 185 }; handTarget = { x: 135, y: 130 };
+        ctx.fillStyle = c.c3; ctx.fillRect(248, gY - 62, 62, 62);
+        contactPts.push({ x: 244, y: 185, label: '脚踝击打接触' });
+      } else if (t.sceneType === 'pick') {
+        pelvis = { x: 165, y: 172 }; torso = { x: 202, y: 140 }; head = { x: 218, y: 122 };
+        lKnee = { x: 190, y: 198 }; rKnee = { x: 195, y: 200 }; handTarget = { x: 248, y: 192 };
+        ctx.fillStyle = c.c6; ctx.fillRect(246, gY - 40, 18, 40); ctx.fillRect(250, gY - 52, 10, 12);
+        contactPts.push({ x: 248, y: 192, label: '精细抓握瓶身' });
+      } else if (t.sceneType === 'stand') {
+        pelvis = { x: 160, y: 180 }; torso = { x: 202, y: 155 }; head = { x: 220, y: 138 };
+        lKnee = { x: 195, y: gY - 4 }; rKnee = { x: 180, y: 202 }; handTarget = { x: 252, y: gY - 12 };
+        ctx.fillStyle = c.c6; ctx.fillRect(245, gY - 18, 42, 18);
+        ctx.setLineDash([4, 3]); ctx.strokeStyle = c.success; ctx.strokeRect(256, gY - 52, 18, 52); ctx.setLineDash([]);
+        contactPts.push({ x: 252, y: gY - 12, label: '扶正水瓶 (允许双膝触地)' });
+      } else if (t.sceneType === 'sit') {
+        ctx.fillStyle = c.muted;
+        ctx.fillRect(115, gY - 48, 52, 10); ctx.fillRect(115, gY - 98, 10, 50);
+        ctx.fillRect(118, gY - 38, 8, 38); ctx.fillRect(156, gY - 38, 8, 38);
+        pelvis = { x: 148, y: gY - 54 }; torso = { x: 152, y: gY - 102 }; head = { x: 154, y: gY - 126 };
+        lKnee = { x: 192, y: gY - 48 }; rKnee = { x: 196, y: gY - 46 };
+        lFoot = { x: 195, y: gY }; rFoot = { x: 202, y: gY }; handTarget = { x: 182, y: gY - 68 };
+        contactPts.push({ x: 148, y: gY - 50, label: 'pelvis / hip 落座接触' });
+      }
+
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.strokeStyle = c.c1; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(pelvis.x, pelvis.y); ctx.lineTo(lKnee.x, lKnee.y); ctx.lineTo(lFoot.x, lFoot.y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(pelvis.x, pelvis.y); ctx.lineTo(rKnee.x, rKnee.y); ctx.lineTo(rFoot.x, rFoot.y); ctx.stroke();
+      ctx.strokeStyle = c.fg; ctx.lineWidth = 7;
+      ctx.beginPath(); ctx.moveTo(pelvis.x, pelvis.y); ctx.lineTo(torso.x, torso.y); ctx.stroke();
+      ctx.beginPath(); ctx.arc(head.x, head.y, 12, 0, Math.PI * 2); ctx.fillStyle = c.fg; ctx.fill();
+      ctx.strokeStyle = c.c5; ctx.lineWidth = 4.5;
+      const elbow = { x: (torso.x + handTarget.x) * 0.5 - 6, y: (torso.y + handTarget.y) * 0.5 + 12 };
+      ctx.beginPath(); ctx.moveTo(torso.x, torso.y + 6); ctx.lineTo(elbow.x, elbow.y); ctx.lineTo(handTarget.x, handTarget.y); ctx.stroke();
+      ctx.fillStyle = c.c2; ctx.beginPath(); ctx.arc(torso.x, torso.y, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillText('锚点 torso_link', torso.x - 95, torso.y - 8);
+      contactPts.forEach(pt => {
+        ctx.fillStyle = c.c4; ctx.beginPath(); ctx.arc(pt.x, pt.y, 7, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = c.fg; ctx.fillText(pt.label, pt.x + 14, pt.y - 10);
+      });
+    }
+
+    const REPO_MODULES = [
+      { title: '① 核心创新包 supermimic/', sub: 'source/sugar_rl/sugar_rl/supermimic/', files: ['rotations.py：零角安全梯度四元数与行优先 6D 旋转', 'urdf_kinematics.py：纯 PyTorch 29-DoF 可微正向运动学与质心速度递推', 'hoi_task.py：84维状态、108维SE(2)特征、890/510维观测、22项奖励+5项软终止', 'networks.py + replay.py + env_bridge.py + trainer.py：世界模型、自包含Actor、双头Critic与32步BPTT训练主循环'] },
+      { title: '② 仿真环境层 tasks/', sub: 'source/sugar_rl/sugar_rl/tasks/', files: ['mdp/commands.py：参考轨迹加载、自适应初始状态池 init_pool、Rollout 采集与 Generator 调用', 'robots/g129dof/：6 个任务在 Refiner / Tracker / Inference 三种模式下的环境配置'] },
+      { title: '③ 扩散大脑包 sugar_il/', sub: 'source/sugar_il/sugar_il/', files: ['generator_state_encoder.py：物体(9D)+指令(36D)+目标(9D)编码为 256D Token', 'generator.py：匈牙利最优传输噪声匹配训练 12层 Transformer + DDIM 16步去噪', 'sugar_il_wrapper.py：10Hz 8步路点 → 50Hz 36帧线性插值外壳'] },
+      { title: '④ 本地跨引擎 scripts/sim2sim/', sub: 'scripts/sim2sim/ & tests/', files: ['scene_builder.py：动态生成全6任务对齐的 MuJoCo XML（CAD惯量、转子armature、橡胶手碰撞）', 'policy_runner.py：10Hz+50Hz+500Hz多频闭环控制 + 鼠标实时拖拽绿色目标点', 'tests/：10项核心单元测试 + 5项 MuJoCo Sim2Sim 端到端测试'] }
+    ];
+    let curRepoIdx = 0;
+    function renderRepoSection() {
+      const box = document.getElementById('repo-cards');
+      box.innerHTML = '';
+      REPO_MODULES.forEach((m, i) => {
+        const b = document.createElement('button');
+        b.className = i === curRepoIdx ? 'active' : '';
+        b.style.textAlign = 'left';
+        b.innerHTML = `<div>${m.title}</div><div style="font-size:11.5px;opacity:0.8;font-family:monospace;">${m.sub}</div>`;
+        b.onclick = () => { curRepoIdx = i; renderRepoSection(); };
+        box.appendChild(b);
+      });
+      const m = REPO_MODULES[curRepoIdx];
+      document.getElementById('repo-detail-box').innerHTML = `<strong>${m.title}</strong><ul style="margin:6px 0 0;padding-left:20px;">${m.files.map(f => `<li class="muted">${f}</li>`).join('')}</ul>`;
+    }
+
+    const STAGES = [
+      { num: 'Stage 1', short: 'Refiner 训练', role: '开天眼的动作精炼老师', script: 'scripts/supermimic/train.py (--task *-Refiner)', input: '原始动捕 data/<TASK> + 890维未来8帧特权观测', process: '真实环境采24步 → 训世界模型(8步自回归) → 训双头Critic → 脑内32步想象BPTT修掉穿模与悬空', output: 'ckpts/refiner.pt (890维)' },
+      { num: 'Stage 2', short: '物理回放过滤', role: '残酷的牛顿力学筛子', script: 'scripts/supermimic/play.py + process_refiner_rollout.py', input: 'refiner.pt + 原始库 data/<TASK>', process: '1000并行环境实机回放，只保留全程未摔倒未掉物的完整轨迹（SitChair自动抹平初态微抖）', output: 'rollout_datasets/refiner/rl_dataset/' },
+      { num: 'Stage 3', short: 'Tracker 训练', role: '蒙眼练功的全身执行小脑', script: 'scripts/supermimic/train.py (--task *-Tracker)', input: '精炼库 rl_dataset + 冻结 refiner.pt + 510维单帧指令与5帧传感器历史', process: '32步想象中同时叠加【世界模型物理奖励 BPTT】与【冻结老师行为克隆蒸馏(1.0线性退火至0.05)】', output: 'ckpts/tracker.pt (510维可部署权重)' },
+      { num: 'Stage 4', short: 'Zarr 数据打包', role: '50Hz→10Hz 浓缩装订机', script: 'scripts/supermimic/play.py + process_tracker_rollout.py', input: 'tracker.pt + rl_dataset', process: '采集闭环成功轨迹，按 stride=5 降采样为 10Hz 36维指令标签，首帧补1帧、末帧重复补7帧', output: 'rollout_datasets/tracker/il_dataset (Zarr)' },
+      { num: 'Stage 5', short: 'Generator 训练', role: '看终点画路线的规划大脑', script: 'scripts/sugar_il/train.py', input: 'Zarr 数据库 il_dataset', process: '匈牙利最优传输噪声匹配训练 12 层 8 头动作扩散 Transformer，学会根据物体与目标生成未来 8 步指令', output: 'ckpts/generator.ckpt' },
+      { num: 'Stage 6', short: '自主闭环 / Sim2Sim', role: '大小脑合体完全体', script: 'run_sim2sim.py 或 supermimic/play.py', input: 'generator.ckpt + tracker.pt (无需 refiner.pt)', process: '每0.4s DDIM 16步去噪插值出36帧50Hz指令 → 50Hz Tracker算关节目标 → 500Hz隐式PD输出力矩', output: '实时3D交互窗口 & 50fps MP4视频' }
+    ];
+    let curStageIdx = 0;
+    function renderStagePipeline() {
+      const stEl = document.getElementById('stage-stepper');
+      stEl.innerHTML = '';
+      STAGES.forEach((s, i) => {
+        const b = document.createElement('button');
+        b.className = i === curStageIdx ? 'active' : '';
+        b.style.textAlign = 'left';
+        b.innerHTML = `<div style="font-size:11.5px;opacity:0.8;font-family:monospace;">${s.num}</div><div>${s.short}</div>`;
+        b.onclick = () => { curStageIdx = i; renderStagePipeline(); };
+        stEl.appendChild(b);
+      });
+      const s = STAGES[curStageIdx];
+      document.getElementById('stage-detail-card').innerHTML = `
+        <div class="row-between" style="border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:10px;">
+          <strong>${s.num}：${s.short}（${s.role}）</strong>
+          <code>${s.script}</code>
+        </div>
+        <div class="grid-3" style="font-size:13px;">
+          <div class="card" style="padding:12px;"><div class="muted">📥 输入契约</div><p>${s.input}</p></div>
+          <div class="card" style="padding:12px;"><div class="muted">⚙️ 核心处理</div><p>${s.process}</p></div>
+          <div class="card" style="padding:12px;"><div class="muted">📤 输出产物</div><p><code>${s.output}</code></p></div>
+        </div>
+      `;
+    }
+
+    let bpttStep = 18, bpttPlaying = true;
+    const bpttSlider = document.getElementById('bptt-step-slider');
+    const bpttLabel = document.getElementById('bptt-step-label');
+    const bpttPlayBtn = document.getElementById('bptt-play-btn');
+    bpttSlider.oninput = () => { bpttStep = parseInt(bpttSlider.value, 10); bpttLabel.textContent = `${bpttStep}/32`; drawBpttCanvas(); };
+    bpttPlayBtn.onclick = () => { bpttPlaying = !bpttPlaying; bpttPlayBtn.textContent = bpttPlaying ? '暂停动画' : '自动播放'; };
+    setInterval(() => {
+      if (bpttPlaying && activeTabId === 'tab-bptt') {
+        bpttStep = (bpttStep + 1) % 33;
+        bpttSlider.value = bpttStep; bpttLabel.textContent = `${bpttStep}/32`;
+        drawBpttCanvas();
+      }
+    }, 180);
+
+    function drawBpttCanvas() {
+      const cv = document.getElementById('bptt-canvas');
+      if (!cv) return;
+      const ctx = cv.getContext('2d'), W = cv.width, H = cv.height, c = themeColors();
+      ctx.clearRect(0, 0, W, H);
+      ctx.strokeStyle = c.border; ctx.beginPath(); ctx.moveTo(20, 145); ctx.lineTo(W - 20, 145); ctx.stroke();
+      ctx.fillStyle = c.fg; ctx.font = 'bold 13px sans-serif';
+      ctx.fillText('传统无模型 PPO / BCPPO（把物理引擎当黑盒，零阶随机试错）：', 28, 28);
+      ctx.fillStyle = c.muted; ctx.font = '12px sans-serif';
+      ctx.fillText('摔倒只拿到标量低分，不知道哪个关节偏了多少度导致失败，只能盲目撒噪声碰运气', 28, 48);
+      const xStart = 70, xEnd = W - 120;
+      [-30, 25, -16, 34].forEach((off, idx) => {
+        ctx.strokeStyle = c.muted; ctx.globalAlpha = 0.45; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(xStart, 95);
+        for (let i = 1; i <= 12; i++) ctx.lineTo(xStart + (xEnd - xStart) * (i / 32) * 1.4, 95 + Math.sin(i * 0.6 + idx) * off * (i / 10));
+        ctx.stroke();
+      });
+      ctx.globalAlpha = 1.0; ctx.fillStyle = c.error;
+      ctx.fillText('✕ 硬终止阶跃导数为 0，无法反传物理原因', 500, 98);
+
+      ctx.fillStyle = c.fg; ctx.font = 'bold 13px sans-serif';
+      ctx.fillText('本项目 SuperMimic（冻结 JointWorldModel 脑内连续展开 H=32 步 + 链式法则一阶解析梯度反传）：', 28, 174);
+      const yBase = 242;
+      ctx.setLineDash([5, 4]); ctx.strokeStyle = c.c2; ctx.lineWidth = 2; ctx.beginPath();
+      for (let i = 0; i <= 32; i++) {
+        const x = xStart + (xEnd - xStart) * (i / 32), y = yBase - Math.sin((i / 32) * Math.PI) * 28;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c.c2; ctx.font = '12px sans-serif'; ctx.fillText('参考目标轨迹 ref[t_cur]', xStart + 10, 198);
+
+      for (let i = 0; i <= 32; i++) {
+        const x = xStart + (xEnd - xStart) * (i / 32), y = yBase - Math.sin((i / 32) * Math.PI) * 22 + Math.cos(i * 0.4) * 4;
+        if (i > 0 && i <= bpttStep) {
+          const xp = xStart + (xEnd - xStart) * ((i - 1) / 32), yp = yBase - Math.sin(((i - 1) / 32) * Math.PI) * 22 + Math.cos((i - 1) * 0.4) * 4;
+          ctx.strokeStyle = c.c1; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(xp, yp); ctx.lineTo(x, y); ctx.stroke();
+        }
+        ctx.fillStyle = i === 0 ? c.c3 : (i <= bpttStep ? c.c1 : c.border);
+        ctx.beginPath(); ctx.arc(x, y, i === bpttStep ? 6.5 : 4, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.strokeStyle = c.c5; ctx.lineWidth = 2; ctx.strokeRect(xEnd + 12, yBase - 24, 92, 46);
+      ctx.fillStyle = c.fg; ctx.font = 'bold 12px sans-serif'; ctx.fillText('Tail Critic', xEnd + 22, yBase - 4);
+      ctx.font = '12px monospace'; ctx.fillText('min(V1,V2)', xEnd + 18, yBase + 13);
+
+      if (bpttStep > 0) {
+        const xCur = xStart + (xEnd - xStart) * (bpttStep / 32), yGrad = 286;
+        ctx.strokeStyle = c.c4; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(xCur, yGrad); ctx.lineTo(xStart + 6, yGrad); ctx.stroke();
+        ctx.fillStyle = c.c4; ctx.beginPath(); ctx.moveTo(xStart, yGrad); ctx.lineTo(xStart + 10, yGrad - 5); ctx.lineTo(xStart + 10, yGrad + 5); ctx.closePath(); ctx.fill();
+        ctx.font = '12px sans-serif';
+        ctx.fillText(`反向传播链式梯度 ∂R/∂θ (穿过 FK + JointWorldModel + 软终止，${bpttStep}步雅可比保留率 0.98^${bpttStep} = ${Math.pow(0.98, bpttStep).toFixed(2)})`, xStart + 18, yGrad + 18);
+      }
+    }
+
+    const annealSlider = document.getElementById('anneal-slider');
+    annealSlider.oninput = drawAnnealCanvas;
+    function drawAnnealCanvas() {
+      const cv = document.getElementById('anneal-canvas');
+      if (!cv) return;
+      const ctx = cv.getContext('2d'), W = cv.width, H = cv.height, c = themeColors();
+      const iter = parseInt(annealSlider.value, 10);
+      const calcW = (it) => Math.max(0.05, 1.0 * (1.0 - Math.min(1, it / 3500)) + 0.05 * Math.min(1, it / 3500));
+      const curW = calcW(iter);
+      document.getElementById('anneal-readout').textContent = `iter=${iter} (bc_coef=${curW.toFixed(2)})`;
+      ctx.clearRect(0, 0, W, H);
+      const padL = 55, padR = 30, padT = 22, padB = 32, pw = W - padL - padR, ph = H - padT - padB;
+      ctx.strokeStyle = c.border; ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, padT + ph); ctx.lineTo(padL + pw, padT + ph); ctx.stroke();
+      ctx.fillStyle = c.muted; ctx.font = '12px monospace';
+      ctx.fillText('1.00', 14, padT + 6); ctx.fillText('0.05', 14, padT + ph);
+      ctx.fillText('iter=0', padL, H - 8); ctx.fillText('iter=3500 (70%)', padL + pw * 0.7 - 45, H - 8); ctx.fillText('iter=5000', padL + pw - 62, H - 8);
+      ctx.strokeStyle = c.c3; ctx.lineWidth = 3; ctx.beginPath();
+      for (let it = 0; it <= 5000; it += 50) {
+        const x = padL + (it / 5000) * pw, y = padT + (1 - (calcW(it) - 0.05) / 0.95) * ph;
+        if (it === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      const cx = padL + (iter / 5000) * pw, cy = padT + (1 - (curW - 0.05) / 0.95) * ph;
+      ctx.fillStyle = c.c1; ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI * 2); ctx.fill();
+    }
+
+    const TENSOR_SPECS = [
+      {
+        name: '510维 Tracker 盲打观测 (TrackerCfg)', total: 510,
+        slices: [
+          { name: 'ref_cmd_36', range: '0:36', dim: 36, color: 'c1', frame: 'Policy关节序 + 骨盆局部系', desc: '单帧控制指令：[目标关节角(29), 局部线速度(3), 局部角速度(3), 接触意图(1)]。部署时由 10Hz Generator 插值供给。' },
+          { name: 'base_ang_vel_hist', range: '36:51', dim: 15, color: 'c2', frame: '骨盆局部系 (5×3)', desc: '过去 5 帧骨盆局部系角速度历史（MuJoCo freejoint qvel[3:6] 原生对齐）。' },
+          { name: 'joint_pos_rel_hist', range: '51:196', dim: 145, color: 'c3', frame: '相对有效零位 (5×29)', desc: '过去 5 帧相对关节角历史，含环境零位标定偏置 xi 补偿。' },
+          { name: 'joint_vel_rel_hist', range: '196:341', dim: 145, color: 'c5', frame: '关节角速度 (5×29)', desc: '过去 5 帧关节角速度历史。' },
+          { name: 'actions_hist', range: '341:486', dim: 145, color: 'c6', frame: '无噪历史动作 (5×29)', desc: '过去 5 帧策略输出历史，[457:486] 为最新一步动作。' },
+          { name: 'project_gravity_hist', range: '486:501', dim: 15, color: 'c2', frame: '骨盆系重力投影 (5×3)', desc: '世界重力在骨盆系的投影，等价于 IMU 倾角测量。' },
+          { name: 'obj_pos_b & ori_b', range: '501:510', dim: 9, color: 'c4', frame: '躯干 torso_link 局部系', desc: '当前物体相对胸腔锚点 torso_link 的位置(3) + 行优先 6D 朝向(6)。' }
+        ]
+      },
+      {
+        name: '890维 上帝视角特权观测 (PrivilegedCfg)', total: 890,
+        slices: [
+          { name: 'joint_pos_vel_future', range: '0:464', dim: 464, color: 'c1', frame: '未来8帧 (8×58)', desc: '未来 8 帧参考关节角与参考角速度，[0:29] 即当前帧目标关节角。' },
+          { name: 'anchor_future', range: '464:536', dim: 72, color: 'c2', frame: 'torso_link 局部系', desc: '未来 8 帧参考躯干锚点的相对位置(24)与 6D 旋转(48)。' },
+          { name: 'ref_obj_pose_future', range: '536:608', dim: 72, color: 'c3', frame: '当前真实物体局部系!', desc: '未来 8 帧参考物体在当前真实物体坐标系下的相对位置(24)与 6D 旋转(48)。' },
+          { name: 'ref_obj_vel_future', range: '608:656', dim: 48, color: 'c4', frame: 'sugar_anchor_vel_rotmat', desc: '未来 8 帧参考物体线速度与角速度投影。' },
+          { name: 'robot_body_pos_ori', range: '656:782', dim: 126, color: 'c5', frame: 'torso_link 局部系', desc: '全身 14 个关键刚体在躯干系下的位置(42)与 6D 旋转(84)。' },
+          { name: 'proprio_and_act', range: '782:875', dim: 93, color: 'c6', frame: '骨盆速度+关节+动作', desc: '基座线/角速度(6) + 相对关节角(29) + 关节角速度(29) + 上一步动作(29)。' },
+          { name: 'cur_obj_pose_vel', range: '875:890', dim: 15, color: 'c4', frame: 'torso_link 局部系', desc: '当前真实物体的位置(3)+6D旋转(6)+线速度(3)+角速度(3)。' }
+        ]
+      },
+      {
+        name: '84维 人-物联合世界状态 (s_flat)', total: 84,
+        slices: [
+          { name: 'root_pos & quat', range: '0:7', dim: 7, color: 'c1', frame: '场地世界系', desc: '骨盆坐标(3) + wxyz单位四元数(4)。' },
+          { name: 'joint_pos (q)', range: '7:36', dim: 29, color: 'c2', frame: '29铰链关节', desc: '全身 29 关节角度。' },
+          { name: 'root_vel', range: '36:42', dim: 6, color: 'c3', frame: '世界系', desc: '骨盆世界系线速度(3) + 角速度(3)。' },
+          { name: 'joint_vel (qd)', range: '42:71', dim: 29, color: 'c5', frame: '29关节角速度', desc: '全身 29 关节角速度。' },
+          { name: 'obj_state_13', range: '71:84', dim: 13, color: 'c4', frame: '场地世界系', desc: '交互物体的位置(3)+四元数(4)+线速度(3)+角速度(3)。' }
+        ]
+      },
+      {
+        name: '108维 SE(2) 航向不变世界模型特征', total: 108,
+        slices: [
+          { name: 'robot_se2_feat', range: '0:71', dim: 71, color: 'c1', frame: '消除水平(x,y)与Yaw', desc: '离地高度(1)+去偏航6D倾角(6)+关节角(29)+航向系线/角速度(6)+关节角速度(29)。' },
+          { name: 'obj_heading_feat', range: '71:87', dim: 16, color: 'c3', frame: '机器人航向系', desc: '物体航向系坐标(3)+高度差(1)+航向系6D朝向(6)+航向系线/角速度(6)。' },
+          { name: 'contact_in_obj', range: '87:108', dim: 21, color: 'c4', frame: '物体自身局部系 (7×3)', desc: '左右橡胶手、脚踝、髋与骨盆共 7 个部位在物体局部系下的三维坐标，直接暴露接触距离！' }
+        ]
+      }
+    ];
+    let curTensorIdx = 0, curSliceIdx = 0;
+    function renderTensorInspector() {
+      const sel = document.getElementById('tensor-selector'), bar = document.getElementById('tensor-bar'), chips = document.getElementById('tensor-chips');
+      const c = themeColors();
+      sel.innerHTML = '';
+      TENSOR_SPECS.forEach((ts, i) => {
+        const b = document.createElement('button');
+        b.className = i === curTensorIdx ? 'active' : '';
+        b.textContent = ts.name.split(' ')[0] + ' ' + ts.name.split(' ')[1];
+        b.onclick = () => { curTensorIdx = i; curSliceIdx = 0; renderTensorInspector(); };
+        sel.appendChild(b);
+      });
+      const spec = TENSOR_SPECS[curTensorIdx];
+      document.getElementById('tensor-title').textContent = spec.name;
+      document.getElementById('tensor-total-dim').textContent = `总维度: ${spec.total}`;
+      bar.innerHTML = ''; chips.innerHTML = '';
+      spec.slices.forEach((sl, idx) => {
+        const d = document.createElement('div');
+        d.className = 'tensor-seg';
+        d.style.width = `${Math.max(4, (sl.dim / spec.total) * 100)}%`;
+        d.style.background = c[sl.color];
+        if (idx === curSliceIdx) { d.style.outline = `3px solid ${c.fg}`; d.style.outlineOffset = '-3px'; }
+        d.textContent = sl.dim >= 20 ? `${sl.dim}D` : '';
+        d.onclick = () => { curSliceIdx = idx; renderTensorInspector(); };
+        bar.appendChild(d);
+
+        const ch = document.createElement('button');
+        ch.className = idx === curSliceIdx ? 'active' : '';
+        ch.style.fontSize = '12px';
+        ch.textContent = `[${sl.range}] ${sl.name}`;
+        ch.onclick = () => { curSliceIdx = idx; renderTensorInspector(); };
+        chips.appendChild(ch);
+      });
+      const active = spec.slices[curSliceIdx];
+      document.getElementById('slice-inspector').innerHTML = `
+        <div class="row-between"><strong>切片 [${active.range}] — ${active.name}（${active.dim} 维）</strong><span class="badge">${active.frame}</span></div>
+        <p class="muted" style="margin-top:6px;">${active.desc}</p>
+      `;
+    }
+
+    let simSubstep = 0;
+    const simSlider = document.getElementById('sim-time-slider');
+    function setSimSubstep(v) {
+      simSubstep = Math.max(0, Math.min(250, v));
+      simSlider.value = simSubstep;
+      document.getElementById('sim-time-label').textContent = `${(simSubstep * 0.002).toFixed(3)} s`;
+      drawSimTimeline();
+    }
+    simSlider.oninput = () => setSimSubstep(parseInt(simSlider.value, 10));
+    document.getElementById('sim-step-2ms').onclick = () => setSimSubstep((simSubstep + 1) % 251);
+    document.getElementById('sim-step-20ms').onclick = () => setSimSubstep((Math.floor(simSubstep / 10) * 10 + 10) % 251);
+
+    function drawSimTimeline() {
+      const cv = document.getElementById('sim-timeline-canvas');
+      if (!cv) return;
+      const ctx = cv.getContext('2d'), W = cv.width, H = cv.height, c = themeColors();
+      ctx.clearRect(0, 0, W, H);
+      const padL = 195, tw = W - padL - 25;
+      const tracks = [
+        { title: '高层大脑 Generator', sub: '每 0.400s 重规划', y: 48, period: 200, color: c.c5 },
+        { title: '底层小脑 Tracker', sub: '50Hz / 每 0.020s', y: 118, period: 10, color: c.c1 },
+        { title: 'MuJoCo 隐式 PD 物理', sub: '500Hz / 每 0.002s', y: 188, period: 1, color: c.c2 }
+      ];
+      tracks.forEach(tr => {
+        ctx.fillStyle = c.fg; ctx.font = 'bold 12px sans-serif'; ctx.fillText(tr.title, 18, tr.y - 4);
+        ctx.fillStyle = c.muted; ctx.font = '12px monospace'; ctx.fillText(tr.sub, 18, tr.y + 14);
+        ctx.strokeStyle = c.border; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(padL, tr.y); ctx.lineTo(padL + tw, tr.y); ctx.stroke();
+        if (tr.period === 1) {
+          for (let s = 0; s <= 250; s += 2) {
+            const x = padL + (s / 250) * tw;
+            ctx.strokeStyle = s <= simSubstep ? tr.color : c.border; ctx.lineWidth = 1.5;
+            ctx.beginPath(); ctx.moveTo(x, tr.y - 7); ctx.lineTo(x, tr.y + 7); ctx.stroke();
+          }
+        } else {
+          for (let s = 0; s <= 250; s += tr.period) {
+            const x = padL + (s / 250) * tw;
+            ctx.fillStyle = s <= simSubstep ? tr.color : c.border;
+            ctx.beginPath(); ctx.arc(x, tr.y, s === simSubstep ? 8 : 5, 0, Math.PI * 2); ctx.fill();
+          }
+        }
+      });
+      const curX = padL + (simSubstep / 250) * tw;
+      ctx.strokeStyle = c.c4; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(curX, 18); ctx.lineTo(curX, H - 15); ctx.stroke();
+
+      const ctrlStep = Math.floor(simSubstep / 10), subIdx = (simSubstep % 10) + 1;
+      const gOn = simSubstep % 200 === 0, tOn = simSubstep % 10 === 0;
+      document.getElementById('sim-frame-log').innerHTML = `
+        <strong>⏱ 当前时刻 t = ${(simSubstep * 0.002).toFixed(3)}s （第 ${ctrlStep} 控制步，第 ${subIdx}/10 物理子步）</strong>
+        <div class="grid-3" style="margin-top:8px;">
+          <div class="card" style="padding:10px;"><strong>${gOn ? '🟢 [触发重规划]' : '⚪ [读取缓存池]'} Generator：</strong><p class="muted">${gOn ? '16步 DDIM 去噪生成 8 个 10Hz 路点 → 线性插值为 36 帧 50Hz 指令并置换 BFS 关节序！' : `直接提供指令池第 ${ctrlStep % 20} 帧 36 维指令。`}</p></div>
+          <div class="card" style="padding:10px;"><strong>${tOn ? '🟢 [前向推理]' : '⚪ [锁存目标角]'} Tracker：</strong><p class="muted">${tOn ? '拼装 510 维盲打观测，算出新的 29 维目标关节角 q_target！' : '维持当前 q_target 不变，等待 10 个子步走完后滚动更新 5 帧历史。'}</p></div>
+          <div class="card" style="padding:10px;"><strong>🟢 [持续工作] MuJoCo 500Hz：</strong><p class="muted">实时解算 29 路隐式 PD 饱和力矩 + 物体角阻尼，执行 mj_step()。</p></div>
+        </div>
+      `;
+    }
+
+    const QA_ITEMS = [
+      { q: 'Q1：为什么要把原版 SUGAR 里的 PPO/BCPPO 换成 SuperMimic（世界模型 BPTT）？', loc: 'trainer.py / hoi_task.py', a: 'PPO 把物理和奖励当黑盒做零阶随机试错，样本利用率低；SuperMimic 在可微 JointWorldModel + 纯 PyTorch 正向运动学 FK 上连续展开 32 步 BPTT，直接获得一阶解析物理梯度 ∂R/∂a。' },
+      { q: 'Q2：32 步长时域 BPTT 怎么防止梯度爆炸和模型漏洞欺骗（Model Exploitation）？', loc: 'rotations.py / networks.py / trainer.py', a: '五层防护：k=8自回归训世界模型、atan2+零点泰勒展开防NaN、0.98状态雅可比衰减、5项Sigmoid软终止连乘、以及仅在真实数据上训练的双头悲观截断 Critic min(V1,V2)∈[-25,15]。' },
+      { q: 'Q3：为什么世界模型输入是 108 维 SE(2) 特征，输出增量是 82 维而非 84 维？', loc: 'hoi_task.py', a: '消除绝对 (x,y) 和 Yaw 实现平面平移旋转不变性，并拼入 7 个接触部位在物体局部系的 21 维坐标；两个单位四元数改用 3 维轴角增量（84-2=82维）右乘积分以严格保持模长为 1。' },
+      { q: 'Q4：没有碰撞检测器时，想象里的接触奖励、脚打滑和腾空时间怎么可微计算？', loc: 'networks.py & hoi_task.py', a: '通过世界模型并联的 5 维 contact_head 预测 sigmoid 接触概率，将离散接触奖励改写为期望奖励，落地瞬间平滑近似为 (1-p_prev)*p_curr。' },
+      { q: 'Q5：GPU 环形缓冲区为什么要拆开存 ep_ids 和 valid_transitions？', loc: 'replay.py', a: '外力推搡 push 打断受控物理连续性（不能训世界模型，由 valid_transitions 拦截），但未重置回合（Tracker 仍需跨 push 按 ep_ids 回溯真实 5 帧传感器历史）。' },
+      { q: 'Q6：为什么想象步奖励拿 s_next 对照 ref[t_cur] 而不是 ref[t_cur+1]？', loc: 'hoi_task.py', a: '严格匹配 IsaacLab step() 内部顺序：物理步进后先算终止与奖励，最后 command_manager 才将 time_steps 加 1，避免 20ms 相位滞后。' },
+      { q: 'Q7：Stage 3 为什么要加冻结 Refiner 的 BC 蒸馏并从 1.0 退火到 0.05？', loc: 'trainer.py', a: '初期借特权老师快速学会全身协同发力，中后期（3500轮）退火至 0.05 释放信息不对称束缚，让世界模型 BPTT 引导盲打学生利用 5 帧历史适应噪声。' },
+      { q: 'Q8：怎么保证手写的纯 PyTorch 观测与 IsaacLab 底层一模一样？', loc: 'env_bridge.py', a: '启动时自动步进 2 步并对 890 维特权观测的全部 18 个语义切片执行 <5e-3 最大绝对误差硬断言（实测误差 1e-5 ~ 1e-6）。' },
+      { q: 'Q9：为什么采样时前 25% 环境固定跑确定性动作（collect_det_frac=0.25）？', loc: 'trainer.py & commands.py', a: '保护 SUGAR 从第 0 帧拓荒填充自适应初始状态池 init_pool 的前 25% 环境成功率，同时后 75% 加噪探索丰富世界模型分布。' },
+      { q: 'Q10：Stage 5 扩散模型里的 noise_assignment（匈牙利匹配）有什么用？', loc: 'sugar_il/policy/generator.py', a: '在 Batch 内计算轨迹与随机噪声的距离矩阵做最优传输配对再加噪，大幅减少扩散流线交叉，使 16 步 DDIM 采样即可输出平滑指令。' },
+      { q: 'Q11：10Hz 扩散大脑是怎么跟 50Hz Tracker 丝滑衔接的？', loc: 'sugar_il_wrapper.py & policy_runner.py', a: '8 个 10Hz 路点经线性插值升频为 36 帧 50Hz 指令序列，并按 20 步（0.4s）滚动时域重规划（RHC）不断刷新缓冲池。' },
+      { q: 'Q12：本地 Sim-to-Sim 若误传了 Stage 1 的 refiner.pt 会怎样？', loc: 'scripts/sim2sim/policy_runner.py', a: '检测到 obs_dim=890 != 510 立即报错拦截，因为真实部署不存在未来 8 帧参考真值，部署仅需 generator.ckpt + tracker.pt。' }
+    ];
+    const mastered = new Set();
+    function renderQA() {
+      document.getElementById('qa-progress').textContent = `通关进度: ${mastered.size} / ${QA_ITEMS.length}`;
+      const list = document.getElementById('qa-list');
+      list.innerHTML = '';
+      QA_ITEMS.forEach((it, idx) => {
+        const d = document.createElement('div');
+        d.className = 'subbox';
+        d.innerHTML = `
+          <div class="row-between">
+            <button class="q-btn" style="text-align:left;flex:1;">${it.q}</button>
+            <label style="font-size:12.5px;cursor:pointer;"><input type="checkbox" ${mastered.has(idx) ? 'checked' : ''}/> 已吃透</label>
+          </div>
+          <div class="q-ans hidden" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:13px;">
+            <div class="muted" style="font-family:monospace;">📍 源码定位: ${it.loc}</div>
+            <p>${it.a}</p>
+          </div>
+        `;
+        d.querySelector('.q-btn').onclick = () => d.querySelector('.q-ans').classList.toggle('hidden');
+        d.querySelector('input').onchange = (e) => { if (e.target.checked) mastered.add(idx); else mastered.delete(idx); renderQA(); };
+        list.appendChild(d);
+      });
+    }
+
+    const TERMS = [
+      { k: 'DoF (自由度)', d: '可独立转动的关节电机数，Unitree G1 共 29 DoF。' },
+      { k: 'FK (正向运动学)', d: '由根部位姿与 29 关节角几何递推全身各连杆三维坐标与速度。' },
+      { k: 'Quaternion (wxyz)', d: '无万向节死锁的四元数旋转，实部 w 严格在第 0 位。' },
+      { k: 'SE(2) 航向不变性', d: '消除水平 (x,y) 与绝对偏航角 Yaw，使动力学模型在任意位置和朝向通用。' },
+      { k: 'World Model & BPTT', d: '神经网络虚拟物理引擎 + 连续 32 步想象展开并随时间反向传播一阶解析梯度。' },
+      { k: 'GAE & Bootstrap', d: '广义优势估计计算 Critic 目标回报；第 32 步末尾用双头最小值 Critic 估算剩余长期价值。' },
+      { k: 'DDPM / DDIM', d: '扩散生成策略，训练 50 步加噪预测，推理 16 步高速去噪生成未来 36 维指令。' },
+      { k: 'BFS vs SDK 关节序', d: 'IsaacLab 广度优先关节序与 MuJoCo 深度优先关节序，需按名字建立双向置换索引。' }
+    ];
+    function renderTerms() {
+      const kw = document.getElementById('term-search').value.trim().toLowerCase();
+      document.getElementById('term-grid').innerHTML = TERMS
+        .filter(t => !kw || t.k.toLowerCase().includes(kw) || t.d.toLowerCase().includes(kw))
+        .map(t => `<div class="subbox" style="font-size:13px;"><strong><code>${t.k}</code></strong><p class="muted">${t.d}</p></div>`)
+        .join('');
+    }
+    document.getElementById('term-search').oninput = renderTerms;
+
+    function drawAllCanvases() {
+      drawTaskCanvas(); drawBpttCanvas(); drawAnnealCanvas(); drawSimTimeline(); renderTensorInspector();
+    }
+    renderTaskSection(); renderRepoSection(); renderStagePipeline(); renderTensorInspector();
+    setSimSubstep(0); renderQA(); renderTerms(); drawAllCanvases();
+    window.addEventListener('resize', drawAllCanvases);
+  </script>
+</body>
+</html>

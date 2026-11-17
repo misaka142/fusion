@@ -16,7 +16,7 @@ import math
 import os
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Sequence
 
@@ -390,6 +390,17 @@ class FKResult:
     anchor_rotmat_w: Tensor     # (B, 3, 3)  torso_link world rotmat
     anchor_lin_vel_w: Tensor    # (B, 3)
     anchor_ang_vel_w: Tensor    # (B, 3)
+
+    def scale_grad(self, alpha: float) -> "FKResult":
+        """Same values, gradients scaled by `alpha` (equals running FK on `x * alpha + x.detach() * (1 - alpha)`)."""
+        if alpha == 1.0:
+            return self
+        return FKResult(
+            **{
+                f.name: getattr(self, f.name) * alpha + getattr(self, f.name).detach() * (1.0 - alpha)
+                for f in fields(self)
+            }
+        )
 
 
 class FastTreeKinematics(nn.Module):

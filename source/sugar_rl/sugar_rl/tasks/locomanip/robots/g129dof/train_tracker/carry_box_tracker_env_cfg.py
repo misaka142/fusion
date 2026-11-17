@@ -109,6 +109,20 @@ class RewardsCfg(BaseRewardsCfg):
             "threshold": 0.1,
         },
     )
+    motion_obj_pos_place = RewTerm(
+        func=mdp.motion_obj_pos_place_exp,
+        weight=1.0,
+        params={"command_name": "motion", "std": 0.08, "window": 25},
+    )
+    motion_feet_height = RewTerm(
+        func=mdp.motion_feet_height_error_exp,
+        weight=0.25,
+        params={
+            "command_name": "motion",
+            "std": 0.06,
+            "body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+        },
+    )
 
 @configclass
 class TerminationsCfg(BaseTerminationsCfg):
