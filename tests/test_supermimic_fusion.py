@@ -1401,6 +1401,19 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
         max_g_diff = max((g1 - g2).abs().max().item() for g1, g2 in zip(grads_ref, grads_opt))
         assert max_g_diff < 1e-4, f"Compiled + FK-reuse policy gradient diverged: {max_g_diff}"
 
+        # --- 3b. CUDAGraph multi-step BPTT lifecycle check (when CUDA is available) ---
+        if DEVICE.type == "cuda":
+            b_cg = _SyntheticSugarBridge(stage="refiner", num_envs=8, device=DEVICE)
+            cfg_cg = SuperMimicTrainCfg(
+                steps_per_env=6, replay_capacity=24, wm_seq_len=2, wm_updates_per_iter=2, wm_batch_size=8,
+                wm_hidden_dims=(32, 32), policy_hidden_dims=(32, 32), wm_warmup_iters=0, imagination_horizon=2,
+                policy_updates_per_iter=2, policy_batch_size=8, enable_tensorboard=False,
+                compile_bptt=True, compile_backend="cudagraphs", compile_mode="reduce-overhead",
+            )
+            tr_cg = SuperMimicTrainer(b_cg, log_dir=tmp / "cg_test", cfg=cfg_cg)
+            assert tr_cg._use_cudagraph_mark is True
+            tr_cg.learn(max_iterations=2)
+
         # --- 4. Strict CUDA zero-host-sync check inside hot training loops ---
         if DEVICE.type == "cuda" and hasattr(torch.cuda, "set_sync_debug_mode"):
             torch.cuda.synchronize()

@@ -274,7 +274,10 @@ class SuperMimicTrainer:
             comp_kwargs: dict[str, Any] = {"backend": self.cfg.compile_backend}
             if self.cfg.compile_backend == "inductor" and self.cfg.compile_mode not in (None, "", "default"):
                 comp_kwargs["mode"] = self.cfg.compile_mode
-                self._use_cudagraph_mark = self.cfg.compile_mode in ("reduce-overhead", "max-autotune")
+            self._use_cudagraph_mark = (self.cfg.compile_backend == "cudagraphs") or (
+                self.cfg.compile_backend == "inductor"
+                and self.cfg.compile_mode in ("reduce-overhead", "max-autotune")
+            )
             self._wm_step_fn = torch.compile(self._wm_step, **comp_kwargs)
             self._img_step_fn = torch.compile(self._imagine_step, **comp_kwargs)
 
@@ -539,8 +542,10 @@ class SuperMimicTrainer:
             loss_contact_sum = torch.zeros((), dtype=torch.float32, device=self.device)
             last_metrics: dict[str, Tensor] = {}
 
+            # Mark step boundary ONCE per full rollout+backward (never inside the k-step loop,
+            # or CUDAGraph Trees will overwrite earlier steps' outputs needed by autograd).
+            self._mark_cudagraph_step()
             for t in range(eff_k):
-                self._mark_cudagraph_step()
                 s_cur, l_s, l_c, last_metrics = self._wm_step_fn(
                     s_cur,
                     batch.actions[:, t],
@@ -741,9 +746,10 @@ class SuperMimicTrainer:
                     bc_term = self._teacher_bc(s_cur, prev_a, m_ids, t_0, xi, fk_cur, a_mean).mean()
                     policy_loss = bc_term
                 else:
+                    # Mark step boundary ONCE per H-step rollout+backward so earlier steps' activations stay valid
+                    self._mark_cudagraph_step()
                     for tau in range(H):
                         t_cur = t_0 + tau
-                        self._mark_cudagraph_step()
                         (
                             s_next,
                             fk_next,
