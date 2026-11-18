@@ -91,6 +91,10 @@ def main() -> None:
         if args_cli.teacher_motion_folder is not None:
             m_cfg.teacher_motion_folder = args_cli.teacher_motion_folder
 
+        from sugar_rl.assets.objects.objects import apply_dataset_box_spec
+
+        apply_dataset_box_spec(env_cfg, m_cfg.motion_folder, m_cfg.teacher_motion_folder)
+
     ckpt_path = retrieve_file_path(args_cli.checkpoint)
     log_dir = os.path.dirname(os.path.abspath(ckpt_path))
 

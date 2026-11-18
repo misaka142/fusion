@@ -158,6 +158,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "motion"):
             env_cfg.commands.motion.teacher_motion_folder = args_cli.teacher_motion_folder
 
+    if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "motion"):
+        from sugar_rl.assets.objects.objects import apply_dataset_box_spec
+
+        apply_dataset_box_spec(
+            env_cfg,
+            env_cfg.commands.motion.motion_folder,
+            env_cfg.commands.motion.teacher_motion_folder,
+        )
+
     if getattr(args_cli, "teacher_ckpt", None) is not None:
         if hasattr(agent_cfg, "algorithm") and hasattr(agent_cfg.algorithm, "teacher_ckpt"):
             agent_cfg.algorithm.teacher_ckpt = args_cli.teacher_ckpt

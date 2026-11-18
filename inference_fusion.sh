@@ -4,15 +4,22 @@
 #
 # Usage:
 #   bash inference_fusion.sh <TASK_NAME> <EXP_NAME> [NUM_ENVS] [VIDEO_LEN]
-# Example:
-#   bash inference_fusion.sh CarryBox sm_run1 4 200
+#   (Optional env override: MOTION_DIR=data/OmniCarryBox bash inference_fusion.sh CarryBox sm_omni_v1)
 # =============================================================================
 set -uo pipefail
 
 TASK_NAME="${1:-CarryBox}"
-EXP_NAME="${2:-sm_run1}"
+EXP_NAME="${2:-sm_omni_v1}"
 NUM_ENVS="${3:-4}"
 VIDEO_LEN="${4:-200}"
+
+if [[ -z "${MOTION_DIR:-}" ]]; then
+    if [[ "$TASK_NAME" == "CarryBox" && -d "data/OmniCarryBox" ]]; then
+        MOTION_DIR="data/OmniCarryBox"
+    else
+        MOTION_DIR="data/${TASK_NAME}"
+    fi
+fi
 
 OUT_DIR="outputs/${TASK_NAME}_${EXP_NAME}"
 TRACKER_CKPT="${OUT_DIR}/ckpts/tracker.pt"
@@ -23,7 +30,7 @@ python -u scripts/supermimic/play.py \
     --task "Sugar-G129dof-${TASK_NAME}-Inference" \
     --checkpoint "${TRACKER_CKPT}" \
     --generator_checkpoint "${GENERATOR_CKPT}" \
-    --motion_folder "data/${TASK_NAME}" \
+    --motion_folder "${MOTION_DIR}" \
     --num_envs "${NUM_ENVS}" \
     --eval_random_motion \
     --headless \

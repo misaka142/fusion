@@ -336,7 +336,12 @@ def _try_extract_usd_to_stl(usd_path: Path, out_stl_path: Path) -> Path | None:
             return None
         xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
         sub_meshes = []
-        for prim in stage.Traverse():
+        traverse_iter = (
+            stage.Traverse(Usd.TraverseInstanceProxies())
+            if hasattr(Usd, "TraverseInstanceProxies")
+            else stage.Traverse()
+        )
+        for prim in traverse_iter:
             if not prim.IsA(UsdGeom.Mesh):
                 continue
             mesh_geom = UsdGeom.Mesh(prim)
@@ -371,9 +376,43 @@ def _try_extract_usd_to_stl(usd_path: Path, out_stl_path: Path) -> Path | None:
 
 
 def _discover_object_mesh(
-    spec: Sim2SimTaskSpec, descriptions_dir: Path | None, cache_dir: Path
-) -> tuple[Path | None, np.ndarray | None, np.ndarray | None]:
-    """Find object `.obj`/`.stl`/`.ply` (or extract from `.usd`) and return `(mesh_path, center_xyz, half_extents)`."""
+    spec: Sim2SimTaskSpec,
+    descriptions_dir: Path | None,
+    cache_dir: Path,
+    motion_folder: Path | None = None,
+) -> tuple[Path | None, np.ndarray | None, np.ndarray | None, str]:
+    """Find object `.obj`/`.stl`/`.ply` (or extract from `.usd`) and return `(mesh_path, center_xyz, half_extents, tag)`."""
+    # Priority 0: Dataset-local object override (`box_spec.json` / `obj_aligned.obj` inside `motion_folder`, e.g. OmniRetarget)
+    if motion_folder is not None:
+        m_dir = Path(motion_folder).resolve()
+        for cand_dir in (m_dir, m_dir.parent):
+            spec_json = cand_dir / "box_spec.json"
+            if spec_json.is_file():
+                import json
+
+                meta = json.loads(spec_json.read_text(encoding="utf-8"))
+                mesh_rel = meta.get("mesh_file", "obj_aligned.obj")
+                local_mesh = cand_dir / mesh_rel
+                if not local_mesh.is_file():
+                    raise FileNotFoundError(
+                        f"[Scene Builder] Found `{spec_json}`, but missing dataset mesh `{local_mesh}`. "
+                        f"Refusing silent box fallback; please re-run `convert_omniretarget_to_sugar.py`."
+                    )
+                import trimesh
+
+                loaded = trimesh.load(str(local_mesh), force="mesh")
+                # Use convex hull for clean fast MuJoCo collision/visual (<2k verts)
+                hull = loaded.convex_hull
+                bounds = np.asarray(hull.bounds, dtype=np.float64)
+                center = 0.5 * (bounds[0] + bounds[1])
+                half_ext = np.maximum(0.5 * (bounds[1] - bounds[0]), 0.01)
+                ds_tag = str(meta.get("dataset", "custom")).lower()
+                stl_cache = cache_dir / f"{spec.object_subdir}_{ds_tag}.stl"
+                if (not stl_cache.exists()) or (stl_cache.stat().st_mtime < local_mesh.stat().st_mtime):
+                    stl_cache.parent.mkdir(parents=True, exist_ok=True)
+                    hull.export(str(stl_cache))
+                return stl_cache.resolve(), center, half_ext, ds_tag
+
     roots: list[Path] = []
     if descriptions_dir is not None:
         roots.append(descriptions_dir)
@@ -402,7 +441,7 @@ def _discover_object_mesh(
                 break
 
     if mesh_file is None:
-        return None, None, None
+        return None, None, None, "default"
 
     try:
         import trimesh
@@ -419,9 +458,9 @@ def _discover_object_mesh(
                 stl_cache.parent.mkdir(parents=True, exist_ok=True)
                 loaded.export(str(stl_cache))
             mesh_file = stl_cache.resolve()
-        return mesh_file, center, half_ext
+        return mesh_file, center, half_ext, "sugar"
     except Exception:
-        return None, None, None
+        return None, None, None, "default"
 
 
 # -----------------------------------------------------------------------------
@@ -674,16 +713,27 @@ def _add_object_collision_and_visual(
     prim_rgba = rgba_str if visual_mesh_name is None else "0.5 0.5 0.5 0.0"
 
     if spec.object_subdir in ("small_box", "big_box"):
-        ET.SubElement(
-            parent_el,
-            "geom",
-            type="box",
-            pos=_fmt_vec((cx, cy, cz)),
-            size=_fmt_vec((hx, hy, hz)),
-            rgba=prim_rgba,
-            **({"mass": f"{spec.object_mass:.6g}"} if not is_ghost else {}),
-            **col_kwargs,
-        )
+        if visual_mesh_name is not None:
+            ET.SubElement(
+                parent_el,
+                "geom",
+                type="mesh",
+                mesh=visual_mesh_name,
+                rgba=prim_rgba,
+                **({"mass": f"{spec.object_mass:.6g}"} if not is_ghost else {}),
+                **col_kwargs,
+            )
+        else:
+            ET.SubElement(
+                parent_el,
+                "geom",
+                type="box",
+                pos=_fmt_vec((cx, cy, cz)),
+                size=_fmt_vec((hx, hy, hz)),
+                rgba=prim_rgba,
+                **({"mass": f"{spec.object_mass:.6g}"} if not is_ghost else {}),
+                **col_kwargs,
+            )
     elif spec.object_subdir == "bottle":
         radius = 0.5 * (hx + hy)
         body_hz = hz * 0.72
@@ -762,6 +812,7 @@ def build_mujoco_scene_xml(
     descriptions_dir: str | Path | None = None,
     sim_dt: float = 0.002,
     output_xml_path: str | Path | None = None,
+    motion_folder: str | Path | None = None,
 ) -> tuple[Path, Sim2SimTaskSpec, dict[str, str]]:
     """Build a complete, self-contained MuJoCo scene XML for any of the 6 SUGAR tasks.
 
@@ -770,6 +821,7 @@ def build_mujoco_scene_xml(
     """
     spec = resolve_task_spec(task_name)
     desc_path = Path(descriptions_dir).resolve() if descriptions_dir is not None else None
+    motion_path = Path(motion_folder).resolve() if motion_folder is not None else None
     cache_dir = (
         Path(output_xml_path).resolve().parent
         if output_xml_path is not None
@@ -778,7 +830,9 @@ def build_mujoco_scene_xml(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     g1_mesh_dir = _discover_g1_mesh_dir(desc_path)
-    obj_mesh_path, obj_center, obj_half_ext = _discover_object_mesh(spec, desc_path, cache_dir / "meshes")
+    obj_mesh_path, obj_center, obj_half_ext, obj_tag = _discover_object_mesh(
+        spec, desc_path, cache_dir / "meshes", motion_folder=motion_path
+    )
 
     if obj_center is None or obj_half_ext is None:
         obj_half_ext = np.asarray(spec.default_half_extents, dtype=np.float64)
@@ -886,10 +940,11 @@ def build_mujoco_scene_xml(
     ET.SubElement(target_body, "site", name="target_axis_y", type="cylinder", fromto="0 0 0 0 0.14 0", size="0.006", rgba="0.2 0.95 0.2 0.75")
     ET.SubElement(target_body, "site", name="target_axis_z", type="cylinder", fromto="0 0 0 0 0 0.14", size="0.006", rgba="0.2 0.45 0.98 0.75")
 
+    suffix = "" if obj_tag in ("sugar", "default") else f"_{obj_tag}"
     xml_path = (
         Path(output_xml_path).resolve()
         if output_xml_path is not None
-        else (cache_dir / f"g1_{spec.task_name.lower()}_scene.xml").resolve()
+        else (cache_dir / f"g1_{spec.task_name.lower()}{suffix}_scene.xml").resolve()
     )
     ET.indent(mj_el, space="  ")
     xml_path.write_text(ET.tostring(mj_el, encoding="unicode"), encoding="utf-8")

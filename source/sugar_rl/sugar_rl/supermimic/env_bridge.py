@@ -15,6 +15,7 @@ Responsibilities:
 from __future__ import annotations
 
 import functools
+import re
 from typing import Any
 
 import torch
@@ -34,6 +35,60 @@ from .hoi_task import (
     resolve_task_profile,
 )
 from .urdf_kinematics import FastTreeKinematics
+
+
+def _resolve_undesired_body_ids(
+    cf_names: list[str],
+    task_name: str,
+    hoi_mode: str,
+    rew_mgr: Any = None,
+) -> list[int]:
+    """Resolve `undesired_contacts` body indices dynamically from `env.reward_manager` when present.
+
+    Matches IsaacLab's `SceneEntityCfg.resolve()` / `find_bodies()` regex semantics, while falling
+    back cleanly to task defaults in Inference / unit-test contexts without a live `reward_manager`.
+    """
+    if rew_mgr is not None:
+        term_names = getattr(rew_mgr, "_term_names", [])
+        term_cfgs = getattr(rew_mgr, "_term_cfgs", [])
+        cfg_map = dict(zip(term_names, term_cfgs))
+        if "undesired_contacts" in cfg_map:
+            uc_params = getattr(cfg_map["undesired_contacts"], "params", None) or {}
+            s_cfg = uc_params.get("sensor_cfg")
+            if s_cfg is not None:
+                b_ids = getattr(s_cfg, "body_ids", None)
+                if isinstance(b_ids, Tensor):
+                    return [int(x) for x in b_ids.detach().cpu().tolist()]
+                if isinstance(b_ids, (list, tuple)):
+                    return [int(x) for x in b_ids]
+                b_names = getattr(s_cfg, "body_names", None)
+                if b_names:
+                    pats = [b_names] if isinstance(b_names, str) else list(b_names)
+                    matched = [
+                        i
+                        for i, n in enumerate(cf_names)
+                        if any(re.fullmatch(p, n) for p in pats)
+                    ]
+                    if matched:
+                        return matched
+                if isinstance(b_ids, slice) and b_ids == slice(None):
+                    return list(range(len(cf_names)))
+
+    if task_name == "CarryBox":
+        pats = (r"pelvis.*", r".*_hip_.*_link", r".*_knee_link", r".*_ankle_pitch_link")
+        return [i for i, n in enumerate(cf_names) if any(re.fullmatch(p, n) for p in pats)]
+
+    allowed = {"left_ankle_roll_link", "right_ankle_roll_link"}
+    if hoi_mode == "hands":
+        allowed.update({"left_rubber_hand", "right_rubber_hand"})
+        if task_name == "StandBottle":
+            allowed.update({"left_knee_link", "right_knee_link"})
+    elif hoi_mode == "sit":
+        for n in cf_names:
+            if "hip" in n or "pelvis" in n:
+                allowed.add(n)
+
+    return [i for i, n in enumerate(cf_names) if n not in allowed]
 
 
 def assert_privileged_obs_aligned(
@@ -276,17 +331,13 @@ class SugarEnvBridge:
         self._lf_idx = cf_names.index("left_ankle_roll_link")
         self._rf_idx = cf_names.index("right_ankle_roll_link")
 
-        allowed = {"left_ankle_roll_link", "right_ankle_roll_link"}
-        if self.profile.hoi_mode == "hands":
-            allowed.update({"left_rubber_hand", "right_rubber_hand"})
-            if self.profile.task_name == "StandBottle":
-                allowed.update({"left_knee_link", "right_knee_link"})
-        elif self.profile.hoi_mode == "sit":
-            for n in cf_names:
-                if "hip" in n or "pelvis" in n:
-                    allowed.add(n)
-
-        undesired_ids = [i for i, n in enumerate(cf_names) if n not in allowed]
+        rew_mgr = getattr(self.env, "reward_manager", None)
+        undesired_ids = _resolve_undesired_body_ids(
+            cf_names=cf_names,
+            task_name=self.profile.task_name,
+            hoi_mode=self.profile.hoi_mode,
+            rew_mgr=rew_mgr,
+        )
         self._undesired_body_ids = torch.tensor(undesired_ids, dtype=torch.long, device=self.device)
         self._undesired_thresh = self.profile.undesired_threshold
         self.profile.num_undesired_bodies = max(1, len(undesired_ids))
@@ -468,8 +519,8 @@ class SugarEnvBridge:
         out = torch.zeros((self.num_envs, CONTACT_DIM), dtype=torch.float32, device=self.device)
 
         def _obj_force_active(sensor_name: str, thresh: float = 0.1) -> Tensor:
-            f_hist = sensors[sensor_name].data.force_matrix_w_history  # [N, H, 1, 1, 3]
-            return f_hist[:, :, 0, 0, :].norm(dim=-1).max(dim=1)[0] > thresh
+            f_hist = sensors[sensor_name].data.force_matrix_w_history  # [N, H, B, 1, 3]
+            return f_hist[:, :, :, 0, :].norm(dim=-1).sum(dim=2).max(dim=1)[0] > thresh
 
         lh = _obj_force_active("left_hand_forces")
         rh = _obj_force_active("right_hand_forces")

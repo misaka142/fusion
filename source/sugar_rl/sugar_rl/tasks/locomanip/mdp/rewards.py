@@ -188,17 +188,16 @@ def hands_contact(
 
     left_hand_contact_sensor: ContactSensor = env.scene.sensors[left_hand_sensor_cfg.name]
     right_hand_contact_sensor: ContactSensor = env.scene.sensors[right_hand_sensor_cfg.name]
-    left_hand_forces = left_hand_contact_sensor.data.force_matrix_w_history  # [num_envs, history(3), body_ids(1), filter_num(1), 3]
+    left_hand_forces = left_hand_contact_sensor.data.force_matrix_w_history  # [num_envs, history(3), body_ids(B), filter_num(1), 3]
     right_hand_forces = right_hand_contact_sensor.data.force_matrix_w_history
 
-
     left_curr_contact_force = torch.max(
-        torch.norm(left_hand_forces[:, :, 0, 0, :], dim=-1),
-        dim=1
+        torch.norm(left_hand_forces[:, :, :, 0, :], dim=-1).sum(dim=2),
+        dim=1,
     )[0]    # num_envs
     right_curr_contact_force = torch.max(
-        torch.norm(right_hand_forces[:, :, 0, 0, :], dim=-1),
-        dim=1
+        torch.norm(right_hand_forces[:, :, :, 0, :], dim=-1).sum(dim=2),
+        dim=1,
     )[0]    # num_envs
     is_contact = (left_curr_contact_force > threshold) * (right_curr_contact_force  > threshold)
     contact_label = command.contact_label

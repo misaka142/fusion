@@ -300,6 +300,7 @@ class MuJoCoSim2SimRunner:
             descriptions_dir=descriptions_dir,
             sim_dt=self.sim_dt,
             output_xml_path=scene_xml_out,
+            motion_folder=motion_folder,
         )
         self.mj_model = mujoco.MjModel.from_xml_path(str(self.xml_path))
         self.mj_data = mujoco.MjData(self.mj_model)

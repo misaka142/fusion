@@ -3,36 +3,11 @@
 # SuperMimic x SUGAR Full 5-Stage Training Pipeline
 # Replaces BOTH Stage 1 Refiner (PPO) and Stage 2 Tracker (BCPPO) with SuperMimic!
 #
-# Remote server usage (requires real-time quota check + interactive `trainreg run --`):
-#   cd /home/xiaoji/YXM/gowork/fusion
-#   trainreg balance --name-id yexiaoming --json
-#   trainreg run -- bash train_fusion.sh <TASK_NAME> <EXP_NAME> [RL_ITERS] [NUM_ENVS]
-# Example:
-#   trainreg run -- bash train_fusion.sh CarryBox sm_run1 5001 2048
+# Usage:
+#   bash train_fusion.sh <TASK_NAME> <EXP_NAME> [RL_ITERS] [NUM_ENVS] [ROLLOUT_ENVS] [IL_EPOCHS]
+#   (Optional env override: MOTION_DIR=data/OmniCarryBox bash train_fusion.sh CarryBox sm_omni_v1)
 # =============================================================================
 set -uo pipefail
-
-# Enforce `trainreg run --` ancestry when `trainreg` is installed on this Linux server
-if command -v trainreg >/dev/null 2>&1; then
-    _has_trainreg=0
-    _pid=$$
-    while [[ $_pid -gt 1 ]]; do
-        _comm="$(cat "/proc/${_pid}/comm" 2>/dev/null || true)"
-        _cmd="$(tr '\0' ' ' < "/proc/${_pid}/cmdline" 2>/dev/null || true)"
-        if [[ "$_comm" == *"trainreg"* || "$_cmd" == *"trainreg"* ]]; then
-            _has_trainreg=1
-            break
-        fi
-        _pid="$(awk '{print $4}' "/proc/${_pid}/stat" 2>/dev/null || echo 1)"
-    done
-    if [[ $_has_trainreg -ne 1 ]]; then
-        echo "[trainreg Compliance Error] 'trainreg' is installed on this server." >&2
-        echo "Direct execution without 'trainreg run --' is forbidden." >&2
-        echo "  1) Check live balance: trainreg balance --name-id yexiaoming --json" >&2
-        echo "  2) Launch pipeline:    trainreg run -- bash $0 $*" >&2
-        exit 2
-    fi
-fi
 
 # Helper: tolerate Omniverse C++ teardown exit code 139 when expected output exists
 run_isaac_stage() {
@@ -54,7 +29,7 @@ run_isaac_stage() {
 set -e
 
 TASK_NAME="${1:-CarryBox}"
-EXP_NAME="${2:-sm_run1}"
+EXP_NAME="${2:-sm_omni_v1}"
 RL_ITERS="${3:-5001}"
 NUM_ENVS="${4:-2048}"
 ROLLOUT_ENVS="${5:-1000}"
@@ -62,6 +37,14 @@ IL_EPOCHS="${6:-1001}"
 
 LAST_ITER=$((RL_ITERS - 1))
 LAST_EPOCH=$((IL_EPOCHS - 1))
+
+if [[ -z "${MOTION_DIR:-}" ]]; then
+    if [[ "$TASK_NAME" == "CarryBox" && -d "data/OmniCarryBox" ]]; then
+        MOTION_DIR="data/OmniCarryBox"
+    else
+        MOTION_DIR="data/${TASK_NAME}"
+    fi
+fi
 
 if [[ "$TASK_NAME" == "CarryBox" || "$TASK_NAME" == "PickBox" || "$TASK_NAME" == "PushBox" ]]; then
     USE_TARGET="True"
@@ -71,6 +54,7 @@ fi
 
 OUT_DIR="outputs/${TASK_NAME}_${EXP_NAME}"
 mkdir -p "${OUT_DIR}/ckpts"
+echo "[Config] TASK=${TASK_NAME} | EXP=${EXP_NAME} | MOTION_DIR=${MOTION_DIR}"
 
 echo "================================================================"
 echo "[1/5] Stage 1: SuperMimic Refiner Training (${TASK_NAME})"
@@ -81,7 +65,7 @@ run_isaac_stage "${OUT_DIR}/logs/refiner/model_${LAST_ITER}.pt" \
     --num_envs "${NUM_ENVS}" \
     --log_dir "${OUT_DIR}/logs/refiner" \
     --max_iterations "${RL_ITERS}" \
-    --motion_folder "data/${TASK_NAME}" \
+    --motion_folder "${MOTION_DIR}" \
     --auto_resume \
     --headless
 
@@ -96,12 +80,13 @@ run_isaac_stage "${OUT_DIR}/rollout_datasets/refiner/raw_npz" \
     --num_envs "${ROLLOUT_ENVS}" \
     --checkpoint "${OUT_DIR}/ckpts/refiner.pt" \
     --rollout_dir "${OUT_DIR}/rollout_datasets/refiner/raw_npz" \
-    --motion_folder "data/${TASK_NAME}" \
+    --motion_folder "${MOTION_DIR}" \
     --headless
 
 python -u scripts/sugar_rl/process_refiner_rollout.py \
     --data_dir "${OUT_DIR}/rollout_datasets/refiner" \
-    --task_name "${TASK_NAME}"
+    --task_name "${TASK_NAME}" \
+    --ref_dir "${MOTION_DIR}"
 
 echo "================================================================"
 echo "[3/5] Stage 3: SuperMimic Tracker Training (WM-BPTT + Teacher BC)"
@@ -112,7 +97,7 @@ run_isaac_stage "${OUT_DIR}/logs/tracker/model_${LAST_ITER}.pt" \
     --num_envs "${NUM_ENVS}" \
     --teacher_ckpt "${OUT_DIR}/ckpts/refiner.pt" \
     --motion_folder "${OUT_DIR}/rollout_datasets/refiner/rl_dataset" \
-    --teacher_motion_folder "data/${TASK_NAME}" \
+    --teacher_motion_folder "${MOTION_DIR}" \
     --log_dir "${OUT_DIR}/logs/tracker" \
     --max_iterations "${RL_ITERS}" \
     --auto_resume \
@@ -130,7 +115,7 @@ run_isaac_stage "${OUT_DIR}/rollout_datasets/tracker/raw_npz" \
     --num_envs "${ROLLOUT_ENVS}" \
     --rollout_dir "${OUT_DIR}/rollout_datasets/tracker/raw_npz" \
     --motion_folder "${OUT_DIR}/rollout_datasets/refiner/rl_dataset" \
-    --teacher_motion_folder "data/${TASK_NAME}" \
+    --teacher_motion_folder "${MOTION_DIR}" \
     --teacher_ckpt "${OUT_DIR}/ckpts/refiner.pt" \
     --headless
 

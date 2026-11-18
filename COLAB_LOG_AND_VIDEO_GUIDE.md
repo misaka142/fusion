@@ -189,6 +189,8 @@ if hasattr(env_cfg, "observations"):
 
 m_cfg = env_cfg.commands.motion
 m_cfg.motion_folder = motion_dir
+from sugar_rl.assets.objects.objects import apply_dataset_box_spec
+apply_dataset_box_spec(env_cfg, motion_dir)
 if is_inf:
     assert gen_ckpt and os.path.isfile(gen_ckpt), f"inference 模式必须提供有效的 GEN_CKPT，当前为: '{gen_ckpt}'"
     m_cfg.generator_checkpoint_path = gen_ckpt
@@ -204,7 +206,7 @@ bridge = SugarEnvBridge(env=env, task_name_or_id=task_id, verify_obs_on_init=Fal
 policy = load_supermimic_policy(ckpt_path, device="cuda:0")
 joint_names = list(bridge.fk.env_joint_names)
 
-xml_path, _, _ = build_mujoco_scene_xml(task_name)
+xml_path, _, _ = build_mujoco_scene_xml(task_name, motion_folder=motion_dir)
 mj_model = mujoco.MjModel.from_xml_path(str(xml_path))
 mj_data = mujoco.MjData(mj_model)
 p_adr = int(mj_model.jnt_qposadr[mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_JOINT, "pelvis_freejoint")])
@@ -288,9 +290,9 @@ cd /content/fusion
 # ==================== 换模型生成视频时，修改以下配置区 ====================
 TASK_NAME="CarryBox"          # 1. 任务名: CarryBox | PushBox | KickBox | PickBottle | StandBottle | SitChair
 STAGE_MODE="refiner"          # 2. 阶段模式: refiner (Stage 1) | tracker (Stage 3) | inference (Stage 6 闭环)
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v4_full/logs/refiner/model_200.pt"  # 3. 策略 .pt 权重路径
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_omni_v1_full/logs/refiner/model_400.pt"  # 3. 策略 .pt 权重路径
 GEN_CKPT=""                   # 4. 扩散生成器 .ckpt 路径（仅 STAGE_MODE="inference" 必填，其余保持 ""）
-MOTION_DIR="data/CarryBox"    # 5. 参考轨迹目录（tracker 模式也可指向精炼后的 .../rl_dataset）
+MOTION_DIR="data/OmniCarryBox" # 5. 参考轨迹目录（OmniRetarget 推荐用 data/OmniCarryBox；tracker 模式也可指向 .../rl_dataset）
 
 NUM_TRAJS=3                   # 连续录制几条轨迹的 MP4
 INF_STEPS=700                 # 仅 inference 闭环模式使用的最大步数（700 步 = 14 秒）
@@ -326,12 +328,12 @@ ls -lh "$DRIVE_VIDEO_DIR"/*.mp4
 
 ### 3.1 修改项速查对照表
 
-| 你要切换的场景 | 需要修改的变量 | 具体怎么改 |
-| :--- | :--- | :--- |
-| **场景 A：同一阶段换不同轮数权重**<br>（如 `model_200.pt` → `model_400.pt` / `model_latest.pt` / `ckpts/refiner.pt`） | **仅改 `CKPT_PATH`（1 处）** | 把路径末尾文件名改为 `model_400.pt` 等即可。输出目录会自动按 `MODEL_TAG` 分开（如 `CarryBox_refiner_model_400`），不会覆盖旧视频。 |
-| **场景 B：换成 Stage 3 `Tracker` 模型**<br>（`510` 维观测的全身跟踪器，不含扩散生成器） | **改 `STAGE_MODE`、`CKPT_PATH`**<br>（可选改 `MOTION_DIR`） | 1. `STAGE_MODE="tracker"`（**必改**，否则报观测维度 890 vs 510 不匹配）<br>2. `CKPT_PATH` 指向 `logs/tracker/model_xxx.pt` 或 `ckpts/tracker.pt`<br>3. `MOTION_DIR` 可填精炼集 `outputs/.../rollout_datasets/refiner/rl_dataset` 或 `data/CarryBox` |
-| **场景 C：换成 Stage 6 全自主闭环推理**<br>（`tracker.pt` + 扩散生成器 `generator.ckpt`） | **改 `STAGE_MODE`、`CKPT_PATH`、`GEN_CKPT`** | 1. `STAGE_MODE="inference"`<br>2. `CKPT_PATH` 指向 `tracker.pt`（510 维）<br>3. `GEN_CKPT` 指向 `ckpts/generator.ckpt`（或官方 `demo_ckpts/CarryBox/generator.ckpt`） |
-| **场景 D：换成其他交互任务**<br>（如 `PushBox`、`PickBottle`、`SitChair` 等） | **改 `TASK_NAME`、`MOTION_DIR`、`CKPT_PATH`** | 例如推箱子：`TASK_NAME="PushBox"`，`MOTION_DIR="data/PushBox"`，并将 `CKPT_PATH` 指向对应任务的 `.pt` 权重。 |
+| 你要切换的场景                                                                                                        | 需要修改的变量                                              | 具体怎么改                                                                                                                                                                                                                                          |
+| :-------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **场景 A：同一阶段换不同轮数权重**<br>（如 `model_200.pt` → `model_400.pt` / `model_latest.pt` / `ckpts/refiner.pt`） | **仅改 `CKPT_PATH`（1 处）**                                | 把路径末尾文件名改为 `model_400.pt` 等即可。输出目录会自动按 `MODEL_TAG` 分开（如 `CarryBox_refiner_model_400`），不会覆盖旧视频。                                                                                                                  |
+| **场景 B：换成 Stage 3 `Tracker` 模型**<br>（`510` 维观测的全身跟踪器，不含扩散生成器）                               | **改 `STAGE_MODE`、`CKPT_PATH`**<br>（可选改 `MOTION_DIR`） | 1. `STAGE_MODE="tracker"`（**必改**，否则报观测维度 890 vs 510 不匹配）<br>2. `CKPT_PATH` 指向 `logs/tracker/model_xxx.pt` 或 `ckpts/tracker.pt`<br>3. `MOTION_DIR` 可填精炼集 `outputs/.../rollout_datasets/refiner/rl_dataset` 或 `data/CarryBox` |
+| **场景 C：换成 Stage 6 全自主闭环推理**<br>（`tracker.pt` + 扩散生成器 `generator.ckpt`）                             | **改 `STAGE_MODE`、`CKPT_PATH`、`GEN_CKPT`**                | 1. `STAGE_MODE="inference"`<br>2. `CKPT_PATH` 指向 `tracker.pt`（510 维）<br>3. `GEN_CKPT` 指向 `ckpts/generator.ckpt`（或官方 `demo_ckpts/CarryBox/generator.ckpt`）                                                                               |
+| **场景 D：换成其他交互任务**<br>（如 `PushBox`、`PickBottle`、`SitChair` 等）                                         | **改 `TASK_NAME`、`MOTION_DIR`、`CKPT_PATH`**               | 例如推箱子：`TASK_NAME="PushBox"`，`MOTION_DIR="data/PushBox"`，并将 `CKPT_PATH` 指向对应任务的 `.pt` 权重。                                                                                                                                        |
 
 ---
 
@@ -343,27 +345,27 @@ ls -lh "$DRIVE_VIDEO_DIR"/*.mp4
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="refiner"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v4_full/logs/refiner/model_400.pt"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_omni_v1_full/logs/refiner/model_400.pt"
 GEN_CKPT=""
-MOTION_DIR="data/CarryBox"
+MOTION_DIR="data/OmniCarryBox"
 ```
 
 #### 模板 2：查看 Stage 3 Tracker 中途或最终权重（例如 `logs/tracker/model_1000.pt`）
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="tracker"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v4_full/logs/tracker/model_1000.pt"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_omni_v1_full/logs/tracker/model_1000.pt"
 GEN_CKPT=""
-MOTION_DIR="/content/fusion/outputs/CarryBox_sm_v4_full/rollout_datasets/refiner/rl_dataset"
+MOTION_DIR="/content/fusion/outputs/CarryBox_sm_omni_v1_full/rollout_datasets/refiner/rl_dataset"
 ```
 
 #### 模板 3：查看 Stage 6 最终闭环自主推理（`tracker.pt` + `generator.ckpt`）
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="inference"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v4_full/ckpts/tracker.pt"
-GEN_CKPT="/content/fusion/outputs/CarryBox_sm_v4_full/ckpts/generator.ckpt"
-MOTION_DIR="data/CarryBox"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_omni_v1_full/ckpts/tracker.pt"
+GEN_CKPT="/content/fusion/outputs/CarryBox_sm_omni_v1_full/ckpts/generator.ckpt"
+MOTION_DIR="data/OmniCarryBox"
 ```
 
 #### 模板 4：切换其他任务（例如 `PickBottle` 抓水瓶 Stage 1 Refiner）

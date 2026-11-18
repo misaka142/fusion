@@ -127,9 +127,9 @@ TASK_PROFILES: dict[str, TaskRewardProfile] = {
     "CarryBox": TaskRewardProfile(
         "CarryBox",
         hoi_mode="hands",
-        undesired_weight=-1.0,
-        undesired_threshold=0.1,
-        num_undesired_bodies=26,
+        undesired_weight=-0.2,
+        undesired_threshold=5.0,
+        num_undesired_bodies=12,
         feet_slide_weight=-0.1,
     ),
     "PickBottle": TaskRewardProfile(

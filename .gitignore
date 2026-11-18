@@ -76,6 +76,8 @@ datasets
 
 descriptions
 data
+data_kin_fixed
+data_omniretarget*
 outputs
 demo_ckpts
 .venv*

@@ -35,6 +35,23 @@ from .base_refiner_env_cfg import BaseRobotSceneCfg, BaseCommandsCfg, BaseAction
 @configclass
 class RobotSceneCfg(BaseRobotSceneCfg):
     obj: RigidObjectCfg = SMALLBOX_CFG.replace(prim_path="{ENV_REGEX_NS}/Obj")
+    # Option 2 (Whole-Body Cradling): include rubber hands + wrists + forearms as valid carry-support links
+    left_hand_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/left_(rubber_hand|wrist_.*_link|elbow_link)",
+        history_length=3,
+        track_air_time=True,
+        force_threshold=0.1,
+        debug_vis=False,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"],
+    )
+    right_hand_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/right_(rubber_hand|wrist_.*_link|elbow_link)",
+        history_length=3,
+        track_air_time=True,
+        force_threshold=0.1,
+        debug_vis=False,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"],
+    )
 
 @configclass
 class CommandsCfg(BaseCommandsCfg):
@@ -85,15 +102,18 @@ class EventCfg(BaseEventCfg):
 class RewardsCfg(BaseRewardsCfg):
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-1.0,
+        weight=-0.2,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces",
                 body_names=[
-                    r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$).+$"
+                    "pelvis.*",
+                    ".*_hip_.*_link",
+                    ".*_knee_link",
+                    ".*_ankle_pitch_link",
                 ],
             ),
-            "threshold": 0.1,
+            "threshold": 5.0,
         },
     )
     hoi_contact = RewTerm(

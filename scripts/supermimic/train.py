@@ -229,6 +229,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
     ):
         env_cfg.commands.motion.teacher_motion_folder = args_cli.teacher_motion_folder
 
+    if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "motion"):
+        from sugar_rl.assets.objects.objects import apply_dataset_box_spec
+
+        apply_dataset_box_spec(
+            env_cfg,
+            env_cfg.commands.motion.motion_folder,
+            env_cfg.commands.motion.teacher_motion_folder,
+        )
+
     # Optional CLI reward overrides (automatically mirrored into imagination by `SugarEnvBridge`)
     if hasattr(env_cfg, "rewards"):
         from isaaclab.managers import RewardTermCfg as RewTerm

@@ -257,7 +257,8 @@ def _create_dummy_motion_dataset(folder: Path, T: int = 30) -> Path:
     return folder
 
 
-def test_1_all_six_tasks_scene_compilation(tmp_dir: Path) -> None:
+def test_1_all_six_tasks_scene_compilation(tmp_path: Path) -> None:
+    tmp_dir = tmp_path
     print("[Test 1] Compiling MuJoCo scenes for all 6 SUGAR tasks...")
     for task_name, spec in SIM2SIM_TASK_SPECS.items():
         xml_path, resolved_spec, _ = build_mujoco_scene_xml(
@@ -305,7 +306,8 @@ def test_1_all_six_tasks_scene_compilation(tmp_dir: Path) -> None:
     print("  -> Passed all 6 tasks + primitive fallback!")
 
 
-def test_2_dual_format_checkpoint_loading_and_joint_order(tmp_dir: Path) -> None:
+def test_2_dual_format_checkpoint_loading_and_joint_order(tmp_path: Path) -> None:
+    tmp_dir = tmp_path
     print("[Test 2] Testing SuperMimic (BFS & SDK) + legacy RSL-RL checkpoint loading...")
     bfs_pt = _save_dummy_supermimic_tracker(tmp_dir / "tracker_bfs.pt", G1_ISAACLAB_BFS_JOINT_NAMES)
     sdk_pt = _save_dummy_supermimic_tracker(tmp_dir / "tracker_sdk.pt", G1_29DOF_SDK_JOINT_NAMES)
@@ -339,7 +341,8 @@ def test_2_dual_format_checkpoint_loading_and_joint_order(tmp_dir: Path) -> None
     print("  -> Passed dual-format & joint-bijection checks!")
 
 
-def test_3_observation_isomorphism_with_sugar_hoi_task(tmp_dir: Path) -> None:
+def test_3_observation_isomorphism_with_sugar_hoi_task(tmp_path: Path) -> None:
+    tmp_dir = tmp_path
     print("[Test 3] Verifying 510-D observation isomorphism against SugarHOITask...")
     bfs_pt = _save_dummy_supermimic_tracker(tmp_dir / "tracker_iso.pt", G1_ISAACLAB_BFS_JOINT_NAMES)
     dataset_dir = _create_dummy_motion_dataset(tmp_dir / "motion_iso")
@@ -426,7 +429,8 @@ def test_3_observation_isomorphism_with_sugar_hoi_task(tmp_dir: Path) -> None:
     print(f"  -> Passed 510-D observation isomorphism (max_abs_err={max_err:.2e} < 1e-4)!")
 
 
-def test_4_pd_standing_stability_and_replay(tmp_dir: Path) -> None:
+def test_4_pd_standing_stability_and_replay(tmp_path: Path) -> None:
+    tmp_dir = tmp_path
     print("[Test 4] Verifying 500Hz implicit PD closed-loop standing stability over 3.0s (1500 substeps)...")
     stand_pt = _save_dummy_supermimic_tracker(
         tmp_dir / "tracker_stand.pt", G1_ISAACLAB_BFS_JOINT_NAMES, closed_loop_balance=True
@@ -450,7 +454,8 @@ def test_4_pd_standing_stability_and_replay(tmp_dir: Path) -> None:
     print(f"  -> Passed 3.0s standing stability (final pelvis_z={info['pelvis_z']:.3f}m, max_qvel={max_qd:.3f} rad/s)!")
 
 
-def test_5_autonomous_generator_closed_loop_and_cli_video(tmp_dir: Path) -> None:
+def test_5_autonomous_generator_closed_loop_and_cli_video(tmp_path: Path) -> None:
+    tmp_dir = tmp_path
     print("[Test 5] Verifying autonomous 10Hz Generator + 50Hz Tracker closed-loop + MP4 CLI...")
     trk_pt = _save_dummy_supermimic_tracker(
         tmp_dir / "tracker_auto.pt", G1_ISAACLAB_BFS_JOINT_NAMES, closed_loop_balance=True
@@ -499,7 +504,8 @@ def test_5_autonomous_generator_closed_loop_and_cli_video(tmp_dir: Path) -> None
     print(f"  -> Passed autonomous closed-loop & MP4 video export ({mp4_out.stat().st_size} bytes)!")
 
 
-def test_6_legs_absolute_ema_v4_checkpoint_sim2sim(tmp_dir: Path) -> None:
+def test_6_legs_absolute_ema_v4_checkpoint_sim2sim(tmp_path: Path) -> None:
+    tmp_dir = tmp_path
     print("[Test 6] Verifying v4 EMA + legs_absolute=True Tracker checkpoint seamless Sim-to-Sim standing...")
     from sugar_rl.supermimic.trainer import make_residual_mask
 
@@ -545,6 +551,78 @@ def test_6_legs_absolute_ema_v4_checkpoint_sim2sim(tmp_dir: Path) -> None:
     print(f"  -> Passed v4 EMA + legs_absolute Sim-to-Sim standing (pelvis_z={info['pelvis_z']:.3f}m)!")
 
 
+def test_7_omnicarrybox_obb_alignment_and_mtime_cache(tmp_path: Path) -> None:
+    tmp_dir = tmp_path
+    print("[Test 7] Verifying OBB-aligned OmniCarryBox mesh centering & mtime STL cache invalidation...")
+    import json
+    import os
+    import time
+    import trimesh
+
+    ds_dir = tmp_dir / "omni_box_ds"
+    ds_dir.mkdir(parents=True)
+    cache_dir = tmp_dir / "scene_cache"
+    cache_dir.mkdir(parents=True)
+
+    # 1. Create a small centered octahedron/box mesh & write v1 STL cache
+    mesh_v1 = trimesh.creation.box(extents=(0.30, 0.30, 0.30))
+    mesh_v1.export(str(ds_dir / "obj_aligned.obj"))
+    (ds_dir / "box_spec.json").write_text(
+        json.dumps(
+            {
+                "dataset": "test_obb_mtime",
+                "box_size_xyz": [0.30, 0.30, 0.30],
+                "box_center_xyz": [0.0, 0.0, 0.0],
+                "mass_kg": 0.5,
+                "mesh_file": "obj_aligned.obj",
+            }
+        ),
+        encoding="utf-8",
+    )
+    xml1, _, rep1 = build_mujoco_scene_xml(
+        task_name="CarryBox",
+        output_xml_path=cache_dir / "scene1.xml",
+        motion_folder=ds_dir,
+    )
+    stl_cached = cache_dir / "meshes" / "small_box_test_obb_mtime.stl"
+    assert stl_cached.is_file()
+    m1 = mujoco.MjModel.from_xml_path(str(xml1))
+    sz1 = trimesh.load(str(stl_cached), force="mesh").extents
+
+    # 2. Update obj_aligned.obj with larger size & bump mtime -> cache MUST rebuild automatically!
+    mesh_v2 = trimesh.creation.box(extents=(0.40, 0.42, 0.38))
+    mesh_v2.export(str(ds_dir / "obj_aligned.obj"))
+    future_t = stl_cached.stat().st_mtime + 5.0
+    os.utime(ds_dir / "obj_aligned.obj", (future_t, future_t))
+
+    xml2, _, _ = build_mujoco_scene_xml(
+        task_name="CarryBox",
+        output_xml_path=cache_dir / "scene2.xml",
+        motion_folder=ds_dir,
+    )
+    _ = mujoco.MjModel.from_xml_path(str(xml2))
+    sz2 = trimesh.load(str(stl_cached), force="mesh").extents
+    assert abs(float(sz1[0]) - 0.30) < 1e-4 and abs(float(sz2[0]) - 0.40) < 1e-4, (
+        f"STL cache failed to refresh on mtime update: sz1={sz1}, sz2={sz2}"
+    )
+
+    # 3. Also verify real data/OmniCarryBox if present locally
+    real_omni = FUSION_ROOT / "data" / "OmniCarryBox"
+    if (real_omni / "box_spec.json").is_file() and (real_omni / "obj_aligned.obj").is_file():
+        m_real = trimesh.load(str(real_omni / "obj_aligned.obj"), force="mesh", process=False)
+        ctr_real = 0.5 * (m_real.bounds[0] + m_real.bounds[1])
+        assert float(np.max(np.abs(ctr_real))) < 1e-4, f"OmniCarryBox mesh not centered: {ctr_real}"
+        xml_r, _, _ = build_mujoco_scene_xml(
+            task_name="CarryBox",
+            output_xml_path=cache_dir / "scene_real.xml",
+            motion_folder=real_omni,
+        )
+        m_mj = mujoco.MjModel.from_xml_path(str(xml_r))
+        assert m_mj.nq == 43
+
+    print("  -> Passed OBB mesh centering & mtime STL cache invalidation!")
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp_dir = Path(td)
@@ -554,7 +632,8 @@ def main() -> None:
         test_4_pd_standing_stability_and_replay(tmp_dir)
         test_5_autonomous_generator_closed_loop_and_cli_video(tmp_dir)
         test_6_legs_absolute_ema_v4_checkpoint_sim2sim(tmp_dir)
-    print("\nALL 6 MUJOCO SIM-TO-SIM END-TO-END TESTS PASSED SUCCESSFULLY!")
+        test_7_omnicarrybox_obb_alignment_and_mtime_cache(tmp_dir)
+    print("\nALL 7 MUJOCO SIM-TO-SIM END-TO-END TESTS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

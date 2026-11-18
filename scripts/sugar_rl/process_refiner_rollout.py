@@ -202,6 +202,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--task_name", type=str, required=True, choices=['CarryBox','KickBox', 'PickBottle', 'PushBox', 'SitChair', 'StandBottle'])
+    parser.add_argument("--ref_dir", type=str, default=None, help="Optional reference motion dir to copy dataset box_spec/mesh assets into rl_dataset.")
     parser.add_argument("--lin_vel_thresh", type=float, default=0.05)
     parser.add_argument("--ang_vel_thresh", type=float, default=0.1)
     parser.add_argument(
@@ -286,6 +287,21 @@ def main():
     
     print(f"\nStable frame records saved to: {output_txt_path}")
     print(f"Total: {total}, Modified: {modified}")
+
+    # Propagate optional dataset-specific box spec & convex-hull assets (`box_spec.json`, `obj_aligned.*`)
+    asset_src_candidates = [p for p in (args.ref_dir, args.data_dir) if p]
+    asset_names = ("box_spec.json", "obj_aligned.obj", "obj_aligned.usda", "obj_aligned.usd")
+    copied_assets: list[str] = []
+    for src_root in asset_src_candidates:
+        if any(os.path.isfile(os.path.join(src_root, name)) for name in asset_names):
+            for name in asset_names:
+                src_file = os.path.join(src_root, name)
+                if os.path.isfile(src_file):
+                    shutil.copy2(src_file, os.path.join(rl_dataset_dir, name))
+                    copied_assets.append(name)
+            break
+    if copied_assets:
+        print(f"[Dataset Box Assets] Copied {copied_assets} -> {rl_dataset_dir}")
 
 
 

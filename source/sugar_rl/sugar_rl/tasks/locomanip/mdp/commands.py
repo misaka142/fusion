@@ -758,8 +758,8 @@ class MotionCommand(CommandTerm):
         left_hand_forces = left_hand_sensor.data.force_matrix_w_history[active_envs]
         right_hand_forces = right_hand_sensor.data.force_matrix_w_history[active_envs]
         
-        left_hand_max_force = torch.max(torch.norm(left_hand_forces[:, :, 0, 0, :], dim=-1), dim=1)[0]
-        right_hand_max_force = torch.max(torch.norm(right_hand_forces[:, :, 0, 0, :], dim=-1), dim=1)[0]
+        left_hand_max_force = torch.max(torch.norm(left_hand_forces[:, :, :, 0, :], dim=-1).sum(dim=2), dim=1)[0]
+        right_hand_max_force = torch.max(torch.norm(right_hand_forces[:, :, :, 0, :], dim=-1).sum(dim=2), dim=1)[0]
         hands_contact_label = (left_hand_max_force > 0.1) & (right_hand_max_force > 0.1)
 
         # Single-foot label

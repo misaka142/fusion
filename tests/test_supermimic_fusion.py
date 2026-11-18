@@ -1685,6 +1685,223 @@ def test_13_ema_actor_bryson_pose_jerk_and_imag_critic() -> None:
     print("[PASS] Test 13: Polyak EMA export/resume, Bryson pose weighting, joint_vel sync & imagined Critic GAE")
 
 
+def test_14_omniretarget_cradling_usda_and_bridge_sync() -> None:
+    """Verify Option 2 multi-body contact aggregation, SugarEnvBridge dynamic contact resolution across
+    all 6 tasks, strict fail-fast USD enforcement (no Cuboid fallback), and rollout asset propagation.
+    """
+    import json
+    import re
+    import subprocess
+    from sugar_rl.supermimic.env_bridge import _resolve_undesired_body_ids
+
+    # 1. Exact 35 robot link names in SUGAR ContactSensorCfg (`{ENV_REGEX_NS}/Robot/.*`)
+    cf_35 = [
+        "pelvis", "left_hip_pitch_link", "pelvis_contour_link", "right_hip_pitch_link",
+        "waist_yaw_link", "left_hip_roll_link", "right_hip_roll_link", "waist_roll_link",
+        "left_hip_yaw_link", "right_hip_yaw_link", "torso_link", "left_knee_link",
+        "right_knee_link", "logo_link", "left_shoulder_pitch_link", "head_link",
+        "right_shoulder_pitch_link", "left_ankle_pitch_link", "right_ankle_pitch_link",
+        "left_shoulder_roll_link", "right_shoulder_roll_link", "left_ankle_roll_link",
+        "right_ankle_roll_link", "left_shoulder_yaw_link", "right_shoulder_yaw_link",
+        "left_elbow_link", "right_elbow_link", "left_wrist_roll_link", "right_wrist_roll_link",
+        "left_wrist_pitch_link", "right_wrist_pitch_link", "left_wrist_yaw_link",
+        "right_wrist_yaw_link", "left_rubber_hand", "right_rubber_hand",
+    ]
+
+    class _SCfg:
+        def __init__(self, body_names, body_ids=slice(None)):
+            self.body_names = body_names
+            self.body_ids = body_ids
+
+    class _Term:
+        def __init__(self, sensor_cfg):
+            self.params = {"sensor_cfg": sensor_cfg}
+
+    class _RewMgr:
+        def __init__(self, names, cfgs):
+            self._term_names = names
+            self._term_cfgs = cfgs
+
+    # Lock down exact equivalence for the other 5 SUGAR tasks against legacy allowed-sets
+    legacy_pats = {
+        "PickBottle": ("hands", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$).+$"]),
+        "PushBox": ("hands", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$).+$"]),
+        "StandBottle": ("hands", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$)(?!left_knee_link$)(?!right_knee_link$).+$"]),
+        "KickBox": ("feet", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$).+$"]),
+        "SitChair": ("sit", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!.*hip.*)(?!.*pelvis.*).+$"]),
+    }
+    for tname, (hmode, pats) in legacy_pats.items():
+        rm_regex = _RewMgr(["undesired_contacts"], [_Term(_SCfg(pats))])
+        ids_from_mgr = _resolve_undesired_body_ids(cf_35, tname, hmode, rew_mgr=rm_regex)
+        ids_fallback = _resolve_undesired_body_ids(cf_35, tname, hmode, rew_mgr=None)
+        assert ids_from_mgr == ids_fallback, f"{tname}: reward_manager sync mismatch vs legacy allowed set!"
+
+    # CarryBox Option 2: exactly 12 lower-body + pelvis non-foot links (gentle anti-kneel/sit penalty)
+    cb_pats = ["pelvis.*", ".*_hip_.*_link", ".*_knee_link", ".*_ankle_pitch_link"]
+    rm_cb = _RewMgr(["undesired_contacts"], [_Term(_SCfg(cb_pats))])
+    cb_ids = _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=rm_cb)
+    assert len(cb_ids) == 12, f"Expected 12 CarryBox undesired bodies, got {len(cb_ids)}"
+    assert cb_ids == _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=None)
+    cb_names = {cf_35[i] for i in cb_ids}
+    assert "torso_link" not in cb_names and "left_wrist_yaw_link" not in cb_names and "left_elbow_link" not in cb_names
+    assert "pelvis" in cb_names and "left_knee_link" in cb_names and "left_ankle_pitch_link" in cb_names
+    assert "left_ankle_roll_link" not in cb_names and "right_ankle_roll_link" not in cb_names
+
+    # Verify resolved integer body_ids takes highest priority when populated by IsaacLab SceneEntityCfg.resolve()
+    rm_resolved = _RewMgr(["undesired_contacts"], [_Term(_SCfg(cb_pats, body_ids=[0, 2, 11]))])
+    assert _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=rm_resolved) == [0, 2, 11]
+
+    # 2. Multi-body contact force aggregation: identical when B=1, captures non-canceling forces when B=5
+    f1 = torch.randn(4, 3, 1, 1, 3, device=DEVICE)
+    agg_1 = torch.norm(f1[:, :, :, 0, :], dim=-1).sum(dim=2).max(dim=1)[0]
+    legacy_1 = torch.norm(f1[:, :, 0, 0, :], dim=-1).max(dim=1)[0]
+    assert (agg_1 - legacy_1).abs().max().item() < 1e-6
+
+    f5 = torch.zeros(2, 3, 5, 1, 3, device=DEVICE)
+    # Env 0: contact purely on forearm link (index 4), palm link (index 0) is zero!
+    f5[0, 2, 4, 0, :] = torch.tensor([0.0, 2.5, 0.0], device=DEVICE)
+    # Env 1: equal & opposite lateral/shear forces on two wrist links within same side (must NOT cancel!)
+    f5[1, 1, 1, 0, :] = torch.tensor([3.0, 0.0, 0.0], device=DEVICE)
+    f5[1, 1, 2, 0, :] = torch.tensor([-3.0, 0.0, 0.0], device=DEVICE)
+    agg_5 = torch.norm(f5[:, :, :, 0, :], dim=-1).sum(dim=2).max(dim=1)[0]
+    assert abs(float(agg_5[0].item()) - 2.5) < 1e-5
+    assert abs(float(agg_5[1].item()) - 6.0) < 1e-5
+
+    # Verify CarryBox profile weight/threshold/count alignment & source code guardrails
+    p_cb = resolve_task_profile("Sugar-G129dof-CarryBox-Refiner")
+    assert p_cb.undesired_weight == -0.2 and p_cb.undesired_threshold == 5.0 and p_cb.num_undesired_bodies == 12
+    rew_py = (REPO_ROOT / "source" / "sugar_rl" / "sugar_rl" / "tasks" / "locomanip" / "mdp" / "rewards.py").read_text(encoding="utf-8")
+    cmd_py = (REPO_ROOT / "source" / "sugar_rl" / "sugar_rl" / "tasks" / "locomanip" / "mdp" / "commands.py").read_text(encoding="utf-8")
+    assert "left_hand_forces[:, :, :, 0, :]" in rew_py and "left_hand_forces[:, :, 0, 0, :]" not in rew_py
+    assert "left_hand_forces[:, :, :, 0, :]" in cmd_py and "left_hand_forces[:, :, 0, 0, :]" not in cmd_py
+
+    # 3. Verify `apply_dataset_box_spec` fail-fast guard (refuses CuboidCfg fallback when USD is missing)
+    #    and `process_refiner_rollout.py --ref_dir` asset propagation without requiring full isaaclab runtime
+    import ast
+    obj_src = (REPO_ROOT / "source" / "sugar_rl" / "sugar_rl" / "assets" / "objects" / "objects.py").read_text(encoding="utf-8")
+    assert "sim_utils.CuboidCfg" not in obj_src and "FileNotFoundError" in obj_src and "max_depenetration_velocity=1.0" in obj_src
+
+    # Dynamically extract and execute `apply_dataset_box_spec` with stubbed isaaclab types to test fail-fast Runtime behavior
+    mod_ast = ast.parse(obj_src)
+    fn_node = next(n for n in mod_ast.body if isinstance(n, ast.FunctionDef) and n.name == "apply_dataset_box_spec")
+    fn_src = ast.get_source_segment(obj_src, fn_node)
+    assert fn_src is not None
+
+    class _CfgNode:
+        def __init__(self, **kw):
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    ns = {
+        "RigidObjectCfg": type("RigidObjectCfg", (_CfgNode,), {"InitialStateCfg": _CfgNode}),
+        "UsdFileCfg": _CfgNode,
+        "sim_utils": _CfgNode(RigidBodyPropertiesCfg=_CfgNode, MassPropertiesCfg=_CfgNode),
+    }
+    exec(fn_src, ns)
+    fn_apply = ns["apply_dataset_box_spec"]
+
+    with tempfile.TemporaryDirectory() as box_tmp:
+        b_dir = pathlib.Path(box_tmp) / "missing_usd_ds"
+        b_dir.mkdir(parents=True)
+        (b_dir / "box_spec.json").write_text(json.dumps({"usd_file": "obj_aligned.usda", "mass_kg": 0.5}), encoding="utf-8")
+        stub_env_cfg = _CfgNode(scene=_CfgNode(obj=_CfgNode(prim_path="{ENV_REGEX_NS}/Obj")))
+        caught_fnf = False
+        try:
+            fn_apply(stub_env_cfg, str(b_dir))
+        except FileNotFoundError:
+            caught_fnf = True
+        assert caught_fnf, "Expected FileNotFoundError when box_spec.json exists without convex-hull USD!"
+
+        # When obj_aligned.usda IS present, override uses UsdFileCfg + max_depenetration_velocity=1.0
+        (b_dir / "obj_aligned.usda").write_text("#usda 1.0\n", encoding="utf-8")
+        assert fn_apply(stub_env_cfg, str(b_dir)) is True
+        assert abs(stub_env_cfg.scene.obj.spawn.rigid_props.max_depenetration_velocity - 1.0) < 1e-6
+        assert stub_env_cfg.scene.obj.spawn.mass_props.mass == 0.5
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir)
+        ref_dir = tmp / "ref_omni"
+        ref_dir.mkdir(parents=True)
+        (ref_dir / "box_spec.json").write_text(json.dumps({"dataset": "test", "usd_file": "obj_aligned.usda", "mass_kg": 0.5}))
+        (ref_dir / "obj_aligned.obj").write_text("v 0 0 0\n")
+        (ref_dir / "obj_aligned.usda").write_text("#usda 1.0\n")
+
+        data_root = tmp / "refiner_rollout"
+        tc_dir = data_root / "raw_npz" / "trajectory_complete"
+        tc_dir.mkdir(parents=True)
+        import numpy as np
+        T = 20
+        np.savez(
+            tc_dir / "motion_000_env_000_t0-19_idx_0.npz",
+            joint_pos=np.zeros((T, 29), dtype=np.float32),
+            joint_vel=np.zeros((T, 29), dtype=np.float32),
+            body_pos_w=np.zeros((T, 14, 3), dtype=np.float32),
+            body_quat_w=np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (T, 14, 1)),
+            body_lin_vel_w=np.zeros((T, 14, 3), dtype=np.float32),
+            body_ang_vel_w=np.zeros((T, 14, 3), dtype=np.float32),
+            obj_pos_w=np.zeros((T, 3), dtype=np.float32),
+            obj_quat_w=np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (T, 1)),
+            obj_lin_vel_w=np.zeros((T, 3), dtype=np.float32),
+            obj_ang_vel_w=np.zeros((T, 3), dtype=np.float32),
+            hands_contact_label=np.ones((T,), dtype=bool),
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "sugar_rl" / "process_refiner_rollout.py"),
+                "--data_dir", str(data_root),
+                "--task_name", "CarryBox",
+                "--ref_dir", str(ref_dir),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for fname in ("box_spec.json", "obj_aligned.obj", "obj_aligned.usda"):
+            assert (data_root / "rl_dataset" / fname).is_file(), f"Missing propagated {fname} in rl_dataset!"
+
+    # 4. Regression test for `scripts/supermimic/train.py` CLI motion/teacher_motion_folder override
+    train_src = (REPO_ROOT / "scripts" / "supermimic" / "train.py").read_text(encoding="utf-8")
+    train_mod = ast.parse(train_src)
+    main_fn = next(n for n in train_mod.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    override_ifs = [
+        ast.get_source_segment(train_src, st)
+        for st in main_fn.body
+        if isinstance(st, ast.If)
+        and (
+            "motion_folder" in (ast.get_source_segment(train_src, st) or "")
+            or "teacher_motion_folder" in (ast.get_source_segment(train_src, st) or "")
+        )
+        and "apply_dataset_box_spec" not in (ast.get_source_segment(train_src, st) or "")
+    ]
+    assert len(override_ifs) == 2, f"Expected 2 CLI folder override blocks in train.py, got {len(override_ifs)}"
+    # Intentionally omit `.motion` directly on `env_cfg` (real ManagerBasedRLEnvCfg stores it at `env_cfg.commands.motion`)
+    stub_motion = _CfgNode(motion_folder=None, teacher_motion_folder=None)
+    stub_cfg = _CfgNode(commands=_CfgNode(motion=stub_motion))
+    stub_args = _CfgNode(motion_folder="rl_ds_dir", teacher_motion_folder="data/OmniCarryBox")
+    exec("\n".join(override_ifs), {"args_cli": stub_args, "env_cfg": stub_cfg})
+    assert stub_motion.motion_folder == "rl_ds_dir"
+    assert stub_motion.teacher_motion_folder == "data/OmniCarryBox", (
+        f"teacher_motion_folder silently ignored! got {stub_motion.teacher_motion_folder}"
+    )
+
+    # 5. Verify `scene_builder.py` fails fast when box_spec.json exists without obj_aligned.obj
+    with tempfile.TemporaryDirectory() as sb_tmp:
+        from scripts.sim2sim.scene_builder import build_mujoco_scene_xml
+
+        bad_ds = pathlib.Path(sb_tmp) / "broken_ds"
+        bad_ds.mkdir(parents=True)
+        (bad_ds / "box_spec.json").write_text(json.dumps({"mesh_file": "missing.obj", "box_size_xyz": [0.3, 0.3, 0.3]}))
+        caught_sb = False
+        try:
+            build_mujoco_scene_xml("CarryBox", output_xml_path=pathlib.Path(sb_tmp) / "s.xml", motion_folder=bad_ds)
+        except FileNotFoundError:
+            caught_sb = True
+        assert caught_sb, "scene_builder silently fell back to cuboid when mesh_file was missing!"
+
+    print("[PASS] Test 14: Option 2 multi-body contact, dynamic bridge sync (6 tasks), fail-fast USD/mesh & train.py CLI override")
+
+
 if __name__ == "__main__":
     print(f"Running SuperMimic x SUGAR test suite on device: {DEVICE} (PyTorch {torch.__version__})")
     test_1_rotations_and_zero_angle_gradients()
@@ -1700,4 +1917,5 @@ if __name__ == "__main__":
     test_11_retrain_config_mechanisms()
     test_12_review_compliance_zero_sync_equivalence_and_rollout_tools()
     test_13_ema_actor_bryson_pose_jerk_and_imag_critic()
-    print("\nALL 13 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")
+    test_14_omniretarget_cradling_usda_and_bridge_sync()
+    print("\nALL 14 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")

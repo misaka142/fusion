@@ -138,6 +138,15 @@ def main():
         if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "motion"):
             print(f"[INFO] Overriding teacher_motion_folder: {args_cli.teacher_motion_folder}")
             env_cfg.commands.motion.teacher_motion_folder = args_cli.teacher_motion_folder
+
+    if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "motion"):
+        from sugar_rl.assets.objects.objects import apply_dataset_box_spec
+
+        apply_dataset_box_spec(
+            env_cfg,
+            env_cfg.commands.motion.motion_folder,
+            env_cfg.commands.motion.teacher_motion_folder,
+        )
     
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 

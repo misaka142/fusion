@@ -34,6 +34,23 @@ from .base_inference_env_cfg import BaseRobotSceneCfg, BaseCommandsCfg, BaseActi
 @configclass
 class RobotSceneCfg(BaseRobotSceneCfg):
     obj: RigidObjectCfg = SMALLBOX_CFG.replace(prim_path="{ENV_REGEX_NS}/Obj")
+    # Option 2 (Whole-Body Cradling): keep hand/wrist/forearm contact sensor config consistent across stages
+    left_hand_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/left_(rubber_hand|wrist_.*_link|elbow_link)",
+        history_length=3,
+        track_air_time=True,
+        force_threshold=0.1,
+        debug_vis=False,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"],
+    )
+    right_hand_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/right_(rubber_hand|wrist_.*_link|elbow_link)",
+        history_length=3,
+        track_air_time=True,
+        force_threshold=0.1,
+        debug_vis=False,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"],
+    )
 
 @configclass
 class CommandsCfg(BaseCommandsCfg):
