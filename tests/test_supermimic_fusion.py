@@ -1293,8 +1293,10 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
     torch.manual_seed(12)
     fk = FastTreeKinematics(device=DEVICE)
 
-    # --- 1. Conservative defaults check (must NOT double UTD or enable legs_absolute by default per review) ---
+    # --- 1. Conservative defaults & batched depth-layer FK check ---
+    assert fk.max_depth == 11, f"Expected G1 kinematic tree max_depth=11, got {fk.max_depth}"
     default_cfg = SuperMimicTrainCfg()
+    assert default_cfg.wm_seq_len == 8
     assert default_cfg.wm_updates_per_iter == 8 and default_cfg.policy_updates_per_iter == 4
     assert default_cfg.wm_hidden_dims == (512, 512, 512) and default_cfg.policy_hidden_dims == (512, 256, 128)
     assert default_cfg.legs_absolute is False and default_cfg.pessimistic_critic is True
@@ -1370,8 +1372,8 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
 
         def _eval_rollout_grads(tr: SuperMimicTrainer, recompute_fk: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
             tr._raw_policy.zero_grad(set_to_none=True)
-            s_c = starts.states.clone()
-            pa = starts.prev_actions.clone()
+            s_c = starts.states.clone().requires_grad_(tr.cfg.compile_bptt)
+            pa = starts.prev_actions.clone().requires_grad_(tr.cfg.compile_bptt)
             fk_c = tr.task.run_fk(s_c)
             disc = torch.ones(8, device=DEVICE)
             ret = torch.zeros(8, device=DEVICE)
@@ -1385,7 +1387,7 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
                 ret = ret + disc * r_s + disc * tr.cfg.gamma * (1.0 - p_t) * v_d * d_m
                 disc = disc * tr.cfg.gamma * (1.0 - p_t) * (1.0 - d_m)
                 s_c = s_n * alpha + s_n.detach() * (1.0 - alpha)
-                fk_c = tr.task.run_fk(s_c) if recompute_fk else fk_n.scale_grad(alpha)
+                fk_c = tr.task.run_fk(s_c) if recompute_fk else fk_n.scale_grad(alpha, tr.fk.anchor_tracked_idx)
                 pa = a_c
             fut_t = tr.bridge.motion_ref.get_future_window(starts.motion_ids, starts.time_steps + 8)
             obs_t = tr.task.build_privileged_obs(s_c, pa, fut_t, fk_res=fk_c, xi=starts.xi)
@@ -1401,7 +1403,33 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
         max_g_diff = max((g1 - g2).abs().max().item() for g1, g2 in zip(grads_ref, grads_opt))
         assert max_g_diff < 1e-4, f"Compiled + FK-reuse policy gradient diverged: {max_g_diff}"
 
-        # --- 3b. CUDAGraph multi-step BPTT lifecycle check (when CUDA is available) ---
+        # --- 3b. Single-trace zero-recompilation check + CUDAGraph multi-step BPTT lifecycle & safety fallback ---
+        import torch._dynamo as dynamo
+
+        tr_recomp = SuperMimicTrainer(b_eager, log_dir=tmp / "recomp_test", cfg=cfg_comp)
+        tr_recomp.replay = tr_eager.replay
+        dynamo.reset()
+        dynamo.utils.counters.clear()
+        tr_recomp.update_world_model()
+        assert dynamo.utils.counters["frames"].get("ok", 0) == 1, (
+            f"_wm_step recompiled across t=0 vs t>=1: {dict(dynamo.utils.counters['frames'])}"
+        )
+        dynamo.utils.counters.clear()
+        tr_recomp.update_policy(iteration=0)
+        first_pol_frames = dynamo.utils.counters["frames"].get("ok", 0)
+        assert first_pol_frames == 1, f"_imagine_step expected 1 compiled frame, got {first_pol_frames}"
+        dynamo.utils.counters.clear()
+        tr_recomp.update_policy(iteration=1)
+        assert dynamo.utils.counters["frames"].get("ok", 0) == 0, "Unexpected recompilation on subsequent policy iter!"
+
+        # Long-horizon inductor `reduce-overhead` must auto-downgrade to `default` (no deep CUDAGraph tree stall)
+        cfg_safe_fb = SuperMimicTrainCfg(
+            imagination_horizon=32, wm_seq_len=8, enable_tensorboard=False,
+            compile_bptt=True, compile_backend="inductor", compile_mode="reduce-overhead",
+        )
+        tr_safe_fb = SuperMimicTrainer(b_eager, log_dir=tmp / "safe_fb", cfg=cfg_safe_fb)
+        assert tr_safe_fb._use_cudagraph_mark is False, "Long-horizon inductor reduce-overhead did not downgrade!"
+
         if DEVICE.type == "cuda":
             b_cg = _SyntheticSugarBridge(stage="refiner", num_envs=8, device=DEVICE)
             cfg_cg = SuperMimicTrainCfg(

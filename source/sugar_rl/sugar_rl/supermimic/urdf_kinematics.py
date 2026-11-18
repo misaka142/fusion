@@ -16,12 +16,13 @@ import math
 import os
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .rotations import (
@@ -391,15 +392,31 @@ class FKResult:
     anchor_lin_vel_w: Tensor    # (B, 3)
     anchor_ang_vel_w: Tensor    # (B, 3)
 
-    def scale_grad(self, alpha: float) -> "FKResult":
-        """Same values, gradients scaled by `alpha` (equals running FK on `x * alpha + x.detach() * (1 - alpha)`)."""
+    def scale_grad(self, alpha: float, anchor_idx: int = 7) -> "FKResult":
+        """Same values, gradients scaled by `alpha`, preserving `anchor_*` slice strides on `tracked_*`."""
         if alpha == 1.0:
             return self
+        b = 1.0 - alpha
+        t_pos = self.tracked_pos_w * alpha + self.tracked_pos_w.detach() * b
+        t_mat = self.tracked_rotmat_w * alpha + self.tracked_rotmat_w.detach() * b
+        t_quat = self.tracked_quat_w * alpha + self.tracked_quat_w.detach() * b
+        t_v = self.tracked_lin_vel_w * alpha + self.tracked_lin_vel_w.detach() * b
+        t_w = self.tracked_ang_vel_w * alpha + self.tracked_ang_vel_w.detach() * b
+        c_pos = self.contact_pos_w * alpha + self.contact_pos_w.detach() * b
+        c_v = self.contact_lin_vel_w * alpha + self.contact_lin_vel_w.detach() * b
         return FKResult(
-            **{
-                f.name: getattr(self, f.name) * alpha + getattr(self, f.name).detach() * (1.0 - alpha)
-                for f in fields(self)
-            }
+            tracked_pos_w=t_pos,
+            tracked_rotmat_w=t_mat,
+            tracked_quat_w=t_quat,
+            tracked_lin_vel_w=t_v,
+            tracked_ang_vel_w=t_w,
+            contact_pos_w=c_pos,
+            contact_lin_vel_w=c_v,
+            anchor_pos_w=t_pos[:, anchor_idx],
+            anchor_quat_w=t_quat[:, anchor_idx],
+            anchor_rotmat_w=t_mat[:, anchor_idx],
+            anchor_lin_vel_w=t_v[:, anchor_idx],
+            anchor_ang_vel_w=t_w[:, anchor_idx],
         )
 
 
@@ -498,6 +515,57 @@ class FastTreeKinematics(nn.Module):
         self.register_buffer(
             "link_com_pos_b",
             torch.zeros((self.num_links, 3), dtype=torch.float32),
+            persistent=False,
+        )
+
+        # Precompute topological depth layers so `forward()` runs in ~11 batched depth steps instead of 33 serial links.
+        # In any rooted tree, depth(u) = depth(parent(u)) + 1, so every link at depth `d` has its parent in `d - 1`.
+        depths = [0] * self.num_links
+        for i in range(1, self.num_links):
+            depths[i] = depths[self.parent_indices[i]] + 1
+        self.max_depth: int = max(depths) if self.num_links > 1 else 0
+        self._num_active_joints: int = len(active_links)  # 29; sentinel slot `29` holds identity rot & zero qd
+
+        layer_links: list[list[int]] = [
+            [i for i in range(self.num_links) if depths[i] == d] for d in range(self.max_depth + 1)
+        ]
+        bfs_order: list[int] = [lk for grp in layer_links for lk in grp]
+        bfs_pos_of_link: dict[int, int] = {lk: pos for pos, lk in enumerate(bfs_order)}
+
+        for d in range(1, self.max_depth + 1):
+            prev_local = {lk: idx for idx, lk in enumerate(layer_links[d - 1])}
+            cur_links = layer_links[d]
+            p_local = [prev_local[self.parent_indices[lk]] for lk in cur_links]
+            slots = [
+                self._link_to_active_slot[lk] if self._link_to_active_slot[lk] >= 0 else self._num_active_joints
+                for lk in cur_links
+            ]
+            axes_d = [
+                axis_list[lk] if self._link_to_active_slot[lk] >= 0 else [0.0, 0.0, 0.0]
+                for lk in cur_links
+            ]
+            self.register_buffer(f"_d{d}_p_local", torch.tensor(p_local, dtype=torch.long), persistent=False)
+            self.register_buffer(f"_d{d}_slot", torch.tensor(slots, dtype=torch.long), persistent=False)
+            self.register_buffer(
+                f"_d{d}_rel_pos",
+                torch.tensor([rel_pos_list[lk] for lk in cur_links], dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"_d{d}_rel_rot", torch.stack([rel_rot_list[lk] for lk in cur_links], dim=0), persistent=False
+            )
+            self.register_buffer(f"_d{d}_axis", torch.tensor(axes_d, dtype=torch.float32), persistent=False)
+
+        self.register_buffer("_eye3_slot", torch.eye(3, dtype=torch.float32).view(1, 1, 3, 3), persistent=False)
+        self.register_buffer("_bfs_order", torch.tensor(bfs_order, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "_tracked_bfs_indices",
+            torch.tensor([bfs_pos_of_link[self.link_to_idx[n]] for n in self.tracked_body_names], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_contact_bfs_indices",
+            torch.tensor([bfs_pos_of_link[self.link_to_idx[n]] for n in self.contact_body_names], dtype=torch.long),
             persistent=False,
         )
 
@@ -624,69 +692,74 @@ class FastTreeKinematics(nn.Module):
         R_root = quat_to_rotmat(root_quat_w)
         w_root = root_ang_vel_w if ang_vel_in_world else torch.einsum("bij,bj->bi", R_root, root_ang_vel_w)
 
-        # Vectorized joint rotation matrices for all 29 active joints at once: (B, 29, 3, 3)
+        # Vectorized joint rotation matrices for all 29 active joints + 1 fixed-joint identity sentinel slot
         q_active = q_env[:, self.active_env_joint_idx]     # (B, 29)
         qd_active = qd_env[:, self.active_env_joint_idx]   # (B, 29)
         R_joints = axis_unit_angle_to_rotmat(self.active_axes.unsqueeze(0), q_active)  # (B, 29, 3, 3)
+        R_slots = torch.cat([R_joints, self._eye3_slot.expand(B, 1, 3, 3)], dim=1)     # (B, 30, 3, 3)
+        qd_slots = F.pad(qd_active, (0, 1))                                            # (B, 30), last slot = 0
 
-        xpos: list[Tensor | None] = [None] * self.num_links
-        xmat: list[Tensor | None] = [None] * self.num_links
-        lin_vel: list[Tensor | None] = [None] * self.num_links
-        ang_vel: list[Tensor | None] = [None] * self.num_links
-
-        xpos[0] = root_pos_w
-        xmat[0] = R_root
-        # Convert pelvis COM velocity (`root_lin_vel_w` in IsaacLab 2.x) to pelvis link-origin velocity
+        # Depth 0: pelvis root, converting COM velocity (`root_lin_vel_w` in IsaacLab 2.x) to link-origin velocity
         root_com_w = torch.einsum("bij,j->bi", R_root, self.link_com_pos_b[0])
-        lin_vel[0] = root_lin_vel_w - torch.cross(w_root, root_com_w, dim=-1)
-        ang_vel[0] = w_root
+        v0 = root_lin_vel_w - torch.cross(w_root, root_com_w, dim=-1)
 
-        for i in range(1, self.num_links):
-            p = self.parent_indices[i]
-            R_p = xmat[p]          # (B, 3, 3)
-            pos_p = xpos[p]        # (B, 3)
-            v_p = lin_vel[p]       # (B, 3)
-            w_p = ang_vel[p]       # (B, 3)
+        pos_prev = root_pos_w.unsqueeze(1)   # (B, 1, 3)
+        R_prev = R_root.unsqueeze(1)         # (B, 1, 3, 3)
+        v_prev = v0.unsqueeze(1)             # (B, 1, 3)
+        w_prev = w_root.unsqueeze(1)         # (B, 1, 3)
 
-            offset_w = torch.einsum("bij,j->bi", R_p, self.rel_pos[i])
-            pos_i = pos_p + offset_w
-            R_base = torch.einsum("bij,jk->bik", R_p, self.rel_rot[i])
+        pos_layers = [pos_prev]
+        R_layers = [R_prev]
+        v_layers = [v_prev]
+        w_layers = [w_prev]
 
-            slot = self._link_to_active_slot[i]
-            if slot >= 0:
-                R_i = torch.bmm(R_base, R_joints[:, slot])
-                axis_w = torch.einsum("bij,j->bi", R_base, self.active_axes[slot])
-                w_i = w_p + qd_active[:, slot : slot + 1] * axis_w
-            else:
-                R_i = R_base
-                w_i = w_p
+        for d in range(1, self.max_depth + 1):
+            p_loc: Tensor = getattr(self, f"_d{d}_p_local")
+            slot_d: Tensor = getattr(self, f"_d{d}_slot")
+            r_pos_d: Tensor = getattr(self, f"_d{d}_rel_pos")
+            r_rot_d: Tensor = getattr(self, f"_d{d}_rel_rot")
+            axis_d: Tensor = getattr(self, f"_d{d}_axis")
 
-            v_i = v_p + torch.cross(w_p, offset_w, dim=-1)
+            R_p = R_prev[:, p_loc]           # (B, K, 3, 3)
+            pos_p = pos_prev[:, p_loc]       # (B, K, 3)
+            v_p = v_prev[:, p_loc]           # (B, K, 3)
+            w_p = w_prev[:, p_loc]           # (B, K, 3)
 
-            xpos[i] = pos_i
-            xmat[i] = R_i
-            lin_vel[i] = v_i
-            ang_vel[i] = w_i
+            offset_w = torch.matmul(R_p, r_pos_d.unsqueeze(-1)).squeeze(-1)   # (B, K, 3)
+            pos_d = pos_p + offset_w
+            R_base = torch.matmul(R_p, r_rot_d)                               # (B, K, 3, 3)
+            R_d = torch.matmul(R_base, R_slots[:, slot_d])                    # (B, K, 3, 3)
+            axis_w = torch.matmul(R_base, axis_d.unsqueeze(-1)).squeeze(-1)   # (B, K, 3)
+            w_d = w_p + qd_slots[:, slot_d].unsqueeze(-1) * axis_w
+            v_d = v_p + torch.cross(w_p, offset_w, dim=-1)
 
-        all_pos = torch.stack(xpos, dim=1)          # (B, L, 3)
-        all_mat = torch.stack(xmat, dim=1)          # (B, L, 3, 3)
-        all_v_orig = torch.stack(lin_vel, dim=1)    # (B, L, 3)
-        all_w = torch.stack(ang_vel, dim=1)         # (B, L, 3)
+            pos_layers.append(pos_d)
+            R_layers.append(R_d)
+            v_layers.append(v_d)
+            w_layers.append(w_d)
+
+            pos_prev, R_prev, v_prev, w_prev = pos_d, R_d, v_d, w_d
+
+        bfs_pos = torch.cat(pos_layers, dim=1)      # (B, L, 3)
+        bfs_mat = torch.cat(R_layers, dim=1)        # (B, L, 3, 3)
+        bfs_v_orig = torch.cat(v_layers, dim=1)     # (B, L, 3)
+        bfs_w = torch.cat(w_layers, dim=1)          # (B, L, 3)
 
         # Convert link-origin linear velocities back to per-link COM velocities matching `robot.data.body_lin_vel_w`
-        all_com_w = torch.einsum("blij,lj->bli", all_mat, self.link_com_pos_b)
-        all_v = all_v_orig + torch.cross(all_w, all_com_w, dim=-1)
+        com_bfs = self.link_com_pos_b[self._bfs_order]
+        bfs_com_w = torch.matmul(bfs_mat, com_bfs.unsqueeze(-1)).squeeze(-1)
+        bfs_v = bfs_v_orig + torch.cross(bfs_w, bfs_com_w, dim=-1)
 
-        t_idx = self.tracked_link_indices
-        tracked_pos = all_pos[:, t_idx]
-        tracked_mat = all_mat[:, t_idx]
+        t_idx = self._tracked_bfs_indices
+        tracked_pos = bfs_pos[:, t_idx]
+        tracked_mat = bfs_mat[:, t_idx]
         tracked_quat = rotmat_to_quat(tracked_mat)
-        tracked_v = all_v[:, t_idx]
-        tracked_w = all_w[:, t_idx]
+        tracked_v = bfs_v[:, t_idx]
+        tracked_w = bfs_w[:, t_idx]
 
-        c_idx = self.contact_link_indices
-        contact_pos = all_pos[:, c_idx]
-        contact_v = all_v[:, c_idx]
+        c_idx = self._contact_bfs_indices
+        contact_pos = bfs_pos[:, c_idx]
+        contact_v = bfs_v[:, c_idx]
 
         a_idx = self.anchor_tracked_idx
         return FKResult(

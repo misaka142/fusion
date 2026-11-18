@@ -113,7 +113,7 @@ parser.add_argument(
 
 # SuperMimic algorithm hyperparameters (aligned with review: fast Step-1 defaults + clean Step-2/3 controls)
 parser.add_argument("--horizon", type=int, default=32, help="Differentiable imagination rollout horizon H.")
-parser.add_argument("--wm_seq_len", type=int, default=16, help="Autoregressive world-model training sequence length k.")
+parser.add_argument("--wm_seq_len", type=int, default=8, help="Autoregressive world-model training sequence length k.")
 parser.add_argument("--wm_updates", type=int, default=8, help="World model gradient updates per iteration.")
 parser.add_argument("--policy_updates", type=int, default=4, help="Policy BPTT updates per iteration.")
 parser.add_argument("--wm_batch_size", type=int, default=1024, help="Minibatch size for world-model updates.")
@@ -145,8 +145,8 @@ parser.add_argument(
     "--compile_mode",
     type=str,
     default="default",
-    choices=["default", "reduce-overhead", "max-autotune"],
-    help="Inductor mode when `--compile_bptt` is enabled (start with `default`, then try `reduce-overhead`).",
+    choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+    help="Inductor mode when `--compile_bptt` is enabled (`default` recommended for H=32 BPTT).",
 )
 parser.add_argument(
     "--place_weight",

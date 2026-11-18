@@ -53,7 +53,7 @@ class SuperMimicTrainCfg:
 
     # World model settings
     wm_hidden_dims: tuple[int, ...] = (512, 512, 512)
-    wm_seq_len: int = 16                             # Autoregressive unroll horizon k (0.32s covers a full swing phase)
+    wm_seq_len: int = 8                              # Autoregressive unroll horizon k (use 16 for Step-2b ablation)
     wm_updates_per_iter: int = 8
     wm_batch_size: int = 1024
     wm_lr: float = 1e-3
@@ -270,13 +270,29 @@ class SuperMimicTrainer:
         self._wm_step_fn = self._wm_step
         self._img_step_fn = self._imagine_step
         self._use_cudagraph_mark = False
+        self._logged_wm_compile = False
+        self._logged_img_compile = False
         if self.cfg.compile_bptt and hasattr(torch, "compile"):
+            eff_mode = self.cfg.compile_mode
+            if (
+                self.cfg.compile_backend == "inductor"
+                and eff_mode in ("reduce-overhead", "max-autotune")
+                and (self.cfg.imagination_horizon > 4 or self.cfg.wm_seq_len > 4)
+            ):
+                fallback = "max-autotune-no-cudagraphs" if eff_mode == "max-autotune" else "default"
+                print(
+                    f"[SuperMimic Trainer] Note: switching compile_mode='{eff_mode}' -> '{fallback}' for "
+                    f"multi-step BPTT (H={self.cfg.imagination_horizon}, k={self.cfg.wm_seq_len}) to avoid "
+                    f"deep CUDAGraph tree capture stalls and VRAM pool bloat.",
+                    flush=True,
+                )
+                eff_mode = fallback
             comp_kwargs: dict[str, Any] = {"backend": self.cfg.compile_backend}
-            if self.cfg.compile_backend == "inductor" and self.cfg.compile_mode not in (None, "", "default"):
-                comp_kwargs["mode"] = self.cfg.compile_mode
+            if self.cfg.compile_backend == "inductor" and eff_mode not in (None, "", "default"):
+                comp_kwargs["mode"] = eff_mode
             self._use_cudagraph_mark = (self.cfg.compile_backend == "cudagraphs") or (
                 self.cfg.compile_backend == "inductor"
-                and self.cfg.compile_mode in ("reduce-overhead", "max-autotune")
+                and eff_mode in ("reduce-overhead", "max-autotune")
             )
             self._wm_step_fn = torch.compile(self._wm_step, **comp_kwargs)
             self._img_step_fn = torch.compile(self._imagine_step, **comp_kwargs)
@@ -537,7 +553,12 @@ class SuperMimicTrainer:
                     wm.update_delta_stats(torch.cat(deltas, dim=0), mask=batch.mask.transpose(0, 1).reshape(-1))
             err_std = wm.delta_std().detach()
 
-            s_cur = batch.s_init
+            if self.cfg.compile_bptt and not self._logged_wm_compile:
+                print("[SuperMimic Trainer] Compiling single-step world-model graph (one-time JIT)...", flush=True)
+                self._logged_wm_compile = True
+
+            # Match `s_cur.requires_grad` at t=0 with t>=1 so torch.compile traces `_wm_step` once, not twice
+            s_cur = batch.s_init.detach().requires_grad_(True) if self.cfg.compile_bptt else batch.s_init
             loss_state_sum = torch.zeros((), dtype=torch.float32, device=self.device)
             loss_contact_sum = torch.zeros((), dtype=torch.float32, device=self.device)
             last_metrics: dict[str, Tensor] = {}
@@ -719,8 +740,20 @@ class SuperMimicTrainer:
                     self.cfg.policy_batch_size, need_history=is_tracker
                 )
                 B = starts.states.shape[0]
-                s_cur = starts.states
-                prev_a = starts.prev_actions
+                use_compiled_rollout = self.cfg.compile_bptt and not warmup_only
+                if use_compiled_rollout and not self._logged_img_compile:
+                    print(
+                        "[SuperMimic Trainer] Compiling single-step imagination BPTT graph "
+                        f"(first run at iter={iteration}, one-time JIT)...",
+                        flush=True,
+                    )
+                    self._logged_img_compile = True
+
+                # Match `requires_grad` at tau=0 with tau>=1 so torch.compile traces `_imagine_step` only once
+                s_cur = starts.states.detach().requires_grad_(True) if use_compiled_rollout else starts.states
+                prev_a = (
+                    starts.prev_actions.detach().requires_grad_(True) if use_compiled_rollout else starts.prev_actions
+                )
                 m_ids = starts.motion_ids
                 t_0 = starts.time_steps
                 xi = starts.xi
@@ -732,6 +765,8 @@ class SuperMimicTrainer:
                     if is_tracker
                     else None
                 )
+                if hist_cur is not None and use_compiled_rollout:
+                    hist_cur = hist_cur.detach().requires_grad_(True)
                 fk_cur = self.task.run_fk(s_cur)
 
                 imagined_return = torch.zeros(B, dtype=torch.float32, device=self.device)
@@ -774,7 +809,7 @@ class SuperMimicTrainer:
                         # Mild Jacobian decay across 32 steps prevents exploding gradients; FK of the decayed state
                         # equals `fk_next` with scaled gradients, so it is reused instead of recomputed
                         s_cur = s_next * alpha + s_next.detach() * (1.0 - alpha)
-                        fk_cur = fk_next.scale_grad(alpha)
+                        fk_cur = fk_next.scale_grad(alpha, self.fk.anchor_tracked_idx)
                         prev_a = a_cur
                         hist_cur = hist_next
 
@@ -962,13 +997,18 @@ class SuperMimicTrainer:
                 "perf/lr_frac": lr_frac,
             }
             all_metrics = {**c_stats, **wm_stats, **crit_stats, **pol_stats, **perf_stats}
+            should_log = (
+                (it < max(10, self.cfg.wm_warmup_iters + 1))
+                or (it % 10 == 0)
+                or (it == max_iterations - 1)
+            )
             if self.tb_writer is not None:
                 for k, v in all_metrics.items():
                     self.tb_writer.add_scalar(k, v, it)
-                if it % 10 == 0 or it == max_iterations - 1:
+                if should_log:
                     self.tb_writer.flush()
 
-            if it % 10 == 0 or it == max_iterations - 1:
+            if should_log:
                 bc_str = (
                     f" | bc={pol_stats.get('policy/bc_loss', 0.0):.4f} (w={pol_stats.get('policy/bc_coef', 0.0):.2f})"
                     if "policy/bc_loss" in pol_stats

@@ -247,6 +247,15 @@ class TrackerHistoryState:
             project_gravity=self.project_gravity.detach(),
         )
 
+    def requires_grad_(self, mode: bool = True) -> "TrackerHistoryState":
+        return TrackerHistoryState(
+            base_ang_vel=self.base_ang_vel.requires_grad_(mode),
+            joint_pos_rel=self.joint_pos_rel.requires_grad_(mode),
+            joint_vel_rel=self.joint_vel_rel.requires_grad_(mode),
+            actions=self.actions.requires_grad_(mode),
+            project_gravity=self.project_gravity.requires_grad_(mode),
+        )
+
 
 # -----------------------------------------------------------------------------
 # Differentiable HOI Task Engine
