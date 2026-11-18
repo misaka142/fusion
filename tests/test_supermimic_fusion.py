@@ -1293,13 +1293,14 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
     torch.manual_seed(12)
     fk = FastTreeKinematics(device=DEVICE)
 
-    # --- 1. Conservative defaults & batched depth-layer FK check ---
+    # --- 1. A100-aligned defaults & batched depth-layer FK check ---
     assert fk.max_depth == 11, f"Expected G1 kinematic tree max_depth=11, got {fk.max_depth}"
     default_cfg = SuperMimicTrainCfg()
     assert default_cfg.wm_seq_len == 8
-    assert default_cfg.wm_updates_per_iter == 8 and default_cfg.policy_updates_per_iter == 4
-    assert default_cfg.wm_hidden_dims == (512, 512, 512) and default_cfg.policy_hidden_dims == (512, 256, 128)
-    assert default_cfg.legs_absolute is False and default_cfg.pessimistic_critic is True
+    assert default_cfg.wm_updates_per_iter == 12 and default_cfg.policy_updates_per_iter == 6
+    assert default_cfg.wm_hidden_dims == (1024, 1024, 1024) and default_cfg.policy_hidden_dims == (512, 256, 128)
+    assert default_cfg.legs_absolute is True and default_cfg.pessimistic_critic is True
+    assert default_cfg.ema_decay == 0.995 and default_cfg.adam_beta2 == 0.95
 
     # --- 2. Feet z-height reward parity + air-time gradient omission in imagination ---
     mock_m = _MockMotionData(fk, device=DEVICE)
@@ -1355,8 +1356,8 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
         cfg_eq = SuperMimicTrainCfg(
             steps_per_env=8, replay_capacity=32, wm_seq_len=4, wm_updates_per_iter=1, wm_batch_size=16,
             wm_hidden_dims=(64, 64), policy_hidden_dims=(64, 64), wm_warmup_iters=0, imagination_horizon=8,
-            policy_updates_per_iter=1, policy_batch_size=8, enable_tensorboard=False,
-            compile_bptt=False,
+            policy_updates_per_iter=1, policy_batch_size=8, bptt_grad_decay=0.98, use_bf16=False,
+            enable_tensorboard=False, compile_bptt=False,
         )
         tr_eager = SuperMimicTrainer(b_eager, log_dir=tmp / "eq_eager", cfg=cfg_eq)
         tr_eager.collect_rollout()
@@ -1552,6 +1553,132 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
     print("[PASS] Test 12: Zero CUDA host-sync, eager-vs-compiled gradient parity, feet_height & rollout tools")
 
 
+def test_13_ema_actor_bryson_pose_jerk_and_imag_critic() -> None:
+    """Verify gait/jitter/placement fixes:
+    1) Polyak EMA actor exported as primary `policy_state_dict`, with exact `raw_policy_state_dict` resume separation.
+    2) Bryson pose weighting (`pose_loss_weight=4.0`) amplifies root/object pose channels vs velocity channels.
+    3) `motion_joint_vel`, narrowed `anc_pos`/`obj_pos` & `joint_acc` live-env synchronization in `SugarEnvBridge`.
+    4) Second-order action smoothness (`imag_jerk_weight`) + imagined GAE critic calibration (`imag_critic_updates`)
+       under `bfloat16` + zero CUDA host syncs.
+    """
+    torch.manual_seed(13)
+    fk = FastTreeKinematics(device=DEVICE)
+    task = SugarHOITask(fk, "CarryBox")
+
+    # 1. Bryson pose loss boost (4x on root/obj pose vs 1x on velocities)
+    s_gt = SugarHOITask.pack_state(
+        torch.zeros(4, 3, device=DEVICE),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=DEVICE).expand(4, 4),
+        torch.zeros(4, 29, device=DEVICE),
+        torch.zeros(4, 3, device=DEVICE),
+        torch.zeros(4, 3, device=DEVICE),
+        torch.zeros(4, 29, device=DEVICE),
+        torch.zeros(4, 3, device=DEVICE),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=DEVICE).expand(4, 4),
+        torch.zeros(4, 3, device=DEVICE),
+        torch.zeros(4, 3, device=DEVICE),
+    )
+    s_pos_err = s_gt.clone()
+    s_pos_err[:, 0] += 0.10  # 10 cm root x error (pose channel)
+    s_vel_err = s_gt.clone()
+    s_vel_err[:, 36] += 0.10  # 0.1 m/s root vx error (velocity channel)
+    ones29 = torch.ones(29, device=DEVICE)
+    ones82 = torch.ones(82, device=DEVICE)
+    l_pos_1, _ = task.world_model_state_loss(s_pos_err, s_gt, ones29, ones82, pose_loss_weight=1.0)
+    l_pos_4, _ = task.world_model_state_loss(s_pos_err, s_gt, ones29, ones82, pose_loss_weight=4.0)
+    l_vel_1, _ = task.world_model_state_loss(s_vel_err, s_gt, ones29, ones82, pose_loss_weight=1.0)
+    l_vel_4, _ = task.world_model_state_loss(s_vel_err, s_gt, ones29, ones82, pose_loss_weight=4.0)
+    assert abs(l_pos_4.item() / l_pos_1.item() - 4.0) < 1e-5, "Bryson pose_loss_weight failed to scale root pose!"
+    assert abs(l_vel_4.item() - l_vel_1.item()) < 1e-7, "Velocity channel was unexpectedly scaled by pose_loss_weight!"
+
+    # 2. Joint velocity damping reward (`motion_joint_vel`) & live RewardManager sync check
+    class _TermStub:
+        def __init__(self, weight: float, params: dict | None = None):
+            self.weight = weight
+            self.params = params or {}
+
+    class _MockRewMgr:
+        _term_names = [
+            "motion_global_anchor_pos",
+            "motion_obj_pos",
+            "motion_joint_vel",
+            "joint_acc",
+            "motion_obj_pos_place",
+            "motion_feet_height",
+            "feet_slide",
+            "feet_air_time",
+        ]
+        _term_cfgs = [
+            _TermStub(0.35, {"std": 0.18}),
+            _TermStub(0.50, {"std": 0.20}),
+            _TermStub(0.15, {"std": 3.0}),
+            _TermStub(-2.5e-6),
+            _TermStub(1.50, {"std": 0.08, "window": 60}),
+            _TermStub(0.50, {"std": 0.06}),
+            _TermStub(-0.25),
+            _TermStub(1.50, {"threshold": 0.28}),
+        ]
+
+    from sugar_rl.supermimic.env_bridge import SugarEnvBridge
+
+    dummy_br = object.__new__(SugarEnvBridge)
+    dummy_br.env = type("_E", (), {"reward_manager": _MockRewMgr()})()
+    dummy_br.profile = task.profile
+    dummy_br.motion_ref = MotionReferenceAdapter(_MockMotionData(fk, device=DEVICE))
+    dummy_br._sync_live_reward_params()
+    assert abs(task.profile.anc_pos_weight - 0.35) < 1e-6 and abs(task.profile.anc_pos_std - 0.18) < 1e-6
+    assert abs(task.profile.obj_pos_std - 0.20) < 1e-6
+    assert abs(task.profile.joint_vel_weight - 0.15) < 1e-6 and abs(task.profile.joint_vel_std - 3.0) < 1e-6
+    assert abs(task.profile.joint_acc_weight - (-2.5e-6)) < 1e-12
+    assert task.profile.place_window == 60 and abs(task.profile.place_weight - 1.50) < 1e-6
+
+    f0 = dummy_br.motion_ref.get_frame(torch.zeros(2, dtype=torch.long, device=DEVICE), torch.zeros(2, dtype=torch.long, device=DEVICE))
+    s_calm = SugarHOITask.pack_state(
+        f0.body_pos_w[:, 0], f0.body_quat_w[:, 0], f0.joint_pos, f0.body_lin_vel_w[:, 0],
+        f0.body_ang_vel_w[:, 0], f0.joint_vel, f0.obj_pos_w, f0.obj_quat_w, f0.obj_lin_vel_w, f0.obj_ang_vel_w,
+    )
+    s_jitter = s_calm.clone()
+    s_jitter[:, 42:71] += 2.5  # high-frequency joint velocity spike
+    z_a = torch.zeros(2, 29, device=DEVICE)
+    r_calm, _, _ = task.compute_reward_and_termination(s_calm, s_calm, z_a, z_a, f0)
+    r_jit, _, _ = task.compute_reward_and_termination(s_calm, s_jitter, z_a, z_a, f0)
+    assert (r_calm > r_jit).all()
+
+    # 3. Actor EMA export vs raw online resume + imagined critic GAE + bf16 zero-sync check
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir)
+        bridge = _SyntheticSugarBridge(stage="refiner", num_envs=16, device=DEVICE)
+        cfg = SuperMimicTrainCfg(
+            steps_per_env=8, replay_capacity=32, wm_seq_len=4, wm_updates_per_iter=2, wm_batch_size=16,
+            wm_hidden_dims=(64, 64), policy_hidden_dims=(64, 64), wm_warmup_iters=0, imagination_horizon=6,
+            policy_updates_per_iter=2, policy_batch_size=16, ema_decay=0.80, imag_jerk_weight=0.05,
+            imag_critic_updates=2, use_bf16=True, enable_tensorboard=False,
+        )
+        tr = SuperMimicTrainer(bridge, log_dir=tmp / "ema_run", cfg=cfg)
+        tr.collect_rollout()
+        tr.update_world_model()
+        p_metrics = tr.update_policy(iteration=1)
+        assert "critic/imag_loss" in p_metrics and math.isfinite(p_metrics["critic/imag_loss"])
+
+        # Raw online weights moved farther than EMA (decay=0.80), and `save_checkpoint` exports EMA as `policy_state_dict`
+        raw_w = tr._raw_policy.backbone[-1].weight.detach().clone()
+        ema_w = tr.ema_policy.backbone[-1].weight.detach().clone()
+        assert (raw_w - ema_w).abs().max().item() > 1e-7, "EMA weights did not lag online policy weights!"
+
+        ckpt_p = tmp / "ema_ckpt.pt"
+        tr.save_checkpoint(ckpt_p, iteration=1)
+        deployed = load_supermimic_policy(ckpt_p, device=DEVICE)
+        assert (deployed.backbone[-1].weight - ema_w).abs().max().item() < 1e-6, "Deployed policy did not load EMA!"
+        assert deployed.residual_mask.sum().item() == 17.0, "Default legs_absolute=True mask not preserved in ckpt!"
+
+        tr_resumed = SuperMimicTrainer(bridge, log_dir=tmp / "ema_resume", cfg=cfg)
+        tr_resumed.load_checkpoint(ckpt_p)
+        assert (tr_resumed._raw_policy.backbone[-1].weight - raw_w).abs().max().item() < 1e-6
+        assert (tr_resumed.ema_policy.backbone[-1].weight - ema_w).abs().max().item() < 1e-6
+
+    print("[PASS] Test 13: Polyak EMA export/resume, Bryson pose weighting, joint_vel sync & imagined Critic GAE")
+
+
 if __name__ == "__main__":
     print(f"Running SuperMimic x SUGAR test suite on device: {DEVICE} (PyTorch {torch.__version__})")
     test_1_rotations_and_zero_angle_gradients()
@@ -1566,4 +1693,5 @@ if __name__ == "__main__":
     test_10_colab_interrupt_auto_resume_and_generator_ckpt()
     test_11_retrain_config_mechanisms()
     test_12_review_compliance_zero_sync_equivalence_and_rollout_tools()
-    print("\nALL 12 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")
+    test_13_ema_actor_bryson_pose_jerk_and_imag_critic()
+    print("\nALL 13 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")

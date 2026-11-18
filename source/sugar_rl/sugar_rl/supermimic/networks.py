@@ -107,10 +107,12 @@ class JointWorldModel(nn.Module):
         xi_dim: int = XI_DIM,
         delta_dim: int = DELTA_DIM,
         contact_dim: int = CONTACT_DIM,
-        hidden_dims: Sequence[int] = (512, 512, 512),
+        hidden_dims: Sequence[int] = (1024, 1024, 1024),
+        use_bf16: bool = False,
     ) -> None:
         super().__init__()
         self.in_dim = state_feat_dim + action_dim * 2 + xi_dim
+        self.use_bf16 = bool(use_bf16)
         self.feat_rms = RunningMeanStd(state_feat_dim)
         self.xi_rms = RunningMeanStd(xi_dim)
         # Output normalizer: the head predicts the delta in units of the true one-step delta std (allmimic `out_norm`)
@@ -129,6 +131,12 @@ class JointWorldModel(nn.Module):
         self._core_fn = self._core_forward
 
     def _core_forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        if self.use_bf16 and x.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                h = self.trunk(x)
+                d_n = self.delta_head(h)
+                c_l = self.contact_head(h)
+            return d_n.float(), c_l.float()
         h = self.trunk(x)
         return self.delta_head(h), self.contact_head(h)
 
@@ -203,6 +211,7 @@ class SuperMimicPolicy(nn.Module):
         max_std: float = 1.0,
         action_limit: float = 8.0,
         residual_mask: Tensor | None = None,
+        use_bf16: bool = False,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
@@ -212,6 +221,7 @@ class SuperMimicPolicy(nn.Module):
         self.min_std = min_std
         self.max_std = max_std
         self.action_limit = action_limit
+        self.use_bf16 = bool(use_bf16)
 
         self.obs_rms = RunningMeanStd(obs_dim)
         self.backbone = _build_mlp(obs_dim, hidden_dims, out_dim=action_dim, out_gain=0.01)
@@ -233,7 +243,12 @@ class SuperMimicPolicy(nn.Module):
         self._core_fn = self._core_forward
 
     def _core_forward(self, obs_n: Tensor) -> Tensor:
-        residual = self.backbone(obs_n)
+        if self.use_bf16 and obs_n.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                residual = self.backbone(obs_n)
+            residual = residual.float()
+        else:
+            residual = self.backbone(obs_n)
         return self.action_limit * torch.tanh(residual / self.action_limit)
 
     def enable_compile(self, **compile_kwargs) -> None:
@@ -286,10 +301,12 @@ class SuperMimicCritic(nn.Module):
         obs_dim: int = PRIVILEGED_OBS_DIM,
         hidden_dims: Sequence[int] = (512, 256, 128),
         num_heads: int = 2,
+        use_bf16: bool = False,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
         self.num_heads = num_heads
+        self.use_bf16 = bool(use_bf16)
         self.obs_rms = RunningMeanStd(obs_dim)
         self.heads = nn.ModuleList(
             [_build_mlp(obs_dim, hidden_dims, out_dim=1, out_gain=1.0) for _ in range(num_heads)]
@@ -297,6 +314,11 @@ class SuperMimicCritic(nn.Module):
         self._core_fn = self._core_forward
 
     def _core_forward(self, obs_n: Tensor) -> Tensor:
+        if self.use_bf16 and obs_n.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                preds = [head(obs_n).squeeze(-1) for head in self.heads]
+                out = torch.stack(preds, dim=0)
+            return out.float()
         preds = [head(obs_n).squeeze(-1) for head in self.heads]
         return torch.stack(preds, dim=0)
 

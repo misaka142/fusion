@@ -236,6 +236,13 @@ class SugarEnvBridge:
         if verify_obs_on_init:
             self._verify_privileged_obs_alignment(atol=obs_verify_atol)
 
+        # Desynchronize episode timeout counters in training mode (matches RSL-RL `init_at_random_ep_len=True`)
+        m_cfg = getattr(self.motion_cmd, "cfg", None)
+        is_eval_or_rollout = bool(getattr(m_cfg, "rollout_traj", False) or getattr(m_cfg, "eval_mode", False))
+        max_ep_len = int(getattr(self.env, "max_episode_length", 0))
+        if (not is_eval_or_rollout) and max_ep_len > 1 and hasattr(self.env, "episode_length_buf"):
+            self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=max_ep_len)
+
     def _install_push_hooks(self) -> None:
         """Wrap interval push event functions so `_pushed_mask` records exact pushed env_ids."""
         ev_mgr = getattr(self.env, "event_manager", None)
@@ -325,6 +332,25 @@ class SugarEnvBridge:
             self.profile.feet_height_std = float(fh_params.get("std", self.profile.feet_height_std))
         elif term_names:
             self.profile.feet_height_weight = 0.0
+        if "motion_global_anchor_pos" in cfg_map:
+            ap = cfg_map["motion_global_anchor_pos"]
+            self.profile.anc_pos_weight = float(ap.weight)
+            ap_params = getattr(ap, "params", None) or {}
+            self.profile.anc_pos_std = float(ap_params.get("std", self.profile.anc_pos_std))
+        if "motion_obj_pos" in cfg_map:
+            op = cfg_map["motion_obj_pos"]
+            self.profile.obj_pos_weight = float(op.weight)
+            op_params = getattr(op, "params", None) or {}
+            self.profile.obj_pos_std = float(op_params.get("std", self.profile.obj_pos_std))
+        if "motion_joint_vel" in cfg_map:
+            jv = cfg_map["motion_joint_vel"]
+            self.profile.joint_vel_weight = float(jv.weight)
+            jv_params = getattr(jv, "params", None) or {}
+            self.profile.joint_vel_std = float(jv_params.get("std", self.profile.joint_vel_std))
+        elif term_names:
+            self.profile.joint_vel_weight = 0.0
+        if "joint_acc" in cfg_map:
+            self.profile.joint_acc_weight = float(cfg_map["joint_acc"].weight)
         self.motion_ref.set_release_window(self.profile.place_window)
 
     def _resolve_foot_shape_indices(self, total_shapes: int) -> list[int]:

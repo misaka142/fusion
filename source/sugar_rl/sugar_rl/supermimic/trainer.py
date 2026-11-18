@@ -18,6 +18,7 @@ Algorithm per iteration:
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import time
@@ -32,6 +33,7 @@ from torch import Tensor
 
 from .hoi_task import (
     PRIVILEGED_OBS_DIM,
+    SDIM,
     TRACKER_OBS_DIM,
     resolve_task_profile,
 )
@@ -43,44 +45,49 @@ LEG_JOINT_KEYWORDS = ("hip", "knee", "ankle")
 
 @dataclass
 class SuperMimicTrainCfg:
-    """Hyperparameters for SuperMimic x SUGAR training (PyTorch 2.7 compatible)."""
+    """Hyperparameters for SuperMimic x SUGAR training (aligned with HybridRobotics/supermimic & A100 4096 envs)."""
 
     stage: str = "auto"                              # "auto" | "refiner" | "tracker"
     steps_per_env: int = 24                          # Matches SUGAR num_steps_per_env=24 for 1:1 iteration parity
     replay_capacity: int = 512                       # Ring buffer length per env on GPU (~21 iters of coverage)
-    collect_det_frac: float = 0.25                   # First 25% envs act without noise (allmimic #23, protects init_pool)
+    collect_det_frac: float = 0.25                   # First 25% envs act without noise via EMA policy (protects init_pool)
     collect_action_noise: float = 0.15               # Fixed exploration noise std in raw action units (0.1-0.2)
 
-    # World model settings
-    wm_hidden_dims: tuple[int, ...] = (512, 512, 512)
-    wm_seq_len: int = 8                              # Autoregressive unroll horizon k (use 16 for Step-2b ablation)
-    wm_updates_per_iter: int = 8
-    wm_batch_size: int = 1024
+    # World model settings (scaled for A100 + Bryson pose weighting from official HybridRobotics/supermimic)
+    wm_hidden_dims: tuple[int, ...] = (1024, 1024, 1024)
+    wm_seq_len: int = 8                              # Autoregressive unroll horizon k
+    wm_updates_per_iter: int = 12
+    wm_batch_size: int = 2048
     wm_lr: float = 1e-3
-    wm_contact_loss_weight: float = 0.2
-    wm_obj_loss_weight: float = 1.5
+    wm_contact_loss_weight: float = 0.25
+    wm_obj_loss_weight: float = 2.0
+    wm_pose_loss_weight: float = 4.0                 # Boost integrated root/object pose channels (prevents XY drift)
     wm_warmup_iters: int = 8                         # Fit WM & Critic (and pure BC if Tracker) before enabling BPTT
     joint_weight_clip: float = 4.0                   # Clip WM joint error weights to [1/c, c] (allmimic #21)
 
     # Policy BPTT settings
     policy_hidden_dims: tuple[int, ...] = (512, 256, 128)
     use_ref_residual: bool = True
-    legs_absolute: bool = False                      # Optional ablation: legs absolute, upper body residual (allmimic #20)
+    legs_absolute: bool = True                       # Legs absolute for dynamic CoM balance, upper body residual (allmimic #20)
     init_noise_std: float = 0.20                     # Only initializes the (unused) `log_std` parameter
     imagination_horizon: int = 32                    # H=32 step differentiable imagination rollout
-    policy_updates_per_iter: int = 4
-    policy_batch_size: int = 512
+    policy_updates_per_iter: int = 6
+    policy_batch_size: int = 2048
     policy_lr: float = 3e-4
-    bptt_grad_decay: float = 0.98                    # Mild state Jacobian damping across 32 steps for stability
-    grad_value_clip: float | None = 0.1              # Elementwise gradient clip after norm clip (allmimic)
+    adam_beta2: float = 0.95                         # Faster Adam EMA recovery after contact gradient spikes (official)
+    bptt_grad_decay: float = 1.0                     # Full unattenuated 32-step horizon gradients (official)
+    imag_jerk_weight: float = 0.02                   # Second-order action smoothness `||a_t - 2a_{t-1} + a_{t-2}||^2`
+    ema_decay: float = 0.995                         # Polyak EMA actor weights for smooth gait & checkpoint stability
+    grad_value_clip: float | None = 0.1              # Elementwise gradient clip after norm clip (official)
     pessimistic_critic: bool = True                  # Min over critic heads in imagination bootstrap
-    value_clip_range: tuple[float, float] | None = None  # None -> +-max_step_reward / (1 - gamma) (allmimic #29)
+    value_clip_range: tuple[float, float] | None = None  # None -> +-max_step_reward / (1 - gamma)
 
-    # Critic TD(lambda) settings
+    # Critic TD(lambda) settings (jointly calibrated on real transitions + deterministic imagined rollouts)
     critic_hidden_dims: tuple[int, ...] = (512, 256, 128)
     critic_heads: int = 2
     critic_epochs: int = 4
     critic_minibatches: int = 4
+    imag_critic_updates: int = 2                     # Extra GAE updates per policy step on 32-step imagined rollouts
     critic_lr: float = 5e-4
     gamma: float = 0.99
     lam: float = 0.95
@@ -93,7 +100,8 @@ class SuperMimicTrainCfg:
     bc_min_coef: float = 0.05
     bc_anneal_iters: int = 3500                      # Reaches bc_min_coef at 70% of standard 5001-iter run
 
-    # Checkpointing & logging
+    # Precision, checkpointing & compilation
+    use_bf16: bool = True                            # CUDA bfloat16 autocast inside MLPs (FP32 state/FK/rotations)
     max_grad_norm: float = 1.0
     save_interval: int = 500
     enable_tensorboard: bool = True
@@ -232,8 +240,17 @@ class SuperMimicTrainer:
             v_lim = self.task.max_step_reward() / (1.0 - self.cfg.gamma)
             self.value_clip = (-v_lim, v_lim)
 
-        # Build World Model, Actor, Critic (retaining uncompiled references for clean attribute/checkpoint access)
-        self._raw_world_model = JointWorldModel(hidden_dims=self.cfg.wm_hidden_dims).to(self.device)
+        # Build World Model, Actor (+ Polyak EMA Actor), Critic
+        eff_bf16 = bool(
+            self.cfg.use_bf16
+            and torch.device(self.device).type == "cuda"
+            and hasattr(torch.cuda, "is_bf16_supported")
+            and torch.cuda.is_bf16_supported()
+        )
+        self._raw_world_model = JointWorldModel(
+            hidden_dims=self.cfg.wm_hidden_dims,
+            use_bf16=eff_bf16,
+        ).to(self.device)
         residual_mask = make_residual_mask(list(self.fk.env_joint_names), self.cfg.legs_absolute)
         self._raw_policy = SuperMimicPolicy(
             obs_dim=policy_obs_dim,
@@ -244,12 +261,21 @@ class SuperMimicTrainer:
             use_ref_residual=self.cfg.use_ref_residual,
             init_std=self.cfg.init_noise_std,
             residual_mask=residual_mask,
+            use_bf16=eff_bf16,
         ).to(self.device)
         self._raw_policy.log_std.requires_grad_(False)  # exploration noise is fixed (`collect_action_noise`)
+
+        # Smooth Polyak EMA policy used for deterministic collection, evaluation & exported `policy_state_dict`
+        self.ema_policy: SuperMimicPolicy = copy.deepcopy(self._raw_policy).to(self.device)
+        self.ema_policy.use_bf16 = False  # exact FP32 inference parity with standalone `play.py` & MuJoCo Sim2Sim
+        self.ema_policy.eval()
+        _freeze_params(self.ema_policy, True)
+
         self._raw_critic = SuperMimicCritic(
             obs_dim=critic_obs_dim,
             hidden_dims=self.cfg.critic_hidden_dims,
             num_heads=self.cfg.critic_heads,
+            use_bf16=eff_bf16,
         ).to(self.device)
 
         self.world_model: nn.Module = self._raw_world_model
@@ -298,17 +324,19 @@ class SuperMimicTrainer:
             self._img_step_fn = torch.compile(self._imagine_step, **comp_kwargs)
 
         use_fused_opt = torch.device(self.device).type == "cuda"
+        betas = (0.9, float(self.cfg.adam_beta2))
         self.wm_opt = torch.optim.AdamW(
-            self._raw_world_model.parameters(), lr=self.cfg.wm_lr, weight_decay=1e-5, fused=use_fused_opt
+            self._raw_world_model.parameters(), lr=self.cfg.wm_lr, betas=betas, weight_decay=1e-5, fused=use_fused_opt
         )
         self.policy_opt = torch.optim.AdamW(
             [p for p in self._raw_policy.parameters() if p.requires_grad],
             lr=self.cfg.policy_lr,
+            betas=betas,
             weight_decay=1e-5,
             fused=use_fused_opt,
         )
         self.critic_opt = torch.optim.AdamW(
-            self._raw_critic.parameters(), lr=self.cfg.critic_lr, weight_decay=1e-5, fused=use_fused_opt
+            self._raw_critic.parameters(), lr=self.cfg.critic_lr, betas=betas, weight_decay=1e-5, fused=use_fused_opt
         )
         self._base_lrs = {
             "wm": self.cfg.wm_lr,
@@ -366,6 +394,23 @@ class SuperMimicTrainer:
                 group["lr"] = self._base_lrs[key] * frac
         return frac
 
+    @torch.no_grad()
+    def _sync_ema_buffers(self) -> None:
+        for b_ema, b_raw in zip(self.ema_policy.buffers(), self._raw_policy.buffers()):
+            b_ema.copy_(b_raw)
+
+    @torch.no_grad()
+    def _update_ema_policy(self) -> None:
+        """Zero-sync fused Polyak EMA update of actor weights + exact buffer mirroring."""
+        decay = float(self.cfg.ema_decay)
+        raw_params = list(self._raw_policy.parameters())
+        ema_params = list(self.ema_policy.parameters())
+        if decay <= 0.0:
+            torch._foreach_copy_(ema_params, raw_params)
+        else:
+            torch._foreach_lerp_(ema_params, raw_params, 1.0 - decay)
+        self._sync_ema_buffers()
+
     # ------------------------------------------------------------------
     # Phase 1: Real Environment Rollout Collection
     # ------------------------------------------------------------------
@@ -405,10 +450,17 @@ class SuperMimicTrainer:
 
             # Update running normalizers with fresh on-policy simulator observations
             self._raw_policy.obs_rms.update(obs_pol)
+            self._sync_ema_buffers()
             v_pred = self.critic(obs_crit, update_rms=True, pessimistic=False)
 
-            # Deterministic first `det_env_count` envs (as deployed), fixed Gaussian noise for the rest
-            act_mean = self._raw_policy.forward_mean(obs_pol, update_rms=False)
+            # Deterministic first `det_env_count` envs use smooth EMA policy (as deployed); rest explore with noise
+            det_n = self.det_env_count
+            if det_n > 0 and self.cfg.ema_decay > 0.0:
+                act_det = self.ema_policy.forward_mean(obs_pol[:det_n], update_rms=False)
+                act_exp = self._raw_policy.forward_mean(obs_pol[det_n:], update_rms=False)
+                act_mean = torch.cat([act_det, act_exp], dim=0)
+            else:
+                act_mean = self._raw_policy.forward_mean(obs_pol, update_rms=False)
             action = act_mean + noise_scale * torch.randn_like(act_mean)
 
             _, sim_rew, dones, timeouts, pushed, extras = self.bridge.step(action)
@@ -515,6 +567,7 @@ class SuperMimicTrainer:
             self.joint_weights,
             err_std,
             obj_loss_weight=self.cfg.wm_obj_loss_weight,
+            pose_loss_weight=self.cfg.wm_pose_loss_weight,
             step_mask=mask_t,
         )
         bce_per = F.binary_cross_entropy_with_logits(c_logits, contact_t, reduction="none").mean(dim=-1)
@@ -707,6 +760,65 @@ class SuperMimicTrainer:
             hist_next,
         )
 
+    def _fit_imagined_critic(
+        self,
+        img_states: Tensor,
+        img_prev_acts: Tensor,
+        img_rewards: Tensor,
+        img_not_done: Tensor,
+        m_ids: Tensor,
+        t_0: Tensor,
+        xi: Tensor,
+    ) -> Tensor:
+        """Align Critic on deterministic H-step imagined GAE returns (official ActorCriticPolicyLearner._fit_critic)."""
+        H, B = img_rewards.shape
+        v_min, v_max = self.value_clip
+        gamma = self.cfg.gamma
+        lam = self.cfg.lam
+
+        with torch.no_grad():
+            offsets = torch.arange(H + 1, device=self.device, dtype=t_0.dtype).unsqueeze(1)  # (H+1, 1)
+            t_all = (t_0.unsqueeze(0) + offsets).reshape(-1)
+            m_all = m_ids.unsqueeze(0).expand(H + 1, B).reshape(-1)
+            xi_all = xi.unsqueeze(0).expand(H + 1, B, -1).reshape((H + 1) * B, -1)
+            s_all = img_states.reshape((H + 1) * B, SDIM)
+            pa_all = img_prev_acts.reshape((H + 1) * B, -1)
+            fut_all = self.bridge.motion_ref.get_future_window(m_all, t_all)
+            obs_all = self.task.build_privileged_obs(s_all, pa_all, fut_all, xi=xi_all)
+            v_all = self.critic(obs_all, update_rms=False, pessimistic=False).clamp(v_min, v_max).view(H + 1, B)
+
+            adv = torch.zeros(B, dtype=torch.float32, device=self.device)
+            imag_ret = torch.empty((H, B), dtype=torch.float32, device=self.device)
+            for tau in reversed(range(H)):
+                nd = img_not_done[tau]
+                delta = img_rewards[tau] + gamma * v_all[tau + 1] * nd - v_all[tau]
+                adv = delta + gamma * lam * nd * adv
+                imag_ret[tau] = (adv + v_all[tau]).clamp(v_min, v_max)
+
+            obs_steps = obs_all[: H * B]
+            ret_steps = imag_ret.reshape(H * B)
+
+        _freeze_params(self._raw_critic, False)
+        self.critic.train()
+        critic_params = list(self._raw_critic.parameters())
+        total_n = H * B
+        mb_n = min(4096, total_n)
+        loss_acc = torch.zeros((), dtype=torch.float32, device=self.device)
+        for _ in range(self.cfg.imag_critic_updates):
+            perm = torch.randperm(total_n, device=self.device)[:mb_n]
+            preds = self._raw_critic.forward_all(obs_steps[perm], update_rms=False)
+            target = ret_steps[perm].unsqueeze(0).expand_as(preds)
+            loss_v = F.smooth_l1_loss(preds, target, beta=1.0)
+            self.critic_opt.zero_grad(set_to_none=True)
+            loss_v.backward()
+            gn = nn.utils.clip_grad_norm_(critic_params, self.cfg.max_grad_norm)
+            _zero_nonfinite_grads_(critic_params, gn)
+            self.critic_opt.step()
+            loss_acc = loss_acc + loss_v.detach()
+        self.critic.eval()
+        _freeze_params(self._raw_critic, True)
+        return loss_acc / float(self.cfg.imag_critic_updates)
+
     def update_policy(self, iteration: int) -> dict[str, float]:
         if self.replay.size < 2:
             return {}
@@ -727,12 +839,15 @@ class SuperMimicTrainer:
         v_min, v_max = self.value_clip
         alpha = self.cfg.bptt_grad_decay
         gamma = self.cfg.gamma
+        jerk_w = float(self.cfg.imag_jerk_weight)
+        dt = float(self.task.step_dt)
         pol_params = [p for p in self._raw_policy.parameters() if p.requires_grad]
 
         ret_accum = torch.zeros((), dtype=torch.float32, device=self.device)
         bc_accum = torch.zeros((), dtype=torch.float32, device=self.device)
         surv_accum = torch.zeros((), dtype=torch.float32, device=self.device)
         obj_rew_accum = torch.zeros((), dtype=torch.float32, device=self.device)
+        imag_v_accum = torch.zeros((), dtype=torch.float32, device=self.device)
 
         try:
             for _ in range(self.cfg.policy_updates_per_iter):
@@ -754,6 +869,7 @@ class SuperMimicTrainer:
                 prev_a = (
                     starts.prev_actions.detach().requires_grad_(True) if use_compiled_rollout else starts.prev_actions
                 )
+                prev2_a = prev_a
                 m_ids = starts.motion_ids
                 t_0 = starts.time_steps
                 xi = starts.xi
@@ -773,6 +889,15 @@ class SuperMimicTrainer:
                 bc_loss_sum = torch.zeros((), dtype=torch.float32, device=self.device)
                 discount_weight = torch.ones(B, dtype=torch.float32, device=self.device)
                 step_obj_rew_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+
+                need_imag_critic = (not warmup_only) and (self.cfg.imag_critic_updates > 0)
+                if need_imag_critic:
+                    img_states = torch.empty((H + 1, B, SDIM), dtype=torch.float32, device=self.device)
+                    img_prev_acts = torch.empty((H + 1, B, prev_a.shape[-1]), dtype=torch.float32, device=self.device)
+                    img_rewards = torch.empty((H, B), dtype=torch.float32, device=self.device)
+                    img_not_done = torch.empty((H, B), dtype=torch.float32, device=self.device)
+                    img_states[0].copy_(starts.states.detach())
+                    img_prev_acts[0].copy_(starts.prev_actions.detach())
 
                 if warmup_only:
                     # Tracker pure-BC warmup: one step, no world model
@@ -800,16 +925,31 @@ class SuperMimicTrainer:
                         bc_loss_sum = bc_loss_sum + (discount_weight.detach() * step_bc).mean()
                         step_obj_rew_sum = step_obj_rew_sum + obj_rew.mean()
 
-                        imagined_return = imagined_return + discount_weight * r_step
-                        imagined_return = (
-                            imagined_return + discount_weight * gamma * (1.0 - p_term) * v_done * traj_done
-                        )
-                        discount_weight = discount_weight * gamma * (1.0 - p_term) * (1.0 - traj_done)
+                        if jerk_w > 0.0 and tau >= 1:
+                            r_actor = r_step - jerk_w * ((a_cur - 2.0 * prev_a + prev2_a) ** 2).sum(dim=-1) * dt
+                        else:
+                            r_actor = r_step
 
-                        # Mild Jacobian decay across 32 steps prevents exploding gradients; FK of the decayed state
-                        # equals `fk_next` with scaled gradients, so it is reused instead of recomputed
-                        s_cur = s_next * alpha + s_next.detach() * (1.0 - alpha)
-                        fk_cur = fk_next.scale_grad(alpha, self.fk.anchor_tracked_idx)
+                        done_boot = gamma * (1.0 - p_term) * v_done * traj_done
+                        not_done_step = (1.0 - p_term) * (1.0 - traj_done)
+
+                        imagined_return = imagined_return + discount_weight * (r_actor + done_boot)
+                        discount_weight = discount_weight * gamma * not_done_step
+
+                        if need_imag_critic:
+                            img_states[tau + 1].copy_(s_next.detach())
+                            img_prev_acts[tau + 1].copy_(a_cur.detach())
+                            img_rewards[tau].copy_((r_step + done_boot).detach())
+                            img_not_done[tau].copy_(not_done_step.detach())
+
+                        # Optional Jacobian damping; when alpha == 1.0, passes gradients through unattenuated
+                        if alpha < 1.0:
+                            s_cur = s_next * alpha + s_next.detach() * (1.0 - alpha)
+                            fk_cur = fk_next.scale_grad(alpha, self.fk.anchor_tracked_idx)
+                        else:
+                            s_cur = s_next
+                            fk_cur = fk_next
+                        prev2_a = prev_a
                         prev_a = a_cur
                         hist_cur = hist_next
 
@@ -831,6 +971,12 @@ class SuperMimicTrainer:
                 if self.cfg.grad_value_clip is not None and self.cfg.grad_value_clip > 0.0:
                     nn.utils.clip_grad_value_(pol_params, self.cfg.grad_value_clip)
                 self.policy_opt.step()
+                self._update_ema_policy()
+
+                if need_imag_critic:
+                    imag_v_accum = imag_v_accum + self._fit_imagined_critic(
+                        img_states, img_prev_acts, img_rewards, img_not_done, m_ids, t_0, xi
+                    )
 
                 ret_accum = ret_accum + imagined_return.mean().detach()
                 bc_accum = bc_accum + bc_term.detach()
@@ -847,6 +993,8 @@ class SuperMimicTrainer:
             "policy/imagined_obj_rew": float((obj_rew_accum / denom).item()),
             "policy/collect_noise": float(self.cfg.collect_action_noise),
         }
+        if (not warmup_only) and self.cfg.imag_critic_updates > 0:
+            metrics["critic/imag_loss"] = float((imag_v_accum / denom).item())
         if self.teacher_policy is not None:
             metrics["policy/bc_loss"] = float((bc_accum / denom).item())
             metrics["policy/bc_coef"] = bc_coef
@@ -858,13 +1006,20 @@ class SuperMimicTrainer:
 
     def save_checkpoint(self, path: str | Path, iteration: int) -> None:
         raw_pol = _unwrap_compiled(self._raw_policy)
+        ema_pol = _unwrap_compiled(self.ema_policy)
         raw_crit = _unwrap_compiled(self._raw_critic)
         raw_wm = _unwrap_compiled(self._raw_world_model)
 
-        # Sync latest nominal actuator buffers before saving
+        # Sync latest nominal actuator & normalizer buffers before saving
         raw_pol.sync_actuator_buffers(self.fk.default_joint_pos, self.fk.action_scale)
+        self._sync_ema_buffers()
+        ema_pol.sync_actuator_buffers(self.fk.default_joint_pos, self.fk.action_scale)
+
+        # Export smooth EMA policy as primary `policy_state_dict` so `play.py`, Teacher BC & MuJoCo Sim2Sim
+        # automatically get jitter-free inference, while retaining `raw_policy_state_dict` for exact resume!
+        export_pol = ema_pol if self.cfg.ema_decay > 0.0 else raw_pol
         payload = {
-            "format": "supermimic_sugar_v3",
+            "format": "supermimic_sugar_v4",
             "stage": self.stage,
             "task_name": self.task.profile.task_name,
             "joint_names": list(self.fk.env_joint_names),
@@ -875,7 +1030,8 @@ class SuperMimicTrainer:
             "hidden_dims": raw_pol.hidden_dims,
             "use_ref_residual": raw_pol.use_ref_residual,
             "cfg": asdict(self.cfg),
-            "policy_state_dict": _strip_compiled_prefix(raw_pol.state_dict()),
+            "policy_state_dict": _strip_compiled_prefix(export_pol.state_dict()),
+            "raw_policy_state_dict": _strip_compiled_prefix(raw_pol.state_dict()),
             "critic_state_dict": _strip_compiled_prefix(raw_crit.state_dict()),
             "world_model_state_dict": _strip_compiled_prefix(raw_wm.state_dict()),
             "policy_opt_state_dict": self.policy_opt.state_dict(),
@@ -890,7 +1046,17 @@ class SuperMimicTrainer:
     def load_checkpoint(self, path: str | Path) -> int:
         payload = torch.load(str(path), map_location=self.device, weights_only=False)
         raw_pol = _unwrap_compiled(self._raw_policy)
-        raw_pol.load_state_dict(_policy_state_dict_compat(payload["policy_state_dict"], raw_pol.action_dim))
+        ema_pol = _unwrap_compiled(self.ema_policy)
+
+        ema_sd = _policy_state_dict_compat(payload["policy_state_dict"], raw_pol.action_dim)
+        raw_sd = (
+            _policy_state_dict_compat(payload["raw_policy_state_dict"], raw_pol.action_dim)
+            if "raw_policy_state_dict" in payload
+            else ema_sd
+        )
+        raw_pol.load_state_dict(raw_sd)
+        ema_pol.load_state_dict(ema_sd)
+
         _unwrap_compiled(self._raw_critic).load_state_dict(_strip_compiled_prefix(payload["critic_state_dict"]))
         _unwrap_compiled(self._raw_world_model).load_state_dict(
             _strip_compiled_prefix(payload["world_model_state_dict"])

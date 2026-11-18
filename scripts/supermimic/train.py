@@ -111,29 +111,31 @@ parser.add_argument(
     "--teacher_ckpt", type=str, default=None, help="Path to Stage 1 SuperMimic Refiner `.pt` checkpoint."
 )
 
-# SuperMimic algorithm hyperparameters (aligned with review: fast Step-1 defaults + clean Step-2/3 controls)
+# SuperMimic algorithm hyperparameters (aligned with HybridRobotics/supermimic & A100 4096 envs)
 parser.add_argument("--horizon", type=int, default=32, help="Differentiable imagination rollout horizon H.")
 parser.add_argument("--wm_seq_len", type=int, default=8, help="Autoregressive world-model training sequence length k.")
-parser.add_argument("--wm_updates", type=int, default=8, help="World model gradient updates per iteration.")
-parser.add_argument("--policy_updates", type=int, default=4, help="Policy BPTT updates per iteration.")
-parser.add_argument("--wm_batch_size", type=int, default=1024, help="Minibatch size for world-model updates.")
-parser.add_argument("--policy_batch_size", type=int, default=512, help="Batch size of 32-step imagination rollouts.")
+parser.add_argument("--wm_updates", type=int, default=12, help="World model gradient updates per iteration.")
+parser.add_argument("--policy_updates", type=int, default=6, help="Policy BPTT updates per iteration.")
+parser.add_argument("--wm_batch_size", type=int, default=2048, help="Minibatch size for world-model updates.")
+parser.add_argument("--policy_batch_size", type=int, default=2048, help="Batch size of 32-step imagination rollouts.")
 parser.add_argument("--replay_capacity", type=int, default=512, help="Ring replay buffer steps per environment.")
-parser.add_argument("--wm_hidden", type=str, default="512,512,512", help="World model hidden widths.")
+parser.add_argument("--wm_hidden", type=str, default="1024,1024,1024", help="World model hidden widths.")
 parser.add_argument("--policy_hidden", type=str, default="512,256,128", help="Policy hidden widths.")
 parser.add_argument("--collect_noise", type=float, default=0.15, help="Fixed collection action noise std (raw units).")
 parser.add_argument("--lr_final_frac", type=float, default=0.03, help="Cosine LR decay target (fraction of base LR).")
+parser.add_argument("--ema_decay", type=float, default=0.995, help="Polyak EMA decay for smooth actor weights (0 disables).")
+parser.add_argument("--no_bf16", action="store_true", default=False, help="Disable CUDA bfloat16 autocast inside MLPs.")
 parser.add_argument(
     "--legs_absolute",
     action="store_true",
-    default=False,
-    help="Optional ablation: leg joints use absolute targets while upper body stays residual on reference.",
+    default=True,
+    help="Leg joints use absolute targets while upper body stays residual on reference (default: enabled).",
 )
 parser.add_argument(
     "--legs_residual",
     action="store_true",
     default=False,
-    help="Explicitly force leg joints to stay residual on reference (default behavior).",
+    help="Force leg joints to use reference residual bias instead of absolute targets.",
 )
 parser.add_argument(
     "--compile_bptt",
@@ -241,7 +243,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
                 env_cfg.rewards.motion_obj_pos_place = RewTerm(
                     func=mdp.motion_obj_pos_place_exp,
                     weight=float(args_cli.place_weight),
-                    params={"command_name": "motion", "std": 0.08, "window": 25},
+                    params={"command_name": "motion", "std": 0.08, "window": 60},
                 )
         if args_cli.feet_height_weight is not None:
             if args_cli.feet_height_weight == 0.0:
@@ -311,6 +313,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
         policy_lr=args_cli.policy_lr,
         critic_lr=args_cli.critic_lr,
         lr_final_frac=args_cli.lr_final_frac,
+        ema_decay=args_cli.ema_decay,
+        use_bf16=not args_cli.no_bf16,
         use_ref_residual=not args_cli.no_ref_residual,
         legs_absolute=bool(args_cli.legs_absolute and not args_cli.legs_residual),
         bc_init_coef=args_cli.bc_coef,

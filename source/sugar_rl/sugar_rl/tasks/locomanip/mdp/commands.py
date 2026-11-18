@@ -1298,8 +1298,8 @@ class MotionCommand(CommandTerm):
             self._call_generator(env_ids)
             
         # Sparsely update the init pool with random samples, using a validation mechanism
-        update_interval = 24 * 100  # 2400 控制步
-        warmup_steps = self.cfg.pool_warmup_steps    # 12000 控制步 warmup
+        update_interval = 24 * 25  # 600 控制步（每 25 轮验证更新一次可行中间状态池）
+        warmup_steps = self.cfg.pool_warmup_steps
 
         self.count += 1
 

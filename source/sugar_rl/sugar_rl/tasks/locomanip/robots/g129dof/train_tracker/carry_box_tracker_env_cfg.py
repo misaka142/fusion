@@ -111,12 +111,12 @@ class RewardsCfg(BaseRewardsCfg):
     )
     motion_obj_pos_place = RewTerm(
         func=mdp.motion_obj_pos_place_exp,
-        weight=1.0,
-        params={"command_name": "motion", "std": 0.08, "window": 25},
+        weight=1.5,
+        params={"command_name": "motion", "std": 0.08, "window": 60},
     )
     motion_feet_height = RewTerm(
         func=mdp.motion_feet_height_error_exp,
-        weight=0.25,
+        weight=0.50,
         params={
             "command_name": "motion",
             "std": 0.06,

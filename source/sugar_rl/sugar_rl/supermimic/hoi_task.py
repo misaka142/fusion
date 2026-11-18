@@ -105,6 +105,15 @@ class TaskRewardProfile:
     feet_air_time_weight: float = 5.0
     feet_air_time_threshold: float = 0.5
     avoid_feet_obj_weight: float = 0.0
+    # Global anchor & object position tracking kernels (mirrored from live env RewardsCfg)
+    anc_pos_weight: float = 0.25
+    anc_pos_std: float = 0.30
+    obj_pos_weight: float = 0.50
+    obj_pos_std: float = 0.30
+    # Joint velocity tracking & joint acceleration regularization (suppresses 50Hz chattering)
+    joint_vel_weight: float = 0.0
+    joint_vel_std: float = 3.0
+    joint_acc_weight: float = -2.5e-7
     # Fine object placement term (`motion_obj_pos_place` in env cfg); synced from the live env, 0 = disabled
     place_weight: float = 0.0
     place_std: float = 0.08
@@ -545,19 +554,23 @@ class SugarHOITask:
         joint_weights: Tensor,
         err_std: Tensor,
         obj_loss_weight: float = 1.5,
+        pose_loss_weight: float = 1.0,
         step_mask: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Squared state error normalized per dimension by the std of the true one-step delta (as in allmimic).
 
         `joint_weights` (29,) weight the q / qd dims; `err_std` (82,) is the per-dim delta std;
+        `pose_loss_weight` boosts integrated root/object pose channels (Bryson's rule, HybridRobotics/supermimic);
         `step_mask` (B,) masks out any post-reset/push tail slots without host syncs.
         """
         e = SugarHOITask.state_error(s_pred, s_true) / err_std.view(1, -1)
         jw = joint_weights.view(1, 29)
-        ones6 = jw.new_ones(1, 6)
-        w_rob = torch.cat([ones6, jw, ones6, jw], dim=-1)  # (1, 70)
+        pose6 = jw.new_full((1, 6), float(pose_loss_weight))
+        vel6 = jw.new_ones((1, 6))
+        w_rob = torch.cat([pose6, jw, vel6, jw], dim=-1)  # (1, 70)
+        w_obj = torch.cat([pose6, vel6], dim=-1)          # (1, 12)
         per_rob = (w_rob * e[:, :ROBOT_DELTA_DIM] ** 2).mean(dim=-1)
-        per_obj = (e[:, ROBOT_DELTA_DIM:] ** 2).mean(dim=-1)
+        per_obj = (w_obj * e[:, ROBOT_DELTA_DIM:] ** 2).mean(dim=-1)
         pos_err = (s_pred[:, 0:3] - s_true[:, 0:3]).detach().norm(dim=-1)
         obj_err = (s_pred[:, 71:74] - s_true[:, 71:74]).detach().norm(dim=-1)
 
@@ -586,10 +599,10 @@ class SugarHOITask:
 
     def max_step_reward(self) -> float:
         """Upper bound of the positive per-step reward (scaled by `step_dt`), used for the value clip."""
-        tracking = 0.125 + 0.25 * 6     # joint pos, anchor pos/ori, body pos/ori/lin vel/ang vel
-        obj = 0.5 * 4                   # obj pos/ori/lin vel/ang vel
-        interaction = 0.25 * 2          # obj2body pos/ori
         prof = self.profile
+        tracking = 0.125 + prof.anc_pos_weight + 0.25 * 5 + max(0.0, prof.joint_vel_weight)
+        obj = prof.obj_pos_weight + 0.5 * 3
+        interaction = 0.25 * 2          # obj2body pos/ori
         total = (
             tracking
             + obj
@@ -881,12 +894,19 @@ class SugarHOITask:
         ref_anc_quat = ref_target.body_quat_w[:, self.anchor_idx]
         body_pos_rel_w, body_quat_rel_w = self._compute_relative_ref_bodies(fk_next, ref_target)
 
-        # ---- A. Tracking rewards (exact weights & stds from BaseRewardsCfg) ----
+        # ---- A. Tracking rewards (exact weights & stds mirrored from live RewardsCfg) ----
+        prof = self.profile
         err_jpos = ((ref_target.joint_pos - q_next) ** 2).sum(dim=-1)
         r_joint_pos = 0.125 * torch.exp(-err_jpos / (0.6**2))
 
+        if prof.joint_vel_weight != 0.0:
+            err_jvel = ((ref_target.joint_vel - qd_next) ** 2).sum(dim=-1)
+            r_joint_vel = prof.joint_vel_weight * torch.exp(-err_jvel / (prof.joint_vel_std**2))
+        else:
+            r_joint_vel = torch.zeros_like(r_joint_pos)
+
         err_anc_p = ((ref_anc_pos - fk_next.anchor_pos_w) ** 2).sum(dim=-1)
-        r_anc_pos = 0.25 * torch.exp(-err_anc_p / (0.3**2))
+        r_anc_pos = prof.anc_pos_weight * torch.exp(-err_anc_p / (prof.anc_pos_std**2))
 
         err_anc_q = quat_error_magnitude(ref_anc_quat, fk_next.anchor_quat_w) ** 2
         r_anc_ori = 0.25 * torch.exp(-err_anc_q / (0.4**2))
@@ -905,7 +925,7 @@ class SugarHOITask:
 
         # ---- B. Object global tracking rewards ----
         err_op = ((obj_pos_w - ref_target.obj_pos_w) ** 2).sum(dim=-1)
-        r_obj_pos = 0.5 * torch.exp(-err_op / (0.3**2))
+        r_obj_pos = prof.obj_pos_weight * torch.exp(-err_op / (prof.obj_pos_std**2))
 
         err_oq = quat_error_magnitude(obj_quat_w, ref_target.obj_quat_w) ** 2
         r_obj_ori = 0.5 * torch.exp(-err_oq / (0.4**2))
@@ -1025,7 +1045,7 @@ class SugarHOITask:
         r_jlimit = -10.0 * (out_low + out_high).sum(dim=-1)
 
         qdd_approx = (qd_next - qd_prev) / self.step_dt
-        r_jacc = -2.5e-7 * (qdd_approx**2).sum(dim=-1)
+        r_jacc = prof.joint_acc_weight * (qdd_approx**2).sum(dim=-1)
 
         q_sp = self.raw_action_to_setpoint(raw_action, xi=xi)
         tau_pd = (
@@ -1036,6 +1056,7 @@ class SugarHOITask:
 
         unscaled_reward = (
             r_joint_pos
+            + r_joint_vel
             + r_anc_pos
             + r_anc_ori
             + r_body_pos
@@ -1093,7 +1114,7 @@ class SugarHOITask:
         p_term = (1.0 - p_survive).clamp(0.0, 1.0)
 
         info = {
-            "rew/tracking_human": (r_joint_pos + r_anc_pos + r_anc_ori + r_body_pos + r_body_ori).detach(),
+            "rew/tracking_human": (r_joint_pos + r_joint_vel + r_anc_pos + r_anc_ori + r_body_pos + r_body_ori).detach(),
             "rew/tracking_obj": (r_obj_pos + r_obj_ori + r_obj_vel + r_obj_ang).detach(),
             "rew/interaction": (r_o2b_pos + r_o2b_ori + r_hoi_contact).detach(),
             "rew/place": r_place.detach(),

@@ -499,6 +499,52 @@ def test_5_autonomous_generator_closed_loop_and_cli_video(tmp_dir: Path) -> None
     print(f"  -> Passed autonomous closed-loop & MP4 video export ({mp4_out.stat().st_size} bytes)!")
 
 
+def test_6_legs_absolute_ema_v4_checkpoint_sim2sim(tmp_dir: Path) -> None:
+    print("[Test 6] Verifying v4 EMA + legs_absolute=True Tracker checkpoint seamless Sim-to-Sim standing...")
+    from sugar_rl.supermimic.trainer import make_residual_mask
+
+    # Reuse the closed-loop ankle CoM stabilizer from `_save_dummy_supermimic_tracker`, converted to v4 + legs_absolute=True
+    base_pt = _save_dummy_supermimic_tracker(
+        tmp_dir / "tracker_base_bal.pt", G1_ISAACLAB_BFS_JOINT_NAMES, closed_loop_balance=True
+    )
+    payload = torch.load(str(base_pt), weights_only=False)
+    res_mask = make_residual_mask(list(G1_ISAACLAB_BFS_JOINT_NAMES), legs_absolute=True)
+    payload["format"] = "supermimic_sugar_v4"
+    payload["policy_state_dict"]["residual_mask"] = res_mask
+    payload["raw_policy_state_dict"] = dict(payload["policy_state_dict"])
+    v4_pt = tmp_dir / "tracker_v4_legs_abs.pt"
+    torch.save(payload, str(v4_pt))
+
+    # Deliberately perturb leg reference joints in clip: with `legs_absolute=True`, legs ignore noisy leg `q_ref`
+    # and keep closed-loop CoM balance, while upper-body arms follow `q_ref`!
+    ds_dir = _create_dummy_motion_dataset(tmp_dir / "motion_v4", T=100)
+    clip_npz_p = ds_dir / "data_000" / "robot_50hz.npz"
+    with np.load(clip_npz_p) as npz_d:
+        raw_d = {k: npz_d[k].copy() for k in npz_d.files}
+    leg_indices = [i for i, n in enumerate(G1_ISAACLAB_BFS_JOINT_NAMES) if any(k in n for k in ("hip", "knee", "ankle"))]
+    upper_indices = [i for i in range(29) if i not in leg_indices]
+    raw_d["joint_pos"][1:, leg_indices] += 0.45    # huge leg ref offset that would topple `legs_absolute=False`
+    raw_d["joint_pos"][1:, upper_indices] += 0.15  # arm ref motion that upper body should still track via residual!
+    np.savez(clip_npz_p, **raw_d)
+
+    bundle = load_tracker_checkpoint(v4_pt, device="cpu")
+    assert bundle.policy.residual_mask.sum().item() == 17.0
+
+    runner = MuJoCoSim2SimRunner(
+        task_name="CarryBox",
+        tracker_ckpt=v4_pt,
+        mode="replay",
+        motion_folder=ds_dir,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    runner.reset()
+    for _ in range(80):  # 1.6s simulated closed-loop physics
+        info = runner.step()
+        assert np.isfinite(info["pelvis_z"])
+    assert 0.70 < info["pelvis_z"] < 0.80, f"v4 legs_absolute policy fell under leg ref perturbation: z={info['pelvis_z']}"
+    print(f"  -> Passed v4 EMA + legs_absolute Sim-to-Sim standing (pelvis_z={info['pelvis_z']:.3f}m)!")
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp_dir = Path(td)
@@ -507,7 +553,8 @@ def main() -> None:
         test_3_observation_isomorphism_with_sugar_hoi_task(tmp_dir)
         test_4_pd_standing_stability_and_replay(tmp_dir)
         test_5_autonomous_generator_closed_loop_and_cli_video(tmp_dir)
-    print("\nALL 5 MUJOCO SIM-TO-SIM END-TO-END TESTS PASSED SUCCESSFULLY!")
+        test_6_legs_absolute_ema_v4_checkpoint_sim2sim(tmp_dir)
+    print("\nALL 6 MUJOCO SIM-TO-SIM END-TO-END TESTS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":
