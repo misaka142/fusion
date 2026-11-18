@@ -281,6 +281,23 @@ class SugarEnvBridge:
         self._setup_contact_indices()
         self._sync_live_reward_params()
 
+        try:
+            sensors = self.env.scene.sensors
+            obj_nb = int(getattr(self.obj, "num_bodies", 1))
+            obj_m0 = float(self.obj.data.default_mass[0].sum().item())
+            lh_nb = len(sensors["left_hand_forces"].body_names)
+            rh_nb = len(sensors["right_hand_forces"].body_names)
+            lh_shp = tuple(sensors["left_hand_forces"].data.force_matrix_w_history.shape)
+            print(
+                f"[SuperMimic Bridge] Scene & Contact verified "
+                f"(obj_bodies={obj_nb}, obj_default_mass={obj_m0:.3f}kg, "
+                f"lh_bodies={lh_nb}, rh_bodies={rh_nb}, lh_force_hist_shape={lh_shp}, "
+                f"undesired_bodies={int(self._undesired_body_ids.numel())}, "
+                f"undesired_w={self.profile.undesired_weight}, undesired_thresh={self._undesired_thresh}N)"
+            )
+        except Exception:
+            pass
+
         # Cache static startup domain randomization vector `xi`
         self.env_xi: Tensor = self.extract_xi()
 
