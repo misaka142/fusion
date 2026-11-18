@@ -68,26 +68,26 @@ class SuperMimicTrainCfg:
     # Policy BPTT settings
     policy_hidden_dims: tuple[int, ...] = (512, 256, 128)
     use_ref_residual: bool = True
-    legs_absolute: bool = True                       # Legs absolute for dynamic CoM balance, upper body residual (allmimic #20)
+    legs_absolute: bool = False                      # Full 29-joint ref_bias + residual (True decouples leg targets)
     init_noise_std: float = 0.20                     # Only initializes the (unused) `log_std` parameter
     imagination_horizon: int = 32                    # H=32 step differentiable imagination rollout
-    policy_updates_per_iter: int = 6
-    policy_batch_size: int = 2048
+    policy_updates_per_iter: int = 4
+    policy_batch_size: int = 1024
     policy_lr: float = 3e-4
     adam_beta2: float = 0.95                         # Faster Adam EMA recovery after contact gradient spikes (official)
-    bptt_grad_decay: float = 1.0                     # Full unattenuated 32-step horizon gradients (official)
+    bptt_grad_decay: float = 0.98                    # Mild 32-step Jacobian damping across contact transitions
     imag_jerk_weight: float = 0.02                   # Second-order action smoothness `||a_t - 2a_{t-1} + a_{t-2}||^2`
     ema_decay: float = 0.995                         # Polyak EMA actor weights for smooth gait & checkpoint stability
     grad_value_clip: float | None = 0.1              # Elementwise gradient clip after norm clip (official)
     pessimistic_critic: bool = True                  # Min over critic heads in imagination bootstrap
     value_clip_range: tuple[float, float] | None = None  # None -> +-max_step_reward / (1 - gamma)
 
-    # Critic TD(lambda) settings (jointly calibrated on real transitions + deterministic imagined rollouts)
+    # Critic TD(lambda) settings (calibrated on real simulator transitions by default)
     critic_hidden_dims: tuple[int, ...] = (512, 256, 128)
     critic_heads: int = 2
     critic_epochs: int = 4
     critic_minibatches: int = 4
-    imag_critic_updates: int = 2                     # Extra GAE updates per policy step on 32-step imagined rollouts
+    imag_critic_updates: int = 0                     # Extra GAE updates per policy step on 32-step imagined rollouts (0 = real-only)
     critic_lr: float = 5e-4
     gamma: float = 0.99
     lam: float = 0.95
@@ -435,6 +435,13 @@ class SuperMimicTrainer:
         proxy_done = torch.zeros((), device=self.device)
         proxy_succ = torch.zeros((), device=self.device)
         proxy_prog = torch.zeros((), device=self.device)
+        dt = float(self.task.step_dt)
+        jacc_w = float(self.task.profile.joint_acc_weight)
+        robot_data = getattr(getattr(self.bridge, "robot", None), "data", None)
+        has_sim_jacc = isinstance(getattr(robot_data, "joint_acc", None), Tensor)
+        jacc_sum = torch.zeros((), device=self.device)
+        jacc_200hz_sum = torch.zeros((), device=self.device)
+        jacc_cnt = torch.zeros((), device=self.device)
         log_sums: dict[str, Tensor] = {}
         log_counts: dict[str, int] = {}
 
@@ -466,6 +473,15 @@ class SuperMimicTrainer:
             _, sim_rew, dones, timeouts, pushed, extras = self.bridge.step(action)
             s_post = self.bridge.get_joint_state()
             contacts = self.bridge.get_ground_truth_contacts()
+
+            # Paired 50Hz vs 200Hz joint_acc step reward on identical non-reset transitions (`~dones`)
+            not_done_f = (~dones).float()
+            qdd_50hz = (s_post[:, 42:71] - s_pre[:, 42:71]) / dt
+            jacc_sum = jacc_sum + (jacc_w * (qdd_50hz * qdd_50hz).sum(dim=-1) * dt * not_done_f).sum()
+            if has_sim_jacc:
+                qdd_200hz = robot_data.joint_acc
+                jacc_200hz_sum = jacc_200hz_sum + (jacc_w * (qdd_200hz * qdd_200hz).sum(dim=-1) * dt * not_done_f).sum()
+            jacc_cnt = jacc_cnt + not_done_f.sum()
 
             # Bootstrap timeout terminations using CURRENT step value `v_pred` ( matching RSL-RL;
             # `next_obs_dict` for reset envs already belongs to the newly reset episode!)
@@ -530,6 +546,11 @@ class SuperMimicTrainer:
             "collect/sim_step_reward": float(rewards_buf.mean().item()),
             "collect/reset_rate": float(dones_buf.float().mean().item()),
         }
+        n_jacc = float(jacc_cnt.item())
+        if n_jacc > 0:
+            stats["diag/jacc_50hz_per_step"] = float(jacc_sum.item()) / n_jacc
+            if has_sim_jacc:
+                stats["diag/jacc_200hz_per_step"] = float(jacc_200hz_sum.item()) / n_jacc
         n_done = float(proxy_done.item())
         if n_done > 0:
             stats["rollout_proxy/det_t0_success_rate"] = float(proxy_succ.item()) / n_done

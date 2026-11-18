@@ -115,9 +115,9 @@ parser.add_argument(
 parser.add_argument("--horizon", type=int, default=32, help="Differentiable imagination rollout horizon H.")
 parser.add_argument("--wm_seq_len", type=int, default=8, help="Autoregressive world-model training sequence length k.")
 parser.add_argument("--wm_updates", type=int, default=12, help="World model gradient updates per iteration.")
-parser.add_argument("--policy_updates", type=int, default=6, help="Policy BPTT updates per iteration.")
+parser.add_argument("--policy_updates", type=int, default=4, help="Policy BPTT updates per iteration.")
 parser.add_argument("--wm_batch_size", type=int, default=2048, help="Minibatch size for world-model updates.")
-parser.add_argument("--policy_batch_size", type=int, default=2048, help="Batch size of 32-step imagination rollouts.")
+parser.add_argument("--policy_batch_size", type=int, default=1024, help="Batch size of 32-step imagination rollouts.")
 parser.add_argument("--replay_capacity", type=int, default=512, help="Ring replay buffer steps per environment.")
 parser.add_argument("--wm_hidden", type=str, default="1024,1024,1024", help="World model hidden widths.")
 parser.add_argument("--policy_hidden", type=str, default="512,256,128", help="Policy hidden widths.")
@@ -128,8 +128,8 @@ parser.add_argument("--no_bf16", action="store_true", default=False, help="Disab
 parser.add_argument(
     "--legs_absolute",
     action="store_true",
-    default=True,
-    help="Leg joints use absolute targets while upper body stays residual on reference (default: enabled).",
+    default=False,
+    help="Leg joints use absolute targets while upper body stays residual on reference (default: disabled).",
 )
 parser.add_argument(
     "--legs_residual",

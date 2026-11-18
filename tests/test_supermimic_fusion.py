@@ -1297,9 +1297,11 @@ def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
     assert fk.max_depth == 11, f"Expected G1 kinematic tree max_depth=11, got {fk.max_depth}"
     default_cfg = SuperMimicTrainCfg()
     assert default_cfg.wm_seq_len == 8
-    assert default_cfg.wm_updates_per_iter == 12 and default_cfg.policy_updates_per_iter == 6
+    assert default_cfg.wm_updates_per_iter == 12 and default_cfg.policy_updates_per_iter == 4
+    assert default_cfg.wm_batch_size == 2048 and default_cfg.policy_batch_size == 1024
     assert default_cfg.wm_hidden_dims == (1024, 1024, 1024) and default_cfg.policy_hidden_dims == (512, 256, 128)
-    assert default_cfg.legs_absolute is True and default_cfg.pessimistic_critic is True
+    assert default_cfg.legs_absolute is False and default_cfg.pessimistic_critic is True
+    assert default_cfg.imag_critic_updates == 0 and default_cfg.bptt_grad_decay == 0.98
     assert default_cfg.ema_decay == 0.995 and default_cfg.adam_beta2 == 0.95
 
     # --- 2. Feet z-height reward parity + air-time gradient omission in imagination ---
@@ -1648,6 +1650,7 @@ def test_13_ema_actor_bryson_pose_jerk_and_imag_critic() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
         bridge = _SyntheticSugarBridge(stage="refiner", num_envs=16, device=DEVICE)
+        bridge.robot = type("_R", (), {"data": type("_D", (), {"joint_acc": torch.full((16, 29), 10.0, device=DEVICE)})()})()
         cfg = SuperMimicTrainCfg(
             steps_per_env=8, replay_capacity=32, wm_seq_len=4, wm_updates_per_iter=2, wm_batch_size=16,
             wm_hidden_dims=(64, 64), policy_hidden_dims=(64, 64), wm_warmup_iters=0, imagination_horizon=6,
@@ -1655,7 +1658,10 @@ def test_13_ema_actor_bryson_pose_jerk_and_imag_critic() -> None:
             imag_critic_updates=2, use_bf16=True, enable_tensorboard=False,
         )
         tr = SuperMimicTrainer(bridge, log_dir=tmp / "ema_run", cfg=cfg)
-        tr.collect_rollout()
+        _, _, c_stats = tr.collect_rollout()
+        assert "diag/jacc_50hz_per_step" in c_stats and c_stats["diag/jacc_50hz_per_step"] <= 0.0
+        exp_200 = bridge.task.profile.joint_acc_weight * (29.0 * 100.0) * bridge.task.step_dt
+        assert abs(c_stats["diag/jacc_200hz_per_step"] - exp_200) < 1e-10
         tr.update_world_model()
         p_metrics = tr.update_policy(iteration=1)
         assert "critic/imag_loss" in p_metrics and math.isfinite(p_metrics["critic/imag_loss"])
@@ -1669,7 +1675,7 @@ def test_13_ema_actor_bryson_pose_jerk_and_imag_critic() -> None:
         tr.save_checkpoint(ckpt_p, iteration=1)
         deployed = load_supermimic_policy(ckpt_p, device=DEVICE)
         assert (deployed.backbone[-1].weight - ema_w).abs().max().item() < 1e-6, "Deployed policy did not load EMA!"
-        assert deployed.residual_mask.sum().item() == 17.0, "Default legs_absolute=True mask not preserved in ckpt!"
+        assert deployed.residual_mask.sum().item() == 29.0, "Default legs_absolute=False mask not preserved in ckpt!"
 
         tr_resumed = SuperMimicTrainer(bridge, log_dir=tmp / "ema_resume", cfg=cfg)
         tr_resumed.load_checkpoint(ckpt_p)

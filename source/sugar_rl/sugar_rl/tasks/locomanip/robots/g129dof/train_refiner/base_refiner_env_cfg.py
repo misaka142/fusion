@@ -298,7 +298,7 @@ class BaseRewardsCfg:
     """Reward terms for the MDP."""
 
     # regularization
-    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-6)
+    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
     joint_torque = RewTerm(func=mdp.joint_torques_l2, weight=-1e-5)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
     joint_limit = RewTerm(
