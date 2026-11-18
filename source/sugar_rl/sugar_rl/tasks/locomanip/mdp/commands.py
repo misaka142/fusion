@@ -323,11 +323,9 @@ class MotionCommand(CommandTerm):
         self.obj_target_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
         self.obj_target_quat_w[:, 0] = 1.0  # Initialize as the identity quaternion
         
-        # Visualization markers for the target object pose.
-        target_marker_cfg = FRAME_MARKER_CFG.copy()
-        target_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)  # Slightly smaller for distinction
-        target_marker_cfg.prim_path = "/Visuals/Command/target"
-        self.target_visualizer = VisualizationMarkers(target_marker_cfg)
+        # Visualization markers for the target object pose (created lazily inside `_set_debug_vis_impl` only when debug_vis=True).
+        if not hasattr(self, "target_visualizer"):
+            self.target_visualizer = None
         
 
         # =====================================================================
@@ -1278,9 +1276,9 @@ class MotionCommand(CommandTerm):
             self._fill_generator_obs_buffer(env_ids_tensor)
 
     def _update_target_visualization(self):
-        """Update visualization markers for random targets."""
-        
-        # Update the frame marker to display the target pose
+        """Update visualization markers for random targets (no-op in headless/non-debug mode)."""
+        if getattr(self, "target_visualizer", None) is None or not self.cfg.debug_vis:
+            return
         self.target_visualizer.visualize(
             translations=self.obj_target_pos_w,
             orientations=self.obj_target_quat_w
@@ -1393,6 +1391,13 @@ class MotionCommand(CommandTerm):
     def _set_debug_vis_impl(self, debug_vis: bool):
 
         if debug_vis:
+            if getattr(self, "target_visualizer", None) is None:
+                target_marker_cfg = FRAME_MARKER_CFG.copy()
+                target_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
+                target_marker_cfg.prim_path = "/Visuals/Command/target"
+                self.target_visualizer = VisualizationMarkers(target_marker_cfg)
+            self.target_visualizer.set_visibility(True)
+
             if not hasattr(self, "current_body_visualizers"):
                 self.current_obj_visualizer = VisualizationMarkers(
                     self.cfg.object_visualizer_cfg.replace(prim_path="/Visuals/Command/current/object")
@@ -1416,12 +1421,16 @@ class MotionCommand(CommandTerm):
                         )
                     )
                 
+            self.current_obj_visualizer.set_visibility(True)
+            self.goal_obj_visualizer.set_visibility(True)
             for i in range(len(self.cfg.body_names)):
                 self.current_body_visualizers[i].set_visibility(True)
                 self.goal_body_visualizers[i].set_visibility(True)
 
 
         else:
+            if getattr(self, "target_visualizer", None) is not None:
+                self.target_visualizer.set_visibility(False)
             if hasattr(self, "current_body_visualizers"):
 
                 self.current_obj_visualizer.set_visibility(False)

@@ -75,7 +75,7 @@ class BaseRobotSceneCfg(InteractiveSceneCfg):
             history_length=3, 
             track_air_time=True, 
             force_threshold=0.1,
-            debug_vis=True,
+            debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"], 
         )
     right_foot_forces = ContactSensorCfg(
@@ -83,7 +83,7 @@ class BaseRobotSceneCfg(InteractiveSceneCfg):
             history_length=3, 
             track_air_time=True, 
             force_threshold=0.1, 
-            debug_vis=True,
+            debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"], 
         )
     
@@ -92,7 +92,7 @@ class BaseRobotSceneCfg(InteractiveSceneCfg):
             history_length=3, 
             track_air_time=True, 
             force_threshold=0.1,
-            debug_vis=True,
+            debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"], 
         )
     right_hand_forces = ContactSensorCfg(
@@ -100,7 +100,7 @@ class BaseRobotSceneCfg(InteractiveSceneCfg):
             history_length=3, 
             track_air_time=True, 
             force_threshold=0.1,
-            debug_vis=True,
+            debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"], 
         )
 
@@ -109,7 +109,7 @@ class BaseRobotSceneCfg(InteractiveSceneCfg):
             history_length=3, 
             track_air_time=True, 
             force_threshold=0.1,
-            debug_vis=True,
+            debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"], 
         )
     right_hip_forces = ContactSensorCfg(
@@ -117,7 +117,7 @@ class BaseRobotSceneCfg(InteractiveSceneCfg):
             history_length=3, 
             track_air_time=True, 
             force_threshold=0.1,
-            debug_vis=True,
+            debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"], 
         )
     pelvis_forces = ContactSensorCfg(
@@ -125,7 +125,7 @@ class BaseRobotSceneCfg(InteractiveSceneCfg):
             history_length=3, 
             track_air_time=True, 
             force_threshold=0.1,
-            debug_vis=True,
+            debug_vis=False,
             filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"], 
         )
 
@@ -152,7 +152,7 @@ class BaseCommandsCfg:
         
         anchor_body_name="torso_link",
         resampling_time_range=(1.0e9, 1.0e9),
-        debug_vis=True,
+        debug_vis=False,
         pose_range={ 
             "x": (-0.0, 0.0),
             "y": (-0.0, 0.0),
