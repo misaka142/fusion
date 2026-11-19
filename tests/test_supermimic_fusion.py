@@ -1215,7 +1215,7 @@ def test_12_omniretarget_clean_usda_and_bridge_sync() -> None:
             self._term_names = names
             self._term_cfgs = cfgs
 
-    # 1. Verify CarryBox undesired_contacts regex keeps head/torso/elbows/pelvis/legs (25 bodies) or live 20 bodies,
+    # 1. Verify CarryBox undesired_contacts regex keeps head/torso/elbows/pelvis/legs (25 bodies),
     #    matching both RewardManager regex and SugarEnvBridge fallback!
     cb_pats = [
         r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$)(?!left_wrist_.*_link$)(?!right_wrist_.*_link$).+$"
@@ -1223,6 +1223,7 @@ def test_12_omniretarget_clean_usda_and_bridge_sync() -> None:
     rm_cb = _RewMgr(["undesired_contacts"], [_Term(_SCfg(cb_pats))])
     cb_ids = _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=rm_cb)
     assert cb_ids == _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=None)
+    assert len(cb_ids) == 25, f"Expected 25 penalized bodies (35 - 10 exempt), got {len(cb_ids)}"
     cb_names = {cf_35[i] for i in cb_ids}
     # Verify head, torso, elbows, pelvis, knees ARE penalized, while palms, wrists, and ankle_roll feet are exempt
     for must_penalize in ("head_link", "torso_link", "waist_yaw_link", "left_elbow_link", "right_elbow_link", "pelvis", "left_knee_link"):
@@ -1231,7 +1232,7 @@ def test_12_omniretarget_clean_usda_and_bridge_sync() -> None:
         assert must_exempt not in cb_names, f"{must_exempt} should be exempt from CarryBox undesired_contacts!"
 
     p_cb = resolve_task_profile("Sugar-G129dof-CarryBox-Refiner")
-    assert p_cb.undesired_weight == -1.0 and p_cb.undesired_threshold == 0.1 and p_cb.num_undesired_bodies == 20
+    assert p_cb.undesired_weight == -1.0 and p_cb.undesired_threshold == 0.1 and p_cb.num_undesired_bodies == 25
 
     # Verify carry_box_*_env_cfg no longer uses 5-link forearm/wrist contact sensor override
     for rel_cfg in (

@@ -113,7 +113,7 @@ TASK_PROFILES: dict[str, TaskRewardProfile] = {
         hoi_mode="hands",
         undesired_weight=-1.0,
         undesired_threshold=0.1,
-        num_undesired_bodies=20,
+        num_undesired_bodies=25,
         feet_slide_weight=-0.1,
     ),
     "PickBottle": TaskRewardProfile(
