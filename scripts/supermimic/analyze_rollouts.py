@@ -31,7 +31,8 @@ import numpy as np
 
 DT = 0.02
 LEFT_ANKLE, RIGHT_ANKLE = 3, 6  # indices in MotionCommandCfg.body_names (rollout body order)
-ANCHOR_IDX = 7                  # `torso_link` index in MotionCommandCfg.body_names
+ANCHOR_IDX = 7                  # `torso_link` index in MotionCommandCfg.body_names (14-body rollout order)
+REF_ANCHOR_IDX = 10             # `torso_link` index in SUGAR_RAW_35_BODY_NAMES (35-body reference `robot_50hz.npz`)
 
 
 def _quat_inv(q: np.ndarray) -> np.ndarray:
@@ -120,8 +121,8 @@ class _RefData:
                 bpos = f["body_pos_w"]
                 bquat = f["body_quat_w"]
                 root = bpos[:, 0, :]            # pelvis = articulation root
-                anc_p = bpos[:, ANCHOR_IDX, :]  # torso_link = anchor
-                anc_q = bquat[:, ANCHOR_IDX, :]
+                anc_p = bpos[:, REF_ANCHOR_IDX, :]  # torso_link = anchor
+                anc_q = bquat[:, REF_ANCHOR_IDX, :]
             with open(os.path.join(folder, "obj_motion_global_50hz.pkl"), "rb") as f:
                 obj = np.asarray(pickle.load(f)["obj_trans"])
             t = min(len(root), len(obj))
@@ -200,7 +201,9 @@ def main() -> None:
     sub = os.path.join(root, "trajectory_complete")
     files = sorted(glob.glob(os.path.join(sub if os.path.isdir(sub) else root, "*.npz")))
     if not files:
-        raise SystemExit(f"No .npz rollouts found under {root}")
+        # Exit 0 so the caller can report the zero-trajectory case with its own hint
+        print(f"[analyze_rollouts] WARNING: no complete .npz rollouts under {root}, skip metrics.")
+        return
 
     joint_names = None
     if args.ckpt:

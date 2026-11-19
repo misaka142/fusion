@@ -168,6 +168,9 @@ def main():
     parser.add_argument("--data_dir", type=str, required=True)
     args = parser.parse_args()
     npz_file_paths = collect_npz_files(f'{args.data_dir}/raw_npz/trajectory_complete')
+    # Fail before creating `il_dataset/.zgroup`, otherwise an empty group is mistaken as "done" on resume
+    if not npz_file_paths:
+        raise SystemExit(f"No complete tracker rollouts under {args.data_dir}/raw_npz/trajectory_complete")
 
     zroot = zarr.open(f'{args.data_dir}/il_dataset', mode='w', zarr_version=2)
     data_group = zroot.create_group('data')

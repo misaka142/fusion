@@ -1779,7 +1779,7 @@ class MotionCommandCfg(CommandTermCfg):
     
     use_generator: bool = MISSING  
     generator_checkpoint_path: str = MISSING  
-    generator_call_interval: int = None,
+    generator_call_interval: int = None
 
     pool_warmup_steps: int = MISSING
     start_init_env_ratio: float = MISSING

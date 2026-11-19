@@ -17,6 +17,7 @@ import torch.nn as nn
 # Add `source/sugar_rl` to sys.path so `sugar_rl.supermimic` imports cleanly without editable install
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "source" / "sugar_rl"))
+sys.path.insert(0, str(REPO_ROOT))  # Test 14 imports `scripts.sim2sim.*` from the repo root
 
 from sugar_rl.supermimic import (  # noqa: E402
     CONTACT_DIM,
