@@ -37,24 +37,6 @@ def motion_relative_body_position_error_exp(
     return torch.exp(-error.mean(-1) / std**2)
 
 
-def motion_feet_height_error_exp(
-    env: ManagerBasedRLEnv,
-    command_name: str,
-    std: float,
-    body_names: list[str] | None = None,
-) -> torch.Tensor:
-    """Track reference vertical (z) height of ankle links (mirrored by `SugarHOITask` `feet_height_weight`)."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    if body_names is None:
-        body_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
-    body_indexes = _get_body_indexes(command, body_names)
-    error = torch.mean(
-        torch.square(command.body_pos_relative_w[:, body_indexes, 2] - command.robot_body_pos_w[:, body_indexes, 2]),
-        dim=-1,
-    )
-    return torch.exp(-error / std**2)
-
-
 def motion_relative_body_orientation_error_exp(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
 ) -> torch.Tensor:
@@ -94,23 +76,6 @@ def motion_global_obj_position_error_exp(env: ManagerBasedRLEnv, command_name: s
     error = torch.sum(torch.square(command.obj_pos_w - command.obj_ref_pos_w), dim=-1)
     return torch.exp(-error / std**2)
 
-
-def motion_obj_pos_place_exp(env: ManagerBasedRLEnv, command_name: str, std: float, window: int) -> torch.Tensor:
-    """Narrow object position kernel, active only within `window` frames of a reference release
-    (contact label 1 -> 0) and on the no-contact frames after it, so the box is put down where the reference puts it.
-    Mirrored exactly by `SugarHOITask` (`release_mask`) in the SuperMimic imagination reward."""
-    from sugar_rl.supermimic.hoi_task import compute_release_mask
-
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    cache = getattr(command, "_place_mask_cache", None)
-    if cache is None or cache[0] != window:
-        mask = compute_release_mask(command.motion.contact_label, command.motion.time_step_total_permotion, window)
-        cache = (window, mask)
-        command._place_mask_cache = cache
-    t = torch.minimum(command.time_steps, command.motion.time_step_total_permotion[command.motion_id] - 1)
-    active = cache[1][command.motion_id, t]
-    error = torch.sum(torch.square(command.obj_pos_w - command.obj_ref_pos_w), dim=-1)
-    return torch.exp(-error / std**2) * active
 
 def motion_global_obj_orientation_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)

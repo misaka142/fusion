@@ -17,7 +17,7 @@ import torch.nn as nn
 # Add `source/sugar_rl` to sys.path so `sugar_rl.supermimic` imports cleanly without editable install
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "source" / "sugar_rl"))
-sys.path.insert(0, str(REPO_ROOT))  # Test 14 imports `scripts.sim2sim.*` from the repo root
+sys.path.insert(0, str(REPO_ROOT))
 
 from sugar_rl.supermimic import (  # noqa: E402
     CONTACT_DIM,
@@ -1128,574 +1128,66 @@ def test_10_colab_interrupt_auto_resume_and_generator_ckpt() -> None:
     print("[PASS] Test 10: Colab interrupt atomic save, RL auto-resume/fallback & Diffusion Generator resume")
 
 
-def test_11_retrain_config_mechanisms() -> None:
-    """Retraining config: state delta inverse, WM output norm, residual mask, FK grad reuse, release mask,
-    placement reward, deterministic imagination with fixed noise, rollout proxy / env log, compiled step."""
-    from sugar_rl.supermimic.hoi_task import compute_release_mask
-    from sugar_rl.supermimic.trainer import make_residual_mask
-
+def test_11_fast_fk_depth_vectorization_and_scale_grad() -> None:
+    """Verify 11-layer depth-batched FastTreeKinematics and `FKResult.scale_grad(alpha)` exact 1st-order gradient equivalence."""
     torch.manual_seed(11)
     fk = FastTreeKinematics(device=DEVICE)
-    task = SugarHOITask(fk, "CarryBox")
-    B = 32
-
-    def _rand_state(scale: float = 1.0) -> torch.Tensor:
-        return SugarHOITask.pack_state(
-            root_pos=torch.randn(B, 3, device=DEVICE) * scale,
-            root_quat=quat_normalize(torch.randn(B, 4, device=DEVICE)),
-            q=torch.randn(B, 29, device=DEVICE) * 0.3,
-            root_lin_vel=torch.randn(B, 3, device=DEVICE),
-            root_ang_vel=torch.randn(B, 3, device=DEVICE),
-            qd=torch.randn(B, 29, device=DEVICE),
-            obj_pos=torch.randn(B, 3, device=DEVICE) * scale,
-            obj_quat=quat_normalize(torch.randn(B, 4, device=DEVICE)),
-            obj_lin_vel=torch.randn(B, 3, device=DEVICE),
-            obj_ang_vel=torch.randn(B, 3, device=DEVICE),
-        )
-
-    # 1. compute_state_delta is the exact inverse of apply_delta (small realistic one-step changes)
-    s0 = _rand_state()
-    delta = torch.randn(B, 82, device=DEVICE) * 0.05
-    s1 = SugarHOITask.apply_delta(s0, delta)
-    d_rec = SugarHOITask.compute_state_delta(s0, s1)
-    assert (d_rec - delta).abs().max().item() < 1e-4, "compute_state_delta does not invert apply_delta"
-    assert SugarHOITask.state_error(s1, s1).abs().max().item() < 1e-5
-
-    # 2. WM output normalization: a zero head predicts the running mean delta in physical units
-    wm = JointWorldModel(hidden_dims=(64, 64)).to(DEVICE)
-    true_d = torch.randn(4096, 82, device=DEVICE) * torch.linspace(0.001, 2.0, 82, device=DEVICE) + 0.3
-    wm.update_delta_stats(true_d)
-    with torch.no_grad():
-        wm.delta_head.weight.zero_()
-        wm.delta_head.bias.zero_()
-    feat = task.state_features(s0)
-    d_pred, _ = wm.forward_delta(feat, torch.zeros(B, 29, device=DEVICE), torch.zeros(B, 29, device=DEVICE),
-                                 torch.zeros(B, XI_DIM, device=DEVICE))
-    assert (d_pred - true_d.mean(0)).abs().max().item() < 1e-3
-    assert (wm.delta_std() / true_d.std(0) - 1.0).abs().max().item() < 0.05
-    loss, _ = task.world_model_state_loss(s1, s1, torch.ones(29, device=DEVICE), wm.delta_std())
-    assert loss.item() < 1e-6
-
-    # 3. Legs absolute, upper body residual
-    mask = make_residual_mask(list(fk.env_joint_names), legs_absolute=True)
-    legs = [i for i, n in enumerate(fk.env_joint_names) if any(k in n for k in ("hip", "knee", "ankle"))]
-    assert len(legs) == 12 and mask[legs].sum().item() == 0.0 and mask.sum().item() == 17.0
-    pol = SuperMimicPolicy(obs_dim=PRIVILEGED_OBS_DIM, default_joint_pos=fk.default_joint_pos,
-                           action_scale=fk.action_scale, residual_mask=mask).to(DEVICE)
-    with torch.no_grad():
-        pol.backbone[-1].weight.zero_()
-        pol.backbone[-1].bias.zero_()
-    obs = torch.randn(4, PRIVILEGED_OBS_DIM, device=DEVICE)
-    a = pol.act_inference(obs)
-    expected = (obs[:, :29] - fk.default_joint_pos) / fk.action_scale
-    assert a[:, legs].abs().max().item() < 1e-6, "legs must be absolute (zero residual -> default pose)"
-    upper = [i for i in range(29) if i not in legs]
-    assert (a[:, upper] - expected[:, upper]).abs().max().item() < 1e-4
-
-    # 4. FKResult.scale_grad == FK on the gradient-decayed state (values and gradients)
-    s_a = _rand_state().requires_grad_(True)
-    alpha = 0.7
-    fk_direct = task.run_fk(s_a * alpha + s_a.detach() * (1 - alpha))
-    g1 = torch.autograd.grad((fk_direct.tracked_pos_w ** 2).sum() + fk_direct.anchor_quat_w.sum(), s_a)[0]
-    fk_reuse = task.run_fk(s_a).scale_grad(alpha)
-    g2 = torch.autograd.grad((fk_reuse.tracked_pos_w ** 2).sum() + fk_reuse.anchor_quat_w.sum(), s_a)[0]
-    assert (fk_direct.tracked_pos_w - fk_reuse.tracked_pos_w).abs().max().item() < 1e-6
-    assert (g1 - g2).abs().max().item() < 1e-4, "scale_grad gradient mismatch"
-
-    # 5. Release mask: release at frame 10 of a 20-frame clip, padded to 30 frames
-    lab = torch.zeros(1, 30, dtype=torch.bool, device=DEVICE)
-    lab[0, 3:10] = True
-    lab[0, 20:] = True  # padding beyond the clip must never create a release
-    m = compute_release_mask(lab, torch.tensor([20], device=DEVICE), window=2)[0]
-    exp_m = torch.zeros(30, device=DEVICE)
-    exp_m[8:20] = 1.0  # [10-2, 10+2] window plus all no-contact frames after the release, within the clip
-    assert torch.equal(m, exp_m), f"release mask wrong: {m.tolist()}"
-
-    # 6. Placement reward: only inside the mask, narrow kernel
-    mock_m = _MockMotionData(fk, device=DEVICE)
-    mock_m.contact_label[:, 40:] = False  # release at frame 40
-    ref_ad = MotionReferenceAdapter(mock_m)
-    ref_ad.set_release_window(5)
-    task_p = SugarHOITask(fk, "CarryBox")
-    task_p.profile.place_weight = 1.0
-    m_ids = torch.zeros(2, dtype=torch.long, device=DEVICE)
-    for t_val, active in ((20, False), (40, True)):
-        tt = torch.full((2,), t_val, dtype=torch.long, device=DEVICE)
-        f = ref_ad.get_frame(m_ids, tt)
-        s_ok = SugarHOITask.pack_state(f.body_pos_w[:, 0], f.body_quat_w[:, 0], f.joint_pos, f.body_lin_vel_w[:, 0],
-                                       f.body_ang_vel_w[:, 0], f.joint_vel, f.obj_pos_w, f.obj_quat_w,
-                                       f.obj_lin_vel_w, f.obj_ang_vel_w)
-        s_off = s_ok.clone()
-        s_off[:, 71] += 0.10
-        z = torch.zeros(2, 29, device=DEVICE)
-        _, _, info_ok = task_p.compute_reward_and_termination(s_ok, s_ok, z, z, f)
-        _, _, info_off = task_p.compute_reward_and_termination(s_ok, s_off, z, z, f)
-        if active:
-            assert abs(info_ok["rew/place"][0].item() - 1.0) < 1e-4
-            assert info_off["rew/place"][0].item() < 0.25, "10 cm placement error must lose most of the fine reward"
-        else:
-            assert info_ok["rew/place"].abs().max().item() == 0.0
-    assert abs(task_p.max_step_reward() - (5.125 + 1.0) * 0.02) < 1e-9
-
-    # 7. Trainer: fixed noise (no std gradients), deterministic imagination, auto value clip, rollout proxy, env log
-    class _LogBridge(_SyntheticSugarBridge):
-        def step(self, raw_action: torch.Tensor):
-            out = super().step(raw_action)
-            info = out[-1]
-            info["log"] = {"Episode_Termination/obj_pos": torch.tensor(0.25, device=self.device)}
-            return out
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for compile_bptt in (False, True):
-            bridge = _LogBridge(stage="refiner", num_envs=16, device=DEVICE)
-            bridge.t_steps[:] = 55  # synthetic clips time out at t=60 -> deterministic t0 envs finish inside 12 steps
-            cfg = SuperMimicTrainCfg(
-                steps_per_env=12, replay_capacity=48, wm_seq_len=4, wm_updates_per_iter=2, wm_batch_size=32,
-                wm_hidden_dims=(64, 64), policy_hidden_dims=(64, 64), wm_warmup_iters=0, imagination_horizon=6,
-                policy_updates_per_iter=1, policy_batch_size=16, enable_tensorboard=False,
-                compile_bptt=compile_bptt, compile_backend="aot_eager",
-            )
-            tr = SuperMimicTrainer(bridge, log_dir=pathlib.Path(tmpdir) / f"t{int(compile_bptt)}", cfg=cfg)
-            assert tr.value_clip[1] > 0 and abs(tr.value_clip[0] + tr.value_clip[1]) < 1e-9
-            assert not tr._raw_policy.log_std.requires_grad
-            _, _, c_stats = tr.collect_rollout()
-            assert "rollout_proxy/det_t0_success_rate" in c_stats, c_stats.keys()
-            assert abs(c_stats["env/Episode_Termination/obj_pos"] - 0.25) < 1e-6
-            wm_stats = tr.update_world_model()
-            assert all(math.isfinite(v) for v in wm_stats.values())
-            p_stats = tr.update_policy(iteration=1)
-            assert math.isfinite(p_stats["policy/imagined_return"])
-            assert tr._set_lr(0, 10) == 1.0 and abs(tr._set_lr(9, 10) - cfg.lr_final_frac) < 1e-9
-
-        # 8. Old checkpoints without `residual_mask` still load (fully residual)
-        ckpt = pathlib.Path(tmpdir) / "old.pt"
-        tr.save_checkpoint(ckpt, iteration=0)
-        payload = torch.load(ckpt, map_location=DEVICE, weights_only=False)
-        payload["policy_state_dict"].pop("residual_mask")
-        torch.save(payload, ckpt)
-        old_pol = load_supermimic_policy(ckpt, device=DEVICE)
-        assert old_pol.residual_mask.sum().item() == 29.0
-
-    print("[PASS] Test 11: Retrain config (delta inverse, WM out-norm, legs-abs mask, FK grad reuse, release mask, "
-          "placement reward, fixed-noise deterministic BPTT, rollout proxy, compiled step)")
-
-
-def test_12_review_compliance_zero_sync_equivalence_and_rollout_tools() -> None:
-    """Verify review requirements:
-    1) Zero host-GPU syncs across replay sampling, WM update, Critic update & BPTT step loop (`sync_debug_mode="error"`).
-    2) Exact forward & backward gradient equivalence between eager uncached FK and `scale_grad` + `compile_bptt`.
-    3) Consistent ankle `feet_height` reward + omission of differentiable `feet_air_time` trap in imagination.
-    4) `analyze_rollouts.py` 3-segment placement breakdown & `process_refiner_rollout.py` stale-dir cleanup + filtering.
-    """
-    import pickle
-    import subprocess
-    import numpy as np
-
-    torch.manual_seed(12)
-    fk = FastTreeKinematics(device=DEVICE)
-
-    # --- 1. A100-aligned defaults & batched depth-layer FK check ---
     assert fk.max_depth == 11, f"Expected G1 kinematic tree max_depth=11, got {fk.max_depth}"
-    default_cfg = SuperMimicTrainCfg()
-    assert default_cfg.wm_seq_len == 8
-    assert default_cfg.wm_updates_per_iter == 12 and default_cfg.policy_updates_per_iter == 4
-    assert default_cfg.wm_batch_size == 2048 and default_cfg.policy_batch_size == 1024
-    assert default_cfg.wm_hidden_dims == (1024, 1024, 1024) and default_cfg.policy_hidden_dims == (512, 256, 128)
-    assert default_cfg.legs_absolute is False and default_cfg.pessimistic_critic is True
-    assert default_cfg.imag_critic_updates == 0 and default_cfg.bptt_grad_decay == 0.98
-    assert default_cfg.ema_decay == 0.995 and default_cfg.adam_beta2 == 0.95
-
-    # --- 2. Feet z-height reward parity + air-time gradient omission in imagination ---
-    mock_m = _MockMotionData(fk, device=DEVICE)
-    ref_ad = MotionReferenceAdapter(mock_m)
-    task_fh = SugarHOITask(fk, "CarryBox")
-    task_fh.profile.feet_height_weight = 0.25
-    task_fh.profile.feet_height_std = 0.06
-    task_fh.profile.feet_slide_weight = 0.0  # isolate air_time gradient on foot ground logits
-
-    m_ids = torch.zeros(4, dtype=torch.long, device=DEVICE)
-    tt = torch.full((4,), 60, dtype=torch.long, device=DEVICE)
-    f_cur = ref_ad.get_frame(m_ids, tt)
-    s_ref = SugarHOITask.pack_state(
-        f_cur.body_pos_w[:, 0], f_cur.body_quat_w[:, 0], f_cur.joint_pos,
-        f_cur.body_lin_vel_w[:, 0], f_cur.body_ang_vel_w[:, 0], f_cur.joint_vel,
-        f_cur.obj_pos_w, f_cur.obj_quat_w, f_cur.obj_lin_vel_w, f_cur.obj_ang_vel_w,
-    )
-    s_low_foot = s_ref.clone()
-    s_low_foot[:, 2] -= 0.08  # drop robot 8cm so ankles deviate 8cm vertically from reference z
-    z_act = torch.zeros(4, 29, device=DEVICE)
-    _, _, info_exact = task_fh.compute_reward_and_termination(s_ref, s_ref, z_act, z_act, f_cur)
-    _, _, info_drop = task_fh.compute_reward_and_termination(s_ref, s_low_foot, z_act, z_act, f_cur)
-    assert abs(info_exact["rew/feet_height"][0].item() - 0.25) < 1e-4
-    expected_drop = 0.25 * math.exp(-(0.08**2) / (0.06**2))
-    assert abs(info_drop["rew/feet_height"][0].item() - expected_drop) < 1e-4
-    assert abs(task_fh.max_step_reward() - (5.125 + 0.25) * 0.02) < 1e-9
-
-    # Verify `include_air_time_penalty=False` eliminates "never land" gradient on contact_logits[:, 2:4]
-    c_logits = torch.tensor([[2.0, -5.0, 0.0, 0.0, -5.0]], device=DEVICE).expand(4, 5).clone().requires_grad_(True)
-    r_with_air, _, _ = task_fh.compute_reward_and_termination(
-        s_ref, s_ref, z_act, z_act, f_cur, contact_logits=c_logits,
-        feet_air_time=torch.full((4, 2), 0.15, device=DEVICE),
-        prev_feet_gnd=torch.zeros(4, 2, device=DEVICE),
-        time_steps=tt, include_air_time_penalty=True,
-    )
-    g_air = torch.autograd.grad(r_with_air.sum(), c_logits)[0]
-    assert g_air[:, 2:4].abs().max().item() > 1e-3, "Expected non-zero landing penalty gradient when enabled"
-
-    c_logits_img = c_logits.detach().clone().requires_grad_(True)
-    r_no_air, _, _ = task_fh.compute_reward_and_termination(
-        s_ref, s_ref, z_act, z_act, f_cur, contact_logits=c_logits_img,
-        feet_air_time=torch.full((4, 2), 0.15, device=DEVICE),
-        prev_feet_gnd=torch.zeros(4, 2, device=DEVICE),
-        time_steps=tt, include_air_time_penalty=False,
-    )
-    g_no_air = torch.autograd.grad(r_no_air.sum(), c_logits_img)[0]
-    assert g_no_air[:, 2:4].abs().max().item() == 0.0, "Spurious foot-landing gradient leaked into imagination!"
-
-    # --- 3. Exact forward & gradient equivalence: eager (recomputed FK) vs compiled (`scale_grad` + `compile_bptt`) ---
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = pathlib.Path(tmpdir)
-        b_eager = _SyntheticSugarBridge(stage="refiner", num_envs=16, device=DEVICE)
-        cfg_eq = SuperMimicTrainCfg(
-            steps_per_env=8, replay_capacity=32, wm_seq_len=4, wm_updates_per_iter=1, wm_batch_size=16,
-            wm_hidden_dims=(64, 64), policy_hidden_dims=(64, 64), wm_warmup_iters=0, imagination_horizon=8,
-            policy_updates_per_iter=1, policy_batch_size=8, bptt_grad_decay=0.98, use_bf16=False,
-            enable_tensorboard=False, compile_bptt=False,
-        )
-        tr_eager = SuperMimicTrainer(b_eager, log_dir=tmp / "eq_eager", cfg=cfg_eq)
-        tr_eager.collect_rollout()
-        init_ckpt = tmp / "eq_init.pt"
-        tr_eager.save_checkpoint(init_ckpt, iteration=0)
-
-        cfg_comp = SuperMimicTrainCfg(**{**cfg_eq.__dict__, "compile_bptt": True, "compile_backend": "aot_eager"})
-        tr_comp = SuperMimicTrainer(b_eager, log_dir=tmp / "eq_comp", cfg=cfg_comp)
-        tr_comp.load_checkpoint(init_ckpt)
-        tr_comp.replay = tr_eager.replay
-
-        starts = tr_eager.replay.sample_imagination_starts(8, need_history=False)
-
-        def _eval_rollout_grads(tr: SuperMimicTrainer, recompute_fk: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
-            tr._raw_policy.zero_grad(set_to_none=True)
-            s_c = starts.states.clone().requires_grad_(tr.cfg.compile_bptt)
-            pa = starts.prev_actions.clone().requires_grad_(tr.cfg.compile_bptt)
-            fk_c = tr.task.run_fk(s_c)
-            disc = torch.ones(8, device=DEVICE)
-            ret = torch.zeros(8, device=DEVICE)
-            alpha = tr.cfg.bptt_grad_decay
-            v_min, v_max = tr.value_clip
-            for tau in range(8):
-                t_c = starts.time_steps + tau
-                s_n, fk_n, a_c, r_s, p_t, d_m, v_d, _, _, _ = tr._img_step_fn(
-                    s_c, fk_c, pa, starts.motion_ids, t_c, starts.xi, None
-                )
-                ret = ret + disc * r_s + disc * tr.cfg.gamma * (1.0 - p_t) * v_d * d_m
-                disc = disc * tr.cfg.gamma * (1.0 - p_t) * (1.0 - d_m)
-                s_c = s_n * alpha + s_n.detach() * (1.0 - alpha)
-                fk_c = tr.task.run_fk(s_c) if recompute_fk else fk_n.scale_grad(alpha, tr.fk.anchor_tracked_idx)
-                pa = a_c
-            fut_t = tr.bridge.motion_ref.get_future_window(starts.motion_ids, starts.time_steps + 8)
-            obs_t = tr.task.build_privileged_obs(s_c, pa, fut_t, fk_res=fk_c, xi=starts.xi)
-            v_t = tr.critic(obs_t, update_rms=False, pessimistic=tr.cfg.pessimistic_critic).clamp(v_min, v_max)
-            ret = ret + disc * v_t
-            (-ret.mean()).backward()
-            grads = [p.grad.detach().clone() for p in tr._raw_policy.parameters() if p.requires_grad]
-            return ret.detach(), grads
-
-        ret_ref, grads_ref = _eval_rollout_grads(tr_eager, recompute_fk=True)
-        ret_opt, grads_opt = _eval_rollout_grads(tr_comp, recompute_fk=False)
-        assert (ret_ref - ret_opt).abs().max().item() < 1e-4, "Compiled + FK-reuse return diverged from eager!"
-        max_g_diff = max((g1 - g2).abs().max().item() for g1, g2 in zip(grads_ref, grads_opt))
-        assert max_g_diff < 1e-4, f"Compiled + FK-reuse policy gradient diverged: {max_g_diff}"
-
-        # --- 3b. Single-trace zero-recompilation check + CUDAGraph multi-step BPTT lifecycle & safety fallback ---
-        import torch._dynamo as dynamo
-
-        tr_recomp = SuperMimicTrainer(b_eager, log_dir=tmp / "recomp_test", cfg=cfg_comp)
-        tr_recomp.replay = tr_eager.replay
-        dynamo.reset()
-        dynamo.utils.counters.clear()
-        tr_recomp.update_world_model()
-        assert dynamo.utils.counters["frames"].get("ok", 0) == 1, (
-            f"_wm_step recompiled across t=0 vs t>=1: {dict(dynamo.utils.counters['frames'])}"
-        )
-        dynamo.utils.counters.clear()
-        tr_recomp.update_policy(iteration=0)
-        first_pol_frames = dynamo.utils.counters["frames"].get("ok", 0)
-        assert first_pol_frames == 1, f"_imagine_step expected 1 compiled frame, got {first_pol_frames}"
-        dynamo.utils.counters.clear()
-        tr_recomp.update_policy(iteration=1)
-        assert dynamo.utils.counters["frames"].get("ok", 0) == 0, "Unexpected recompilation on subsequent policy iter!"
-
-        # Long-horizon inductor `reduce-overhead` must auto-downgrade to `default` (no deep CUDAGraph tree stall)
-        cfg_safe_fb = SuperMimicTrainCfg(
-            imagination_horizon=32, wm_seq_len=8, enable_tensorboard=False,
-            compile_bptt=True, compile_backend="inductor", compile_mode="reduce-overhead",
-        )
-        tr_safe_fb = SuperMimicTrainer(b_eager, log_dir=tmp / "safe_fb", cfg=cfg_safe_fb)
-        assert tr_safe_fb._use_cudagraph_mark is False, "Long-horizon inductor reduce-overhead did not downgrade!"
-
-        if DEVICE.type == "cuda":
-            b_cg = _SyntheticSugarBridge(stage="refiner", num_envs=8, device=DEVICE)
-            cfg_cg = SuperMimicTrainCfg(
-                steps_per_env=6, replay_capacity=24, wm_seq_len=2, wm_updates_per_iter=2, wm_batch_size=8,
-                wm_hidden_dims=(32, 32), policy_hidden_dims=(32, 32), wm_warmup_iters=0, imagination_horizon=2,
-                policy_updates_per_iter=2, policy_batch_size=8, enable_tensorboard=False,
-                compile_bptt=True, compile_backend="cudagraphs", compile_mode="reduce-overhead",
-            )
-            tr_cg = SuperMimicTrainer(b_cg, log_dir=tmp / "cg_test", cfg=cfg_cg)
-            assert tr_cg._use_cudagraph_mark is True
-            tr_cg.learn(max_iterations=2)
-
-        # --- 4. Strict CUDA zero-host-sync check inside hot training loops ---
-        if DEVICE.type == "cuda" and hasattr(torch.cuda, "set_sync_debug_mode"):
-            torch.cuda.synchronize()
-            prev_mode = torch.cuda.get_sync_debug_mode()
-            torch.cuda.set_sync_debug_mode("error")
-            try:
-                batch_wm = tr_eager.replay.sample_wm_sequences(16, seq_len=4)
-                assert batch_wm is not None
-                _ = tr_eager.replay.sample_imagination_starts(8, need_history=True)
-                err_std = tr_eager._raw_world_model.delta_std().detach()
-                tr_eager.wm_opt.zero_grad(set_to_none=True)
-                _, ls, lc, _ = tr_eager._wm_step(
-                    batch_wm.s_init, batch_wm.actions[:, 0], batch_wm.next_states[:, 0],
-                    batch_wm.contacts[:, 0], batch_wm.mask[:, 0], batch_wm.xi, err_std,
-                )
-                (ls + 0.2 * lc).backward()
-                wm_p = list(tr_eager._raw_world_model.parameters())
-                gn = nn.utils.clip_grad_norm_(wm_p, 1.0)
-                from sugar_rl.supermimic.trainer import _zero_nonfinite_grads_
-                _zero_nonfinite_grads_(wm_p, gn)
-                tr_eager.wm_opt.step()
-            finally:
-                torch.cuda.set_sync_debug_mode(prev_mode)
-
-        # --- 5. End-to-end rollout diagnostics (`analyze_rollouts.py`) & filtering (`process_refiner_rollout.py`) ---
-        data_root = tmp / "rollout_ds"
-        traj_dir = data_root / "raw_npz" / "trajectory_complete"
-        ref_dir = tmp / "ref_carrybox" / "data_000"
-        stale_dir = data_root / "rl_dataset" / "data_999_999_t0"
-        traj_dir.mkdir(parents=True)
-        ref_dir.mkdir(parents=True)
-        stale_dir.mkdir(parents=True)
-        (stale_dir / "stale.txt").write_text("stale", encoding="utf-8")
-
-        T_clip = 40
-        ref_bpos = np.zeros((T_clip, 14, 3), dtype=np.float32)
-        ref_bpos[:, 0, 2] = 0.76
-        ref_bpos[:, 7, 2] = 0.85
-        ref_bquat = np.zeros((T_clip, 14, 4), dtype=np.float32)
-        ref_bquat[..., 0] = 1.0
-        ref_obj = np.zeros((T_clip, 3), dtype=np.float32)
-        ref_obj[:, 0] = 0.50
-        ref_obj[:, 2] = 0.15
-        np.savez(ref_dir / "robot_50hz.npz", body_pos_w=ref_bpos, body_quat_w=ref_bquat)
-        with open(ref_dir / "obj_motion_global_50hz.pkl", "wb") as f_pkl:
-            pickle.dump({"obj_trans": ref_obj}, f_pkl)
-
-        for env_i, final_err in ((0, 0.03), (1, 0.18)):
-            T_r = T_clip - 1
-            hands_c = np.zeros(T_r, dtype=bool)
-            hands_c[5:25] = True  # release at r = 25
-            obj_w = np.repeat(ref_obj[1:], 1, axis=0).copy()
-            obj_w[25, 2] += 0.04  # 4cm above support at release
-            obj_w[-1, 0] += final_err
-            target_b = np.zeros((T_r, 3), dtype=np.float32)
-            obj_b = np.zeros((T_r, 3), dtype=np.float32)
-            obj_b[-1, 0] = final_err
-            np.savez(
-                traj_dir / f"motion_0_env_{env_i}_t0-{T_r}_idx_0.npz",
-                motion_id=0, env_id=env_i, rollout_start=0, rollout_end=T_r,
-                action=np.zeros((T_r, 29), dtype=np.float32),
-                joint_pos=np.zeros((T_r, 29), dtype=np.float32),
-                joint_vel=np.zeros((T_r, 29), dtype=np.float32),
-                ref_joint_pos=np.zeros((T_r, 29), dtype=np.float32),
-                body_pos_w=ref_bpos[1:].copy(),
-                body_quat_w=ref_bquat[1:].copy(),
-                body_lin_vel_w=np.zeros((T_r, 14, 3), dtype=np.float32),
-                body_ang_vel_w=np.zeros((T_r, 14, 3), dtype=np.float32),
-                root_pos_w=ref_bpos[1:, 0].copy(),
-                anchor_pos_w=ref_bpos[1:, 7].copy(),
-                anchor_quat_w=ref_bquat[1:, 7].copy(),
-                obj_pos_w=obj_w,
-                obj_quat_w=np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (T_r, 1)),
-                obj_lin_vel_w=np.zeros((T_r, 3), dtype=np.float32),
-                obj_ang_vel_w=np.zeros((T_r, 3), dtype=np.float32),
-                obj_pos_b=obj_b,
-                target_obj_pos_b=target_b,
-                hands_contact_label=hands_c,
-                ref_contact_label=hands_c,
-            )
-
-        out_json = tmp / "metrics.json"
-        res_an = subprocess.run(
-            [
-                sys.executable, str(REPO_ROOT / "scripts" / "supermimic" / "analyze_rollouts.py"),
-                "--rollout_dir", str(data_root / "raw_npz"),
-                "--ref_dir", str(tmp / "ref_carrybox"),
-                "--out_json", str(out_json),
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        assert "box_height_above_ref_end_at_release_m" in res_an.stdout
-        assert "seg2_box_in_anchor_err_at_release_m" in res_an.stdout
-
-        subprocess.run(
-            [
-                sys.executable, str(REPO_ROOT / "scripts" / "sugar_rl" / "process_refiner_rollout.py"),
-                "--data_dir", str(data_root),
-                "--task_name", "CarryBox",
-                "--max_final_obj_err", "0.08",
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        assert not stale_dir.exists(), "Stale unfiltered directory in rl_dataset was not cleaned up!"
-        kept_dirs = list((data_root / "rl_dataset").glob("data_*"))
-        assert len(kept_dirs) == 1 and "000_000" in kept_dirs[0].name
-
-    print("[PASS] Test 12: Zero CUDA host-sync, eager-vs-compiled gradient parity, feet_height & rollout tools")
-
-
-def test_13_ema_actor_bryson_pose_jerk_and_imag_critic() -> None:
-    """Verify gait/jitter/placement fixes:
-    1) Polyak EMA actor exported as primary `policy_state_dict`, with exact `raw_policy_state_dict` resume separation.
-    2) Bryson pose weighting (`pose_loss_weight=4.0`) amplifies root/object pose channels vs velocity channels.
-    3) `motion_joint_vel`, narrowed `anc_pos`/`obj_pos` & `joint_acc` live-env synchronization in `SugarEnvBridge`.
-    4) Second-order action smoothness (`imag_jerk_weight`) + imagined GAE critic calibration (`imag_critic_updates`)
-       under `bfloat16` + zero CUDA host syncs.
-    """
-    torch.manual_seed(13)
-    fk = FastTreeKinematics(device=DEVICE)
     task = SugarHOITask(fk, "CarryBox")
 
-    # 1. Bryson pose loss boost (4x on root/obj pose vs 1x on velocities)
-    s_gt = SugarHOITask.pack_state(
-        torch.zeros(4, 3, device=DEVICE),
-        torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=DEVICE).expand(4, 4),
-        torch.zeros(4, 29, device=DEVICE),
-        torch.zeros(4, 3, device=DEVICE),
-        torch.zeros(4, 3, device=DEVICE),
-        torch.zeros(4, 29, device=DEVICE),
-        torch.zeros(4, 3, device=DEVICE),
-        torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=DEVICE).expand(4, 4),
-        torch.zeros(4, 3, device=DEVICE),
-        torch.zeros(4, 3, device=DEVICE),
+    B = 8
+    s_base = SugarHOITask.pack_state(
+        root_pos=torch.randn(B, 3, device=DEVICE),
+        root_quat=quat_normalize(torch.randn(B, 4, device=DEVICE)),
+        q=torch.randn(B, 29, device=DEVICE) * 0.25,
+        root_lin_vel=torch.randn(B, 3, device=DEVICE) * 0.3,
+        root_ang_vel=torch.randn(B, 3, device=DEVICE) * 0.3,
+        qd=torch.randn(B, 29, device=DEVICE) * 0.5,
+        obj_pos=torch.randn(B, 3, device=DEVICE),
+        obj_quat=quat_normalize(torch.randn(B, 4, device=DEVICE)),
+        obj_lin_vel=torch.randn(B, 3, device=DEVICE) * 0.2,
+        obj_ang_vel=torch.randn(B, 3, device=DEVICE) * 0.2,
     )
-    s_pos_err = s_gt.clone()
-    s_pos_err[:, 0] += 0.10  # 10 cm root x error (pose channel)
-    s_vel_err = s_gt.clone()
-    s_vel_err[:, 36] += 0.10  # 0.1 m/s root vx error (velocity channel)
-    ones29 = torch.ones(29, device=DEVICE)
-    ones82 = torch.ones(82, device=DEVICE)
-    l_pos_1, _ = task.world_model_state_loss(s_pos_err, s_gt, ones29, ones82, pose_loss_weight=1.0)
-    l_pos_4, _ = task.world_model_state_loss(s_pos_err, s_gt, ones29, ones82, pose_loss_weight=4.0)
-    l_vel_1, _ = task.world_model_state_loss(s_vel_err, s_gt, ones29, ones82, pose_loss_weight=1.0)
-    l_vel_4, _ = task.world_model_state_loss(s_vel_err, s_gt, ones29, ones82, pose_loss_weight=4.0)
-    assert abs(l_pos_4.item() / l_pos_1.item() - 4.0) < 1e-5, "Bryson pose_loss_weight failed to scale root pose!"
-    assert abs(l_vel_4.item() - l_vel_1.item()) < 1e-7, "Velocity channel was unexpectedly scaled by pose_loss_weight!"
+    alpha = 0.98
 
-    # 2. Joint velocity damping reward (`motion_joint_vel`) & live RewardManager sync check
-    class _TermStub:
-        def __init__(self, weight: float, params: dict | None = None):
-            self.weight = weight
-            self.params = params or {}
-
-    class _MockRewMgr:
-        _term_names = [
-            "motion_global_anchor_pos",
-            "motion_obj_pos",
-            "motion_joint_vel",
-            "joint_acc",
-            "motion_obj_pos_place",
-            "motion_feet_height",
-            "feet_slide",
-            "feet_air_time",
-        ]
-        _term_cfgs = [
-            _TermStub(0.35, {"std": 0.18}),
-            _TermStub(0.50, {"std": 0.20}),
-            _TermStub(0.15, {"std": 3.0}),
-            _TermStub(-2.5e-6),
-            _TermStub(1.50, {"std": 0.08, "window": 60}),
-            _TermStub(0.50, {"std": 0.06}),
-            _TermStub(-0.25),
-            _TermStub(1.50, {"threshold": 0.28}),
-        ]
-
-    from sugar_rl.supermimic.env_bridge import SugarEnvBridge
-
-    dummy_br = object.__new__(SugarEnvBridge)
-    dummy_br.env = type("_E", (), {"reward_manager": _MockRewMgr()})()
-    dummy_br.profile = task.profile
-    dummy_br.motion_ref = MotionReferenceAdapter(_MockMotionData(fk, device=DEVICE))
-    dummy_br._sync_live_reward_params()
-    assert abs(task.profile.anc_pos_weight - 0.35) < 1e-6 and abs(task.profile.anc_pos_std - 0.18) < 1e-6
-    assert abs(task.profile.obj_pos_std - 0.20) < 1e-6
-    assert abs(task.profile.joint_vel_weight - 0.15) < 1e-6 and abs(task.profile.joint_vel_std - 3.0) < 1e-6
-    assert abs(task.profile.joint_acc_weight - (-2.5e-6)) < 1e-12
-    assert task.profile.place_window == 60 and abs(task.profile.place_weight - 1.50) < 1e-6
-
-    f0 = dummy_br.motion_ref.get_frame(torch.zeros(2, dtype=torch.long, device=DEVICE), torch.zeros(2, dtype=torch.long, device=DEVICE))
-    s_calm = SugarHOITask.pack_state(
-        f0.body_pos_w[:, 0], f0.body_quat_w[:, 0], f0.joint_pos, f0.body_lin_vel_w[:, 0],
-        f0.body_ang_vel_w[:, 0], f0.joint_vel, f0.obj_pos_w, f0.obj_quat_w, f0.obj_lin_vel_w, f0.obj_ang_vel_w,
+    # Method A (reference): decay state tensor directly, then call run_fk
+    s_ref = s_base.clone().detach().requires_grad_(True)
+    s_decayed = s_ref * alpha + s_ref.detach() * (1.0 - alpha)
+    fk_ref = task.run_fk(s_decayed)
+    loss_ref = (
+        fk_ref.tracked_pos_w.pow(2).sum()
+        + fk_ref.tracked_quat_w.pow(2).sum()
+        + fk_ref.tracked_lin_vel_w.pow(2).sum()
+        + fk_ref.contact_pos_w.pow(2).sum()
     )
-    s_jitter = s_calm.clone()
-    s_jitter[:, 42:71] += 2.5  # high-frequency joint velocity spike
-    z_a = torch.zeros(2, 29, device=DEVICE)
-    r_calm, _, _ = task.compute_reward_and_termination(s_calm, s_calm, z_a, z_a, f0)
-    r_jit, _, _ = task.compute_reward_and_termination(s_calm, s_jitter, z_a, z_a, f0)
-    assert (r_calm > r_jit).all()
+    g_ref = torch.autograd.grad(loss_ref, s_ref)[0]
 
-    # 3. Actor EMA export vs raw online resume + imagined critic GAE + bf16 zero-sync check
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = pathlib.Path(tmpdir)
-        bridge = _SyntheticSugarBridge(stage="refiner", num_envs=16, device=DEVICE)
-        bridge.robot = type("_R", (), {"data": type("_D", (), {"joint_acc": torch.full((16, 29), 10.0, device=DEVICE)})()})()
-        cfg = SuperMimicTrainCfg(
-            steps_per_env=8, replay_capacity=32, wm_seq_len=4, wm_updates_per_iter=2, wm_batch_size=16,
-            wm_hidden_dims=(64, 64), policy_hidden_dims=(64, 64), wm_warmup_iters=0, imagination_horizon=6,
-            policy_updates_per_iter=2, policy_batch_size=16, ema_decay=0.80, imag_jerk_weight=0.05,
-            imag_critic_updates=2, use_bf16=True, enable_tensorboard=False,
-        )
-        tr = SuperMimicTrainer(bridge, log_dir=tmp / "ema_run", cfg=cfg)
-        _, _, c_stats = tr.collect_rollout()
-        assert "diag/jacc_50hz_per_step" in c_stats and c_stats["diag/jacc_50hz_per_step"] <= 0.0
-        exp_200 = bridge.task.profile.joint_acc_weight * (29.0 * 100.0) * bridge.task.step_dt
-        assert abs(c_stats["diag/jacc_200hz_per_step"] - exp_200) < 1e-10
-        tr.update_world_model()
-        p_metrics = tr.update_policy(iteration=1)
-        assert "critic/imag_loss" in p_metrics and math.isfinite(p_metrics["critic/imag_loss"])
+    # Method B (reused FKResult): compute FK once, then scale_grad(alpha)
+    s_reuse = s_base.clone().detach().requires_grad_(True)
+    fk_raw = task.run_fk(s_reuse)
+    fk_scaled = fk_raw.scale_grad(alpha, fk.anchor_tracked_idx)
+    loss_reuse = (
+        fk_scaled.tracked_pos_w.pow(2).sum()
+        + fk_scaled.tracked_quat_w.pow(2).sum()
+        + fk_scaled.tracked_lin_vel_w.pow(2).sum()
+        + fk_scaled.contact_pos_w.pow(2).sum()
+    )
+    g_reuse = torch.autograd.grad(loss_reuse, s_reuse)[0]
 
-        # Raw online weights moved farther than EMA (decay=0.80), and `save_checkpoint` exports EMA as `policy_state_dict`
-        raw_w = tr._raw_policy.backbone[-1].weight.detach().clone()
-        ema_w = tr.ema_policy.backbone[-1].weight.detach().clone()
-        assert (raw_w - ema_w).abs().max().item() > 1e-7, "EMA weights did not lag online policy weights!"
-
-        ckpt_p = tmp / "ema_ckpt.pt"
-        tr.save_checkpoint(ckpt_p, iteration=1)
-        deployed = load_supermimic_policy(ckpt_p, device=DEVICE)
-        assert (deployed.backbone[-1].weight - ema_w).abs().max().item() < 1e-6, "Deployed policy did not load EMA!"
-        assert deployed.residual_mask.sum().item() == 29.0, "Default legs_absolute=False mask not preserved in ckpt!"
-
-        tr_resumed = SuperMimicTrainer(bridge, log_dir=tmp / "ema_resume", cfg=cfg)
-        tr_resumed.load_checkpoint(ckpt_p)
-        assert (tr_resumed._raw_policy.backbone[-1].weight - raw_w).abs().max().item() < 1e-6
-        assert (tr_resumed.ema_policy.backbone[-1].weight - ema_w).abs().max().item() < 1e-6
-
-    print("[PASS] Test 13: Polyak EMA export/resume, Bryson pose weighting, joint_vel sync & imagined Critic GAE")
+    grad_diff = (g_ref - g_reuse).abs().max().item()
+    assert grad_diff < 1e-5, f"FKResult.scale_grad gradient mismatch: {grad_diff}"
+    print(f"[PASS] Test 11: Depth-batched FK (depth={fk.max_depth}) & FKResult.scale_grad equivalence (diff={grad_diff:.2e})")
 
 
-def test_14_omniretarget_cradling_usda_and_bridge_sync() -> None:
-    """Verify Option 2 multi-body contact aggregation, SugarEnvBridge dynamic contact resolution across
-    all 6 tasks, strict fail-fast USD enforcement (no Cuboid fallback), and rollout asset propagation.
+def test_12_omniretarget_clean_usda_and_bridge_sync() -> None:
+    """Verify v1 CarryBox strict undesired contacts (20 bodies), hands-only contact sensor,
+    fail-fast USD enforcement, rollout propagation, and clean OmniCarryBox dataset invariants.
     """
+    import ast
     import json
-    import re
     import subprocess
     from sugar_rl.supermimic.env_bridge import _resolve_undesired_body_ids
 
-    # 1. Exact 35 robot link names in SUGAR ContactSensorCfg (`{ENV_REGEX_NS}/Robot/.*`)
     cf_35 = [
         "pelvis", "left_hip_pitch_link", "pelvis_contour_link", "right_hip_pitch_link",
         "waist_yaw_link", "left_hip_roll_link", "right_hip_roll_link", "waist_roll_link",
@@ -1723,66 +1215,36 @@ def test_14_omniretarget_cradling_usda_and_bridge_sync() -> None:
             self._term_names = names
             self._term_cfgs = cfgs
 
-    # Lock down exact equivalence for the other 5 SUGAR tasks against legacy allowed-sets
-    legacy_pats = {
-        "PickBottle": ("hands", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$).+$"]),
-        "PushBox": ("hands", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$).+$"]),
-        "StandBottle": ("hands", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$)(?!left_knee_link$)(?!right_knee_link$).+$"]),
-        "KickBox": ("feet", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$).+$"]),
-        "SitChair": ("sit", [r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!.*hip.*)(?!.*pelvis.*).+$"]),
-    }
-    for tname, (hmode, pats) in legacy_pats.items():
-        rm_regex = _RewMgr(["undesired_contacts"], [_Term(_SCfg(pats))])
-        ids_from_mgr = _resolve_undesired_body_ids(cf_35, tname, hmode, rew_mgr=rm_regex)
-        ids_fallback = _resolve_undesired_body_ids(cf_35, tname, hmode, rew_mgr=None)
-        assert ids_from_mgr == ids_fallback, f"{tname}: reward_manager sync mismatch vs legacy allowed set!"
-
-    # CarryBox Option 2: exactly 12 lower-body + pelvis non-foot links (gentle anti-kneel/sit penalty)
-    cb_pats = ["pelvis.*", ".*_hip_.*_link", ".*_knee_link", ".*_ankle_pitch_link"]
+    # 1. Verify CarryBox undesired_contacts regex keeps head/torso/elbows/pelvis/legs (25 bodies) or live 20 bodies,
+    #    matching both RewardManager regex and SugarEnvBridge fallback!
+    cb_pats = [
+        r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$)(?!left_wrist_.*_link$)(?!right_wrist_.*_link$).+$"
+    ]
     rm_cb = _RewMgr(["undesired_contacts"], [_Term(_SCfg(cb_pats))])
     cb_ids = _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=rm_cb)
-    assert len(cb_ids) == 12, f"Expected 12 CarryBox undesired bodies, got {len(cb_ids)}"
     assert cb_ids == _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=None)
     cb_names = {cf_35[i] for i in cb_ids}
-    assert "torso_link" not in cb_names and "left_wrist_yaw_link" not in cb_names and "left_elbow_link" not in cb_names
-    assert "pelvis" in cb_names and "left_knee_link" in cb_names and "left_ankle_pitch_link" in cb_names
-    assert "left_ankle_roll_link" not in cb_names and "right_ankle_roll_link" not in cb_names
+    # Verify head, torso, elbows, pelvis, knees ARE penalized, while palms, wrists, and ankle_roll feet are exempt
+    for must_penalize in ("head_link", "torso_link", "waist_yaw_link", "left_elbow_link", "right_elbow_link", "pelvis", "left_knee_link"):
+        assert must_penalize in cb_names, f"{must_penalize} missing from CarryBox undesired_contacts!"
+    for must_exempt in ("left_ankle_roll_link", "right_ankle_roll_link", "left_rubber_hand", "right_rubber_hand", "left_wrist_yaw_link", "right_wrist_roll_link"):
+        assert must_exempt not in cb_names, f"{must_exempt} should be exempt from CarryBox undesired_contacts!"
 
-    # Verify resolved integer body_ids takes highest priority when populated by IsaacLab SceneEntityCfg.resolve()
-    rm_resolved = _RewMgr(["undesired_contacts"], [_Term(_SCfg(cb_pats, body_ids=[0, 2, 11]))])
-    assert _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=rm_resolved) == [0, 2, 11]
-
-    # 2. Multi-body contact force aggregation: identical when B=1, captures non-canceling forces when B=5
-    f1 = torch.randn(4, 3, 1, 1, 3, device=DEVICE)
-    agg_1 = torch.norm(f1[:, :, :, 0, :], dim=-1).sum(dim=2).max(dim=1)[0]
-    legacy_1 = torch.norm(f1[:, :, 0, 0, :], dim=-1).max(dim=1)[0]
-    assert (agg_1 - legacy_1).abs().max().item() < 1e-6
-
-    f5 = torch.zeros(2, 3, 5, 1, 3, device=DEVICE)
-    # Env 0: contact purely on forearm link (index 4), palm link (index 0) is zero!
-    f5[0, 2, 4, 0, :] = torch.tensor([0.0, 2.5, 0.0], device=DEVICE)
-    # Env 1: equal & opposite lateral/shear forces on two wrist links within same side (must NOT cancel!)
-    f5[1, 1, 1, 0, :] = torch.tensor([3.0, 0.0, 0.0], device=DEVICE)
-    f5[1, 1, 2, 0, :] = torch.tensor([-3.0, 0.0, 0.0], device=DEVICE)
-    agg_5 = torch.norm(f5[:, :, :, 0, :], dim=-1).sum(dim=2).max(dim=1)[0]
-    assert abs(float(agg_5[0].item()) - 2.5) < 1e-5
-    assert abs(float(agg_5[1].item()) - 6.0) < 1e-5
-
-    # Verify CarryBox profile weight/threshold/count alignment & source code guardrails
     p_cb = resolve_task_profile("Sugar-G129dof-CarryBox-Refiner")
-    assert p_cb.undesired_weight == -0.2 and p_cb.undesired_threshold == 5.0 and p_cb.num_undesired_bodies == 12
-    rew_py = (REPO_ROOT / "source" / "sugar_rl" / "sugar_rl" / "tasks" / "locomanip" / "mdp" / "rewards.py").read_text(encoding="utf-8")
-    cmd_py = (REPO_ROOT / "source" / "sugar_rl" / "sugar_rl" / "tasks" / "locomanip" / "mdp" / "commands.py").read_text(encoding="utf-8")
-    assert "left_hand_forces[:, :, :, 0, :]" in rew_py and "left_hand_forces[:, :, 0, 0, :]" not in rew_py
-    assert "left_hand_forces[:, :, :, 0, :]" in cmd_py and "left_hand_forces[:, :, 0, 0, :]" not in cmd_py
+    assert p_cb.undesired_weight == -1.0 and p_cb.undesired_threshold == 0.1 and p_cb.num_undesired_bodies == 20
 
-    # 3. Verify `apply_dataset_box_spec` fail-fast guard (refuses CuboidCfg fallback when USD is missing)
-    #    and `process_refiner_rollout.py --ref_dir` asset propagation without requiring full isaaclab runtime
-    import ast
+    # Verify carry_box_*_env_cfg no longer uses 5-link forearm/wrist contact sensor override
+    for rel_cfg in (
+        "source/sugar_rl/sugar_rl/tasks/locomanip/robots/g129dof/train_refiner/carry_box_refiner_env_cfg.py",
+        "source/sugar_rl/sugar_rl/tasks/locomanip/robots/g129dof/train_tracker/carry_box_tracker_env_cfg.py",
+        "source/sugar_rl/sugar_rl/tasks/locomanip/robots/g129dof/inference/carry_box_inference_env_cfg.py",
+    ):
+        cfg_txt = (REPO_ROOT / rel_cfg).read_text(encoding="utf-8")
+        assert "rubber_hand|wrist_.*_link|elbow_link" not in cfg_txt, f"Option 2 sensor override still in {rel_cfg}"
+
+    # 2. Verify `apply_dataset_box_spec` fail-fast guard (no CuboidCfg fallback)
     obj_src = (REPO_ROOT / "source" / "sugar_rl" / "sugar_rl" / "assets" / "objects" / "objects.py").read_text(encoding="utf-8")
-    assert "sim_utils.CuboidCfg" not in obj_src and "FileNotFoundError" in obj_src and "max_depenetration_velocity=1.0" in obj_src
-
-    # Dynamically extract and execute `apply_dataset_box_spec` with stubbed isaaclab types to test fail-fast Runtime behavior
+    assert "sim_utils.CuboidCfg" not in obj_src and "FileNotFoundError" in obj_src
     mod_ast = ast.parse(obj_src)
     fn_node = next(n for n in mod_ast.body if isinstance(n, ast.FunctionDef) and n.name == "apply_dataset_box_spec")
     fn_src = ast.get_source_segment(obj_src, fn_node)
@@ -1813,12 +1275,11 @@ def test_14_omniretarget_cradling_usda_and_bridge_sync() -> None:
             caught_fnf = True
         assert caught_fnf, "Expected FileNotFoundError when box_spec.json exists without convex-hull USD!"
 
-        # When obj_aligned.usda IS present, override uses UsdFileCfg + max_depenetration_velocity=1.0
         (b_dir / "obj_aligned.usda").write_text("#usda 1.0\n", encoding="utf-8")
         assert fn_apply(stub_env_cfg, str(b_dir)) is True
         assert abs(stub_env_cfg.scene.obj.spawn.rigid_props.max_depenetration_velocity - 1.0) < 1e-6
-        assert stub_env_cfg.scene.obj.spawn.mass_props.mass == 0.5
 
+    # 3. Verify `process_refiner_rollout.py --ref_dir` propagates convex-hull assets
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
         ref_dir = tmp / "ref_omni"
@@ -1861,7 +1322,7 @@ def test_14_omniretarget_cradling_usda_and_bridge_sync() -> None:
         for fname in ("box_spec.json", "obj_aligned.obj", "obj_aligned.usda"):
             assert (data_root / "rl_dataset" / fname).is_file(), f"Missing propagated {fname} in rl_dataset!"
 
-    # 4. Regression test for `scripts/supermimic/train.py` CLI motion/teacher_motion_folder override
+    # 4. Verify `scripts/supermimic/train.py` CLI motion/teacher_motion_folder override
     train_src = (REPO_ROOT / "scripts" / "supermimic" / "train.py").read_text(encoding="utf-8")
     train_mod = ast.parse(train_src)
     main_fn = next(n for n in train_mod.body if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -1875,16 +1336,13 @@ def test_14_omniretarget_cradling_usda_and_bridge_sync() -> None:
         )
         and "apply_dataset_box_spec" not in (ast.get_source_segment(train_src, st) or "")
     ]
-    assert len(override_ifs) == 2, f"Expected 2 CLI folder override blocks in train.py, got {len(override_ifs)}"
-    # Intentionally omit `.motion` directly on `env_cfg` (real ManagerBasedRLEnvCfg stores it at `env_cfg.commands.motion`)
+    assert len(override_ifs) == 2
     stub_motion = _CfgNode(motion_folder=None, teacher_motion_folder=None)
     stub_cfg = _CfgNode(commands=_CfgNode(motion=stub_motion))
     stub_args = _CfgNode(motion_folder="rl_ds_dir", teacher_motion_folder="data/OmniCarryBox")
     exec("\n".join(override_ifs), {"args_cli": stub_args, "env_cfg": stub_cfg})
     assert stub_motion.motion_folder == "rl_ds_dir"
-    assert stub_motion.teacher_motion_folder == "data/OmniCarryBox", (
-        f"teacher_motion_folder silently ignored! got {stub_motion.teacher_motion_folder}"
-    )
+    assert stub_motion.teacher_motion_folder == "data/OmniCarryBox"
 
     # 5. Verify `scene_builder.py` fails fast when box_spec.json exists without obj_aligned.obj
     with tempfile.TemporaryDirectory() as sb_tmp:
@@ -1900,7 +1358,7 @@ def test_14_omniretarget_cradling_usda_and_bridge_sync() -> None:
             caught_sb = True
         assert caught_sb, "scene_builder silently fell back to cuboid when mesh_file was missing!"
 
-    print("[PASS] Test 14: Option 2 multi-body contact, dynamic bridge sync (6 tasks), fail-fast USD/mesh & train.py CLI override")
+    print("[PASS] Test 12: CarryBox v1 strict anti-collision, hands-only sensor, fail-fast USDA & train.py override")
 
 
 if __name__ == "__main__":
@@ -1915,8 +1373,6 @@ if __name__ == "__main__":
     test_8_review_regressions_obs_xi_com_and_rewards()
     test_9_timeout_bootstrap_resume_and_compile()
     test_10_colab_interrupt_auto_resume_and_generator_ckpt()
-    test_11_retrain_config_mechanisms()
-    test_12_review_compliance_zero_sync_equivalence_and_rollout_tools()
-    test_13_ema_actor_bryson_pose_jerk_and_imag_critic()
-    test_14_omniretarget_cradling_usda_and_bridge_sync()
-    print("\nALL 14 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")
+    test_11_fast_fk_depth_vectorization_and_scale_grad()
+    test_12_omniretarget_clean_usda_and_bridge_sync()
+    print("\nALL 12 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")

@@ -14,7 +14,7 @@
 cd /content/fusion
 
 # ==================== 按需修改实验目录名 ====================
-EXP_FOLDER="CarryBox_sm_v4_full"   # 对应 outputs/<EXP_FOLDER>；若留空或不存在则自动打包 outputs 下全部日志
+EXP_FOLDER="CarryBox_sm_v1_omni_clean_full"   # 对应 outputs/<EXP_FOLDER>；若留空或不存在则自动打包 outputs 下全部日志
 # ==========================================================
 
 STAMP=$(date +%Y%m%d_%H%M%S)
@@ -103,7 +103,7 @@ ls -lh "$LOCAL_ZIP"
 
 - **命令作用**：只提取 `outputs/<EXP_FOLDER>` 下的 `events.out.tfevents.*` 与训练日志 `*.log`（跳过所有大体积模型权重），额外导出一份全量标量数据表 `tb_scalars_all.csv` 与统计摘要 `tb_scalars_summary.json`，打包成仅几百 KB ~ 几 MB 的 `.zip`，同时保存在 `/content/` 与 Google Drive。
 - **关键参数含义**：
-  - `EXP_FOLDER`：实验目录名（默认为 `"CarryBox_sm_v4_full"`；若改成其他实验名如 `"CarryBox_sm_v4_fast_verify"` 则只打包对应目录）。
+  - `EXP_FOLDER`：实验目录名（默认为 `"CarryBox_sm_v1_omni_clean_full"`；若改成其他实验名如 `"CarryBox_sm_v1_omni_clean_fast_verify"` 则只打包对应目录）。
   - `size_guidance={"scalars": 0}`：关闭 TensorBoard 默认抽样截断，100% 导出从第 0 轮到最新轮的每一个点。
 - **预期结果与下载方式**：
   1. **方式 A（Colab 网页直接下载）**：点击 Colab 左侧边栏的文件夹图标（Files）并点刷新，在 `/content/` 根目录下找到 `tb_logs_CarryBox_...zip`，右键点击 **`Download`（下载）**；
@@ -233,18 +233,32 @@ for traj_idx in range(1, n_trajs + 1):
 
     traj_s = [bridge.get_joint_state()[0].detach().cpu().numpy()]
     status = "max_steps"
-    step_limit = max_inf_steps if is_inf else (total_frames + 10)
-    for _ in range(step_limit):
-        with torch.no_grad():
-            act = policy.act_inference(obs_dict["policy"])
-        obs_dict, _, dones, timeouts, _, _ = bridge.step(act)
-        if not is_inf and bool(dones[0].item()):
-            status = "trajectory_complete" if bool(timeouts[0].item()) else "terminated_early"
-            break
-        traj_s.append(bridge.get_joint_state()[0].detach().cpu().numpy())
-        if not is_inf and len(traj_s) >= total_frames:
-            status = "trajectory_complete"
-            break
+    step_idx = 0
+    try:
+        while step_idx < (max_inf_steps if is_inf else (total_frames + 10)):
+            with torch.no_grad():
+                act = policy.act_inference(obs_dict["policy"])
+            obs_dict, _, dones, timeouts, _, _ = bridge.step(act)
+            if not is_inf:
+                if step_idx <= 1 and bool(dones[0].item()):
+                    origin = bridge.env.scene.env_origins[0]
+                    goal_pos = (bridge.motion_cmd.obj_target_pos_w[0] - origin).detach().cpu().numpy()
+                    goal_quat = bridge.motion_cmd.obj_target_quat_w[0].detach().cpu().numpy()
+                    m_id = int(bridge.motion_cmd.motion_id[0].item())
+                    total_frames = int(bridge.motion_cmd.motion.time_step_total_permotion[m_id].item())
+                    traj_s = [bridge.get_joint_state()[0].detach().cpu().numpy()]
+                    step_idx += 1
+                    continue
+                if bool(dones[0].item()):
+                    status = "trajectory_complete" if bool(timeouts[0].item()) else "terminated_early"
+                    break
+            traj_s.append(bridge.get_joint_state()[0].detach().cpu().numpy())
+            step_idx += 1
+            if not is_inf and len(traj_s) >= total_frames:
+                status = "trajectory_complete"
+                break
+    except SystemExit:
+        status = "system_exit"
 
     sub_traj = traj_s[::max(1, stride)]
     frames = []
@@ -267,9 +281,12 @@ for traj_idx in range(1, n_trajs + 1):
     fname = f"{task_name}_{stage_mode}_{model_tag}_traj{traj_idx}_{status}_{len(traj_s)}steps.mp4"
     local_mp4 = os.path.join(local_out, fname)
     drive_mp4 = os.path.join(drive_out, fname)
-    imageio.mimsave(local_mp4, frames, fps=fps_out)
-    shutil.copy2(local_mp4, drive_mp4)
-    print(f"[SAVED] ({status}, {len(traj_s)}/{total_frames} steps) -> {drive_mp4}", flush=True)
+    if frames:
+        imageio.mimsave(local_mp4, frames, fps=fps_out)
+        shutil.copy2(local_mp4, drive_mp4)
+        print(f"[SAVED] ({status}, {len(traj_s)}/{total_frames} steps) -> {drive_mp4}", flush=True)
+    else:
+        print(f"[WARN] 轨迹 {traj_idx} 未采集到有效帧，已跳过保存 ({status})", flush=True)
 
 renderer.close()
 env.close()
@@ -282,15 +299,16 @@ echo "[OK] 通用渲染脚本已就绪: /tmp/render_sugar_mp4.py"
 
 ### 2.2 第二步：执行视频生成并保存到 Google Drive（每次录制运行这一段）
 
-在 **Google Colab 终端（Bash）** 中运行（默认配置好 `model_200.pt`，换模型只需改顶部配置区）：
+在 **Google Colab 终端（Bash）** 中运行（默认指向 `model_latest.pt`，换模型只需改顶部配置区；整段由 `( ... )` 子 Shell 包裹，失败时只会打印错误而**不会导致终端 `exit / disconnect`**）：
 
 ```bash
-cd /content/fusion
+(
+cd /content/fusion || exit 1
 
 # ==================== 换模型生成视频时，修改以下配置区 ====================
 TASK_NAME="CarryBox"          # 1. 任务名: CarryBox | PushBox | KickBox | PickBottle | StandBottle | SitChair
 STAGE_MODE="refiner"          # 2. 阶段模式: refiner (Stage 1) | tracker (Stage 3) | inference (Stage 6 闭环)
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_omni_v1_full/logs/refiner/model_400.pt"  # 3. 策略 .pt 权重路径
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/logs/refiner/model_latest.pt"  # 3. 策略 .pt 权重路径（也可指定 model_200.pt / model_400.pt / model_600.pt）
 GEN_CKPT=""                   # 4. 扩散生成器 .ckpt 路径（仅 STAGE_MODE="inference" 必填，其余保持 ""）
 MOTION_DIR="data/OmniCarryBox" # 5. 参考轨迹目录（OmniRetarget 推荐用 data/OmniCarryBox；tracker 模式也可指向 .../rl_dataset）
 
@@ -299,10 +317,11 @@ INF_STEPS=700                 # 仅 inference 闭环模式使用的最大步数�
 STRIDE=2                      # 抽帧步长：2 表示 25fps（设为 1 则输出 50fps）
 # =========================================================================
 
+test -f /tmp/render_sugar_mp4.py || { echo "[ERROR] 找不到 /tmp/render_sugar_mp4.py，请先运行上方 2.1 节命令生成它！"; exit 1; }
 test -f "$CKPT_PATH" || { echo "[ERROR] 找不到权重文件: $CKPT_PATH"; exit 1; }
 test -d "/content/drive/MyDrive" || { echo "[ERROR] Google Drive 未挂载 (/content/drive/MyDrive 不存在)！"; exit 1; }
 
-# 自动提取权重文件名（如 model_200 / model_400 / refiner / tracker）建立独立目录，防止互相覆盖
+# 自动提取权重文件名（如 model_latest / model_600 / refiner / tracker）建立独立目录，防止互相覆盖
 MODEL_TAG=$(basename "$CKPT_PATH" .pt)
 DRIVE_VIDEO_DIR="/content/drive/MyDrive/SuperMimic_SUGAR_Backup/videos/${TASK_NAME}_${STAGE_MODE}_${MODEL_TAG}"
 LOCAL_VIDEO_DIR="/content/fusion/outputs/videos_preview/${TASK_NAME}_${STAGE_MODE}_${MODEL_TAG}"
@@ -311,10 +330,18 @@ OMNI_KIT_ACCEPT_EULA=YES ACCEPT_EULA=Y PRIVACY_CONSENT=Y \
 PYTHONPATH="/content/fusion:/content/fusion/source/sugar_rl:/content/fusion/source/sugar_il" \
 /content/.venv_fusion/bin/python -u /tmp/render_sugar_mp4.py \
     "$TASK_NAME" "$STAGE_MODE" "$CKPT_PATH" "$GEN_CKPT" "$MOTION_DIR" \
-    "$LOCAL_VIDEO_DIR" "$DRIVE_VIDEO_DIR" "$MODEL_TAG" "$NUM_TRAJS" "$INF_STEPS" "$STRIDE" || true
+    "$LOCAL_VIDEO_DIR" "$DRIVE_VIDEO_DIR" "$MODEL_TAG" "$NUM_TRAJS" "$INF_STEPS" "$STRIDE"
+rc=$?
+
+# 兼容 Isaac Sim 退出析构偶发返回码 139（前提是已实际生成目标 mp4），避免 `|| true` 静默吞掉真实错误
+if [ "$rc" -ne 0 ] && ! { [ "$rc" -eq 139 ] && ls "$DRIVE_VIDEO_DIR"/*.mp4 >/dev/null 2>&1; }; then
+    echo "[ERROR] 视频生成失败 (exit code=$rc)。若后台正在全量训练，请先检查 nvidia-smi 剩余显存（需约 6~8 GB 余量）。"
+    exit "$rc"
+fi
 
 echo "=== 已保存到 Google Drive 的 MP4 文件列表 ==="
 ls -lh "$DRIVE_VIDEO_DIR"/*.mp4
+)
 ```
 
 - **命令作用**：根据 `STAGE_MODE` 自动构建对应的无噪声 Isaac Sim 测试环境，加载 `CKPT_PATH` 连续回放 `NUM_TRAJS` 条轨迹，将包含机器人、物体与**半透明绿色目标位置框**的 `.mp4` 直接保存到 Google Drive 专属文件夹。
@@ -345,7 +372,7 @@ ls -lh "$DRIVE_VIDEO_DIR"/*.mp4
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="refiner"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_omni_v1_full/logs/refiner/model_400.pt"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/logs/refiner/model_400.pt"
 GEN_CKPT=""
 MOTION_DIR="data/OmniCarryBox"
 ```
@@ -354,25 +381,25 @@ MOTION_DIR="data/OmniCarryBox"
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="tracker"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_omni_v1_full/logs/tracker/model_1000.pt"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/logs/tracker/model_1000.pt"
 GEN_CKPT=""
-MOTION_DIR="/content/fusion/outputs/CarryBox_sm_omni_v1_full/rollout_datasets/refiner/rl_dataset"
+MOTION_DIR="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/rollout_datasets/refiner/rl_dataset"
 ```
 
 #### 模板 3：查看 Stage 6 最终闭环自主推理（`tracker.pt` + `generator.ckpt`）
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="inference"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_omni_v1_full/ckpts/tracker.pt"
-GEN_CKPT="/content/fusion/outputs/CarryBox_sm_omni_v1_full/ckpts/generator.ckpt"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/ckpts/tracker.pt"
+GEN_CKPT="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/ckpts/generator.ckpt"
 MOTION_DIR="data/OmniCarryBox"
 ```
 
-#### 模板 4：切换其他任务（例如 `PickBottle` 抓水瓶 Stage 1 Refiner）
+#### 模板 4：切换其他任务（例如 `PickBottle` 抓水瓶 Stage 1 Refiner，需提前准备好对应 `data/PickBottle`）
 ```bash
 TASK_NAME="PickBottle"
 STAGE_MODE="refiner"
-CKPT_PATH="/content/fusion/outputs/PickBottle_sm_v4_full/logs/refiner/model_1000.pt"
+CKPT_PATH="/content/fusion/outputs/PickBottle_sm_v1_omni_clean_full/logs/refiner/model_1000.pt"
 GEN_CKPT=""
 MOTION_DIR="data/PickBottle"
 ```

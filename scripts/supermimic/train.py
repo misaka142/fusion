@@ -1,22 +1,22 @@
 """Train SUGAR Stage 1 (Refiner) or Stage 2 (Tracker) using SuperMimic differentiable World-Model BPTT.
 
-Drop-in CLI replacement for `scripts/sugar_rl/train.py` (prepend `trainreg run --` on managed servers):
+Drop-in CLI replacement for `scripts/sugar_rl/train.py`:
 - Stage 1 Refiner:
-    trainreg run -- python scripts/supermimic/train.py \
+    python -u scripts/supermimic/train.py \
       --task Sugar-G129dof-CarryBox-Refiner \
       --num_envs 2048 \
       --log_dir outputs/CarryBox_sm/logs/refiner \
       --max_iterations 5001 \
-      --motion_folder data/CarryBox \
+      --motion_folder data/OmniCarryBox \
       --headless
 
 - Stage 2 Tracker (with frozen SuperMimic Refiner Teacher):
-    trainreg run -- python scripts/supermimic/train.py \
+    python -u scripts/supermimic/train.py \
       --task Sugar-G129dof-CarryBox-Tracker \
       --num_envs 2048 \
       --teacher_ckpt outputs/CarryBox_sm/ckpts/refiner.pt \
       --motion_folder outputs/CarryBox_sm/rollout_datasets/refiner/rl_dataset \
-      --teacher_motion_folder data/CarryBox \
+      --teacher_motion_folder data/OmniCarryBox \
       --log_dir outputs/CarryBox_sm/logs/tracker \
       --max_iterations 5001 \
       --headless
@@ -111,57 +111,16 @@ parser.add_argument(
     "--teacher_ckpt", type=str, default=None, help="Path to Stage 1 SuperMimic Refiner `.pt` checkpoint."
 )
 
-# SuperMimic algorithm hyperparameters (aligned with HybridRobotics/supermimic & A100 4096 envs)
+# SuperMimic algorithm hyperparameters (v1 baseline defaults)
 parser.add_argument("--horizon", type=int, default=32, help="Differentiable imagination rollout horizon H.")
 parser.add_argument("--wm_seq_len", type=int, default=8, help="Autoregressive world-model training sequence length k.")
-parser.add_argument("--wm_updates", type=int, default=12, help="World model gradient updates per iteration.")
+parser.add_argument("--wm_updates", type=int, default=8, help="World model gradient updates per iteration.")
 parser.add_argument("--policy_updates", type=int, default=4, help="Policy BPTT updates per iteration.")
-parser.add_argument("--wm_batch_size", type=int, default=2048, help="Minibatch size for world-model updates.")
-parser.add_argument("--policy_batch_size", type=int, default=1024, help="Batch size of 32-step imagination rollouts.")
-parser.add_argument("--replay_capacity", type=int, default=512, help="Ring replay buffer steps per environment.")
-parser.add_argument("--wm_hidden", type=str, default="1024,1024,1024", help="World model hidden widths.")
+parser.add_argument("--wm_batch_size", type=int, default=1024, help="Minibatch size for world-model updates.")
+parser.add_argument("--policy_batch_size", type=int, default=512, help="Batch size of 32-step imagination rollouts.")
+parser.add_argument("--replay_capacity", type=int, default=256, help="Ring replay buffer steps per environment.")
+parser.add_argument("--wm_hidden", type=str, default="512,512,512", help="World model hidden widths.")
 parser.add_argument("--policy_hidden", type=str, default="512,256,128", help="Policy hidden widths.")
-parser.add_argument("--collect_noise", type=float, default=0.15, help="Fixed collection action noise std (raw units).")
-parser.add_argument("--lr_final_frac", type=float, default=0.03, help="Cosine LR decay target (fraction of base LR).")
-parser.add_argument("--ema_decay", type=float, default=0.995, help="Polyak EMA decay for smooth actor weights (0 disables).")
-parser.add_argument("--no_bf16", action="store_true", default=False, help="Disable CUDA bfloat16 autocast inside MLPs.")
-parser.add_argument(
-    "--legs_absolute",
-    action="store_true",
-    default=False,
-    help="Leg joints use absolute targets while upper body stays residual on reference (default: disabled).",
-)
-parser.add_argument(
-    "--legs_residual",
-    action="store_true",
-    default=False,
-    help="Force leg joints to use reference residual bias instead of absolute targets.",
-)
-parser.add_argument(
-    "--compile_bptt",
-    action="store_true",
-    default=False,
-    help="torch.compile whole WM & imagination steps (FK + obs + WM + reward).",
-)
-parser.add_argument(
-    "--compile_mode",
-    type=str,
-    default="default",
-    choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
-    help="Inductor mode when `--compile_bptt` is enabled (`default` recommended for H=32 BPTT).",
-)
-parser.add_argument(
-    "--place_weight",
-    type=float,
-    default=None,
-    help="Override `motion_obj_pos_place` reward weight in both simulator env and imagination (0 disables).",
-)
-parser.add_argument(
-    "--feet_height_weight",
-    type=float,
-    default=None,
-    help="Override `motion_feet_height` reward weight in both simulator env and imagination (0 disables).",
-)
 parser.add_argument("--wm_lr", type=float, default=1e-3, help="World model learning rate.")
 parser.add_argument("--policy_lr", type=float, default=3e-4, help="Policy BPTT learning rate.")
 parser.add_argument("--critic_lr", type=float, default=5e-4, help="Critic learning rate.")
@@ -238,38 +197,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
             env_cfg.commands.motion.teacher_motion_folder,
         )
 
-    # Optional CLI reward overrides (automatically mirrored into imagination by `SugarEnvBridge`)
-    if hasattr(env_cfg, "rewards"):
-        from isaaclab.managers import RewardTermCfg as RewTerm
-        import sugar_rl.tasks.locomanip.mdp as mdp
-
-        if args_cli.place_weight is not None:
-            if args_cli.place_weight == 0.0:
-                env_cfg.rewards.motion_obj_pos_place = None
-            elif getattr(env_cfg.rewards, "motion_obj_pos_place", None) is not None:
-                env_cfg.rewards.motion_obj_pos_place.weight = float(args_cli.place_weight)
-            else:
-                env_cfg.rewards.motion_obj_pos_place = RewTerm(
-                    func=mdp.motion_obj_pos_place_exp,
-                    weight=float(args_cli.place_weight),
-                    params={"command_name": "motion", "std": 0.08, "window": 60},
-                )
-        if args_cli.feet_height_weight is not None:
-            if args_cli.feet_height_weight == 0.0:
-                env_cfg.rewards.motion_feet_height = None
-            elif getattr(env_cfg.rewards, "motion_feet_height", None) is not None:
-                env_cfg.rewards.motion_feet_height.weight = float(args_cli.feet_height_weight)
-            else:
-                env_cfg.rewards.motion_feet_height = RewTerm(
-                    func=mdp.motion_feet_height_error_exp,
-                    weight=float(args_cli.feet_height_weight),
-                    params={
-                        "command_name": "motion",
-                        "std": 0.06,
-                        "body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
-                    },
-                )
-
     if args_cli.log_dir is not None:
         log_dir = os.path.abspath(args_cli.log_dir)
     else:
@@ -309,7 +236,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
 
     sm_cfg = SuperMimicTrainCfg(
         replay_capacity=args_cli.replay_capacity,
-        collect_action_noise=args_cli.collect_noise,
         wm_hidden_dims=_dims(args_cli.wm_hidden),
         wm_seq_len=args_cli.wm_seq_len,
         wm_updates_per_iter=args_cli.wm_updates,
@@ -321,17 +247,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
         policy_batch_size=pol_bs,
         policy_lr=args_cli.policy_lr,
         critic_lr=args_cli.critic_lr,
-        lr_final_frac=args_cli.lr_final_frac,
-        ema_decay=args_cli.ema_decay,
-        use_bf16=not args_cli.no_bf16,
         use_ref_residual=not args_cli.no_ref_residual,
-        legs_absolute=bool(args_cli.legs_absolute and not args_cli.legs_residual),
         bc_init_coef=args_cli.bc_coef,
         bc_anneal_iters=bc_anneal_iters,
         save_interval=args_cli.save_interval,
         compile_models=args_cli.compile,
-        compile_bptt=args_cli.compile_bptt,
-        compile_mode=args_cli.compile_mode,
     )
 
     bridge = SugarEnvBridge(

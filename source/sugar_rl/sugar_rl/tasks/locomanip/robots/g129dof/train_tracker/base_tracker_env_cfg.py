@@ -371,7 +371,7 @@ class BaseRewardsCfg:
     )
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.25,
+        weight=-0.1,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"),
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
@@ -379,10 +379,10 @@ class BaseRewardsCfg:
     )
     feet_air_time = RewTerm(
         func=mdp.feet_air_time_min_penalty,
-        weight=1.5,
+        weight=5.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
-            "threshold": 0.28,
+            "threshold": 0.5,
         },
     )
     undesired_contacts : RewTerm = MISSING
@@ -395,15 +395,10 @@ class BaseRewardsCfg:
         weight=0.125,
         params={"command_name": "motion", "std": 0.6},
     )
-    motion_joint_vel = RewTerm(
-        func=mdp.motion_joint_vel_error_exp,
-        weight=0.15,
-        params={"command_name": "motion", "std": 3.0},
-    )
     motion_global_anchor_pos = RewTerm(
         func=mdp.motion_global_anchor_position_error_exp,
-        weight=0.35,
-        params={"command_name": "motion", "std": 0.18},
+        weight=0.25,
+        params={"command_name": "motion", "std": 0.3},
     )
     motion_global_anchor_ori = RewTerm(
         func=mdp.motion_global_anchor_orientation_error_exp,
@@ -433,7 +428,7 @@ class BaseRewardsCfg:
     motion_obj_pos = RewTerm(
         func=mdp.motion_global_obj_position_error_exp,
         weight=0.5,
-        params={"command_name": "motion", "std": 0.20},
+        params={"command_name": "motion", "std": 0.3},
     )
     motion_obj_ori = RewTerm(
         func=mdp.motion_global_obj_orientation_error_exp,

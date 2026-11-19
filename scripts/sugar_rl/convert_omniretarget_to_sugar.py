@@ -343,6 +343,12 @@ def main() -> None:
         default=False,
         help="Disable per-clip constant floor clearance offset on resting frames.",
     )
+    ap.add_argument(
+        "--no_posture_filter",
+        action="store_true",
+        default=False,
+        help="Disable t=0 upright torso & non-contact filtering for pick_carry_place subsets.",
+    )
     args = ap.parse_args()
 
     raw_root = Path(args.raw_dir).resolve()
@@ -366,7 +372,8 @@ def main() -> None:
             obj_xyz = q[:, 40:43]
             z0, z1, zmax = float(obj_xyz[0, 2]), float(obj_xyz[-1, 2]), float(obj_xyz[:, 2].max())
             xy_disp = float(np.linalg.norm(obj_xyz[-1, :2] - obj_xyz[0, :2]))
-            if not (z0 < 0.30 and z1 < 0.30 and (zmax - max(z0, z1)) > 0.12 and xy_disp > 0.30):
+            min_xy_disp = 0.30 if args.no_posture_filter else 0.50
+            if not (z0 < 0.30 and z1 < 0.30 and (zmax - max(z0, z1)) > 0.12 and xy_disp >= min_xy_disp):
                 continue
         selected.append(p)
 
@@ -431,9 +438,13 @@ def main() -> None:
     verts_al = np.asarray(hull_aligned.vertices, dtype=np.float64)  # (V, 3)
     lk_bfs = G1_ISAACLAB_BFS_JOINT_NAMES.index("left_knee_joint")
     rk_bfs = G1_ISAACLAB_BFS_JOINT_NAMES.index("right_knee_joint")
+    torso_raw_idx = SUGAR_RAW_35_BODY_NAMES.index("torso_link")
 
     manifest = []
     floor_shifts_mm = []
+    kept_idx = 0
+    skipped_bent = 0
+    skipped_t0_contact = 0
     for idx, src_npz in enumerate(selected):
         with np.load(src_npz) as d:
             q_in = d["qpos"].astype(np.float64)
@@ -482,7 +493,6 @@ def main() -> None:
             if z_rest_med < 0.0:
                 dz_const = -z_rest_med
                 obj_pos_al[:, 2] += dz_const
-        floor_shifts_mm.append(dz_const * 1000.0)
 
         # Exact world angular velocity via constant-R identity (`qd` / `obj_rot_al`)
         obj_lin_vel = np.gradient(obj_pos_al, DT, axis=0).astype(np.float32)
@@ -499,7 +509,18 @@ def main() -> None:
             obj_rot_al,
         )
 
-        clip_folder = out_root / f"data_{idx:03d}"
+        rot_torso0 = _quat_to_rotmat(b_quat[0:1, torso_raw_idx].astype(np.float64))[0]
+        torso_up_z0 = float(rot_torso0[2, 2])
+        if args.subset.startswith("pick_carry_place") and not args.no_posture_filter:
+            if torso_up_z0 < 0.80:
+                skipped_bent += 1
+                continue
+            if bool(contact_50[0]):
+                skipped_t0_contact += 1
+                continue
+
+        floor_shifts_mm.append(dz_const * 1000.0)
+        clip_folder = out_root / f"data_{kept_idx:03d}"
         clip_folder.mkdir(parents=True, exist_ok=True)
         np.savez(
             clip_folder / "robot_50hz.npz",
@@ -527,26 +548,31 @@ def main() -> None:
         knees_deg = np.degrees(q_bfs_50[:, [lk_bfs, rk_bfs]])
         manifest.append(
             {
-                "index": idx,
+                "index": kept_idx,
                 "folder": clip_folder.name,
                 "source": src_npz.name,
                 "frames_50hz": len(q_bfs_50),
                 "floor_z_shift_mm": round(dz_const * 1000.0, 3),
+                "t0_torso_up_z": round(torso_up_z0, 4),
             }
         )
+        kept_idx += 1
 
-        if (idx + 1) % 15 == 0 or idx == 0 or (idx + 1) == len(selected):
+        if kept_idx % 15 == 0 or kept_idx == 1 or (idx + 1) == len(selected):
             print(
-                f"  [{idx + 1:3d}/{len(selected)}] {clip_folder.name} <- {src_npz.name:34s} | "
-                f"T={len(q_bfs_50):3d} | knee={knees_deg.mean():4.1f}° | dz=+{dz_const*1000:4.2f}mm | "
-                f"contact={contact_50.mean()*100:4.1f}%"
+                f"  [{kept_idx:3d} kept | scan {idx + 1:3d}/{len(selected)}] {clip_folder.name} <- {src_npz.name:34s} | "
+                f"T={len(q_bfs_50):3d} | torso_up={torso_up_z0:.2f} | knee={knees_deg.mean():4.1f}° | dz=+{dz_const*1000:4.2f}mm"
             )
+
+    if not manifest:
+        raise RuntimeError(f"All {len(selected)} candidate clips were filtered out! Check filter thresholds.")
 
     (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print("=" * 82)
     print(
-        f"[DONE] Converted {len(selected)} clips -> `{out_root}` in {time.perf_counter() - t0:.1f}s "
-        f"(floor dz median=+{np.median(floor_shifts_mm):.2f}mm, max=+{np.max(floor_shifts_mm):.2f}mm)"
+        f"[DONE] Converted {len(manifest)} clean clips -> `{out_root}` in {time.perf_counter() - t0:.1f}s "
+        f"(filtered: bent_t0={skipped_bent}, contact_t0={skipped_t0_contact} | "
+        f"floor dz median=+{np.median(floor_shifts_mm):.2f}mm, max=+{np.max(floor_shifts_mm):.2f}mm)"
     )
     print("=" * 82)
 

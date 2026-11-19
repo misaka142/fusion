@@ -5,7 +5,7 @@
 #
 # Usage:
 #   bash train_fusion.sh <TASK_NAME> <EXP_NAME> [RL_ITERS] [NUM_ENVS] [ROLLOUT_ENVS] [IL_EPOCHS]
-#   (Optional env override: MOTION_DIR=data/OmniCarryBox bash train_fusion.sh CarryBox sm_omni_v1)
+#   (Optional env override: MOTION_DIR=data/OmniCarryBox bash train_fusion.sh CarryBox sm_v1_omni_clean)
 # =============================================================================
 set -uo pipefail
 
@@ -29,7 +29,7 @@ run_isaac_stage() {
 set -e
 
 TASK_NAME="${1:-CarryBox}"
-EXP_NAME="${2:-sm_omni_v1}"
+EXP_NAME="${2:-sm_v1_omni_clean}"
 RL_ITERS="${3:-5001}"
 NUM_ENVS="${4:-2048}"
 ROLLOUT_ENVS="${5:-1000}"

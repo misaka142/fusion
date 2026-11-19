@@ -504,67 +504,31 @@ def test_5_autonomous_generator_closed_loop_and_cli_video(tmp_path: Path) -> Non
     print(f"  -> Passed autonomous closed-loop & MP4 video export ({mp4_out.stat().st_size} bytes)!")
 
 
-def test_6_legs_absolute_ema_v4_checkpoint_sim2sim(tmp_path: Path) -> None:
+def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
     tmp_dir = tmp_path
-    print("[Test 6] Verifying v4 EMA + legs_absolute=True Tracker checkpoint seamless Sim-to-Sim standing...")
-    from sugar_rl.supermimic.trainer import make_residual_mask
-
-    # Reuse the closed-loop ankle CoM stabilizer from `_save_dummy_supermimic_tracker`, converted to v4 + legs_absolute=True
-    base_pt = _save_dummy_supermimic_tracker(
-        tmp_dir / "tracker_base_bal.pt", G1_ISAACLAB_BFS_JOINT_NAMES, closed_loop_balance=True
-    )
-    payload = torch.load(str(base_pt), weights_only=False)
-    res_mask = make_residual_mask(list(G1_ISAACLAB_BFS_JOINT_NAMES), legs_absolute=True)
-    payload["format"] = "supermimic_sugar_v4"
-    payload["policy_state_dict"]["residual_mask"] = res_mask
-    payload["raw_policy_state_dict"] = dict(payload["policy_state_dict"])
-    v4_pt = tmp_dir / "tracker_v4_legs_abs.pt"
-    torch.save(payload, str(v4_pt))
-
-    # Deliberately perturb leg reference joints in clip: with `legs_absolute=True`, legs ignore noisy leg `q_ref`
-    # and keep closed-loop CoM balance, while upper-body arms follow `q_ref`!
-    ds_dir = _create_dummy_motion_dataset(tmp_dir / "motion_v4", T=100)
-    clip_npz_p = ds_dir / "data_000" / "robot_50hz.npz"
-    with np.load(clip_npz_p) as npz_d:
-        raw_d = {k: npz_d[k].copy() for k in npz_d.files}
-    leg_indices = [i for i, n in enumerate(G1_ISAACLAB_BFS_JOINT_NAMES) if any(k in n for k in ("hip", "knee", "ankle"))]
-    upper_indices = [i for i in range(29) if i not in leg_indices]
-    raw_d["joint_pos"][1:, leg_indices] += 0.45    # huge leg ref offset that would topple `legs_absolute=False`
-    raw_d["joint_pos"][1:, upper_indices] += 0.15  # arm ref motion that upper body should still track via residual!
-    np.savez(clip_npz_p, **raw_d)
-
-    bundle = load_tracker_checkpoint(v4_pt, device="cpu")
-    assert bundle.policy.residual_mask.sum().item() == 17.0
-
-    runner = MuJoCoSim2SimRunner(
-        task_name="CarryBox",
-        tracker_ckpt=v4_pt,
-        mode="replay",
-        motion_folder=ds_dir,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    runner.reset()
-    for _ in range(80):  # 1.6s simulated closed-loop physics
-        info = runner.step()
-        assert np.isfinite(info["pelvis_z"])
-    assert 0.70 < info["pelvis_z"] < 0.80, f"v4 legs_absolute policy fell under leg ref perturbation: z={info['pelvis_z']}"
-    print(f"  -> Passed v4 EMA + legs_absolute Sim-to-Sim standing (pelvis_z={info['pelvis_z']:.3f}m)!")
-
-
-def test_7_omnicarrybox_obb_alignment_and_mtime_cache(tmp_path: Path) -> None:
-    tmp_dir = tmp_path
-    print("[Test 7] Verifying OBB-aligned OmniCarryBox mesh centering & mtime STL cache invalidation...")
+    print("[Test 6] Verifying OBB-aligned OmniCarryBox mesh centering, mtime cache, clean clips & ckpt compat...")
     import json
     import os
-    import time
     import trimesh
+    from scipy.spatial.transform import Rotation as R
+
+    # 1. Verify backward-compatible loading when a checkpoint carries an extra `residual_mask` buffer
+    base_pt = _save_dummy_supermimic_tracker(
+        tmp_dir / "tracker_compat_base.pt", G1_ISAACLAB_BFS_JOINT_NAMES, closed_loop_balance=False
+    )
+    payload = torch.load(str(base_pt), weights_only=False)
+    payload["policy_state_dict"]["residual_mask"] = torch.ones(29)
+    compat_pt = tmp_dir / "tracker_compat_extra_mask.pt"
+    torch.save(payload, str(compat_pt))
+    bundle = load_tracker_checkpoint(compat_pt, device="cpu")
+    assert bundle.joint_names == list(G1_ISAACLAB_BFS_JOINT_NAMES)
 
     ds_dir = tmp_dir / "omni_box_ds"
     ds_dir.mkdir(parents=True)
     cache_dir = tmp_dir / "scene_cache"
     cache_dir.mkdir(parents=True)
 
-    # 1. Create a small centered octahedron/box mesh & write v1 STL cache
+    # 2. Create a small centered mesh & write v1 STL cache
     mesh_v1 = trimesh.creation.box(extents=(0.30, 0.30, 0.30))
     mesh_v1.export(str(ds_dir / "obj_aligned.obj"))
     (ds_dir / "box_spec.json").write_text(
@@ -579,17 +543,17 @@ def test_7_omnicarrybox_obb_alignment_and_mtime_cache(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    xml1, _, rep1 = build_mujoco_scene_xml(
+    xml1, _, _ = build_mujoco_scene_xml(
         task_name="CarryBox",
         output_xml_path=cache_dir / "scene1.xml",
         motion_folder=ds_dir,
     )
     stl_cached = cache_dir / "meshes" / "small_box_test_obb_mtime.stl"
     assert stl_cached.is_file()
-    m1 = mujoco.MjModel.from_xml_path(str(xml1))
+    _ = mujoco.MjModel.from_xml_path(str(xml1))
     sz1 = trimesh.load(str(stl_cached), force="mesh").extents
 
-    # 2. Update obj_aligned.obj with larger size & bump mtime -> cache MUST rebuild automatically!
+    # 3. Update obj_aligned.obj with larger size & bump mtime -> cache MUST rebuild automatically!
     mesh_v2 = trimesh.creation.box(extents=(0.40, 0.42, 0.38))
     mesh_v2.export(str(ds_dir / "obj_aligned.obj"))
     future_t = stl_cached.stat().st_mtime + 5.0
@@ -606,7 +570,7 @@ def test_7_omnicarrybox_obb_alignment_and_mtime_cache(tmp_path: Path) -> None:
         f"STL cache failed to refresh on mtime update: sz1={sz1}, sz2={sz2}"
     )
 
-    # 3. Also verify real data/OmniCarryBox if present locally
+    # 4. Verify real cleaned data/OmniCarryBox if present locally
     real_omni = FUSION_ROOT / "data" / "OmniCarryBox"
     if (real_omni / "box_spec.json").is_file() and (real_omni / "obj_aligned.obj").is_file():
         m_real = trimesh.load(str(real_omni / "obj_aligned.obj"), force="mesh", process=False)
@@ -619,8 +583,17 @@ def test_7_omnicarrybox_obb_alignment_and_mtime_cache(tmp_path: Path) -> None:
         )
         m_mj = mujoco.MjModel.from_xml_path(str(xml_r))
         assert m_mj.nq == 43
+        clips = sorted(real_omni.glob("data_*"))
+        assert len(clips) >= 40, f"Too few cleaned OmniCarryBox clips: {len(clips)}"
+        for c in clips:
+            r = np.load(c / "robot_50hz.npz")
+            cl = np.load(c / "contact_labels_50hz.npy")
+            tq = r["body_quat_w"][0, 10]
+            up_z = float(R.from_quat([tq[1], tq[2], tq[3], tq[0]]).as_matrix()[2, 2])
+            assert up_z >= 0.80, f"{c.name} has bent t=0 start: torso_up_z={up_z:.3f}"
+            assert not bool(cl[0]), f"{c.name} has t=0 contact=True!"
 
-    print("  -> Passed OBB mesh centering & mtime STL cache invalidation!")
+    print("  -> Passed OBB centering, mtime cache, clean OmniCarryBox & checkpoint compat checks!")
 
 
 def main() -> None:
@@ -631,9 +604,8 @@ def main() -> None:
         test_3_observation_isomorphism_with_sugar_hoi_task(tmp_dir)
         test_4_pd_standing_stability_and_replay(tmp_dir)
         test_5_autonomous_generator_closed_loop_and_cli_video(tmp_dir)
-        test_6_legs_absolute_ema_v4_checkpoint_sim2sim(tmp_dir)
-        test_7_omnicarrybox_obb_alignment_and_mtime_cache(tmp_dir)
-    print("\nALL 7 MUJOCO SIM-TO-SIM END-TO-END TESTS PASSED SUCCESSFULLY!")
+        test_6_omnicarrybox_obb_alignment_and_compat(tmp_dir)
+    print("\nALL 6 MUJOCO SIM-TO-SIM END-TO-END TESTS PASSED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":

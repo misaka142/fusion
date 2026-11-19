@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import shutil
+import subprocess
 import urllib.request
 import zipfile
 
@@ -24,10 +25,19 @@ FILES_TO_FETCH = (
 )
 
 
-def _download_file(url: str, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + ".tmp")
-    print(f"[Download] {url} -> {dst}", flush=True)
+def _download_with_curl(curl_bin: str, url: str, tmp: Path) -> None:
+    base_cmd = [curl_bin, "-L", "--fail", "--retry", "3", "--retry-delay", "2", "--progress-bar"]
+    cmd = [*base_cmd, "-C", "-", "-o", str(tmp), url] if tmp.is_file() else [*base_cmd, "-o", str(tmp), url]
+    rc = subprocess.run(cmd).returncode
+    if rc != 0 and tmp.is_file():
+        # Retry cleanly once without `-C -` in case a partial `.tmp` caused HTTP 416 or range mismatch.
+        tmp.unlink(missing_ok=True)
+        rc = subprocess.run([*base_cmd, "-o", str(tmp), url]).returncode
+    if rc != 0:
+        raise RuntimeError(f"curl download failed (exit code {rc}): {url}")
+
+
+def _download_with_urllib(url: str, tmp: Path) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as f:
         total = int(resp.headers.get("Content-Length") or 0)
@@ -42,7 +52,28 @@ def _download_file(url: str, dst: Path) -> None:
             if total > 0 and done >= next_report:
                 print(f"  ... {done / (1024**2):.1f} / {total / (1024**2):.1f} MB ({100.0 * done / total:.0f}%)", flush=True)
                 next_report += 25 * 1024 * 1024
-    shutil.move(str(tmp), str(dst))
+    if total > 0 and done != total:
+        raise RuntimeError(f"Incomplete download ({done}/{total} bytes): {url}")
+
+
+def _download_file(url: str, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    print(f"[Download] {url} -> {dst}", flush=True)
+    curl_bin = shutil.which("curl")
+    try:
+        if curl_bin:
+            _download_with_curl(curl_bin, url, tmp)
+        else:
+            _download_with_urllib(url, tmp)
+        if not tmp.is_file() or tmp.stat().st_size == 0:
+            raise RuntimeError(f"Downloaded file is empty: {url}")
+        if dst.suffix.lower() == ".zip" and not zipfile.is_zipfile(tmp):
+            raise RuntimeError(f"Downloaded file is not a valid zip archive: {url}")
+        shutil.move(str(tmp), str(dst))
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def main() -> None:
@@ -69,6 +100,9 @@ def main() -> None:
         print(f"[Skip] Found existing extracted trajectories in {npz_dir}")
     else:
         zip_cached = cache_root / "robot-object.zip"
+        if zip_cached.is_file() and not zipfile.is_zipfile(zip_cached):
+            print(f"[Warn] Removing corrupted cached zip: {zip_cached}", flush=True)
+            zip_cached.unlink()
         if not zip_cached.is_file():
             _download_file(f"{HF_BASE_URL}/robot-object.zip", zip_cached)
         else:

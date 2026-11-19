@@ -35,23 +35,6 @@ from .base_refiner_env_cfg import BaseRobotSceneCfg, BaseCommandsCfg, BaseAction
 @configclass
 class RobotSceneCfg(BaseRobotSceneCfg):
     obj: RigidObjectCfg = SMALLBOX_CFG.replace(prim_path="{ENV_REGEX_NS}/Obj")
-    # Option 2 (Whole-Body Cradling): include rubber hands + wrists + forearms as valid carry-support links
-    left_hand_forces = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/left_(rubber_hand|wrist_.*_link|elbow_link)",
-        history_length=3,
-        track_air_time=True,
-        force_threshold=0.1,
-        debug_vis=False,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"],
-    )
-    right_hand_forces = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/right_(rubber_hand|wrist_.*_link|elbow_link)",
-        history_length=3,
-        track_air_time=True,
-        force_threshold=0.1,
-        debug_vis=False,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obj"],
-    )
 
 @configclass
 class CommandsCfg(BaseCommandsCfg):
@@ -102,18 +85,15 @@ class EventCfg(BaseEventCfg):
 class RewardsCfg(BaseRewardsCfg):
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-0.2,
+        weight=-1.0,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_forces",
                 body_names=[
-                    "pelvis.*",
-                    ".*_hip_.*_link",
-                    ".*_knee_link",
-                    ".*_ankle_pitch_link",
+                    r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$)(?!left_wrist_.*_link$)(?!right_wrist_.*_link$).+$"
                 ],
             ),
-            "threshold": 5.0,
+            "threshold": 0.1,
         },
     )
     hoi_contact = RewTerm(
@@ -128,22 +108,6 @@ class RewardsCfg(BaseRewardsCfg):
             ),
             "command_name": "motion",
             "threshold": 0.1,
-        },
-    )
-    # Fine placement precision (std 8 cm) activated 60 frames (1.2 s) before release so the last steps align on target.
-    motion_obj_pos_place = RewTerm(
-        func=mdp.motion_obj_pos_place_exp,
-        weight=1.5,
-        params={"command_name": "motion", "std": 0.08, "window": 60},
-    )
-    # Ankle vertical swing clearance tracking (consistent across simulator env and SuperMimic imagination).
-    motion_feet_height = RewTerm(
-        func=mdp.motion_feet_height_error_exp,
-        weight=0.50,
-        params={
-            "command_name": "motion",
-            "std": 0.06,
-            "body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
         },
     )
 

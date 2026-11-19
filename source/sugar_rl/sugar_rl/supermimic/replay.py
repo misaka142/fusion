@@ -29,7 +29,6 @@ class WMSequenceBatch:
     next_states: Tensor         # (B, k, 84)
     contacts: Tensor            # (B, k, 5) float in [0, 1]
     xi: Tensor                  # (B, 37)
-    mask: Tensor                # (B, k) float in {0.0, 1.0} marking unbroken prefix steps
 
 
 @dataclass
@@ -133,65 +132,62 @@ class HOIReplayBuffer:
 
     @torch.no_grad()
     def sample_wm_sequences(self, batch_size: int, seq_len: int = 8) -> WMSequenceBatch | None:
-        """Sample contiguous transitions without episode resets, push discontinuities, or host-GPU syncs.
+        """Sample contiguous transitions without episode resets or push discontinuities.
 
-        Uses oversampled candidate scoring (`topk`) on GPU instead of data-dependent `nonzero()`,
-        preferring full `eff_k` unbroken windows and masking any trailing post-reset/push steps.
+        If no full `seq_len` unbroken window exists yet, safely shrinks window length `eff_k >= 1`
+        rather than ever sampling across reset/push boundaries; returns `None` if zero valid steps exist.
         """
         if self.size < 1:
             return None
 
         chrono = self._chronological_indices()                  # (S,)
-        eff_k = min(seq_len, self.size)
-        num_starts = self.size - eff_k + 1
+        ep_chrono = self.ep_ids[chrono]                         # (S, N)
+        vt_chrono = self.valid_transitions[chrono]              # (S, N)
 
-        # Oversample candidates on GPU so full unbroken windows are selected with zero host sync
-        cand_n = max(batch_size * 6, 256)
-        cand_pos = torch.randint(0, num_starts, (cand_n,), device=self.device)
-        cand_env = torch.randint(0, self.num_envs, (cand_n,), device=self.device)
+        max_k = min(seq_len, self.size)
+        valid_pairs: Tensor | None = None
+        eff_k = max_k
+
+        for cand_k in range(max_k, 0, -1):
+            num_starts = self.size - cand_k + 1
+            ep_first = ep_chrono[:num_starts]
+            valid = (ep_first >= 0) & vt_chrono[:num_starts]
+            for offset in range(1, cand_k):
+                valid = (
+                    valid
+                    & vt_chrono[offset : offset + num_starts]
+                    & (ep_chrono[offset : offset + num_starts] == ep_first)
+                )
+            pairs = valid.nonzero(as_tuple=False)
+            if pairs.shape[0] > 0:
+                valid_pairs = pairs
+                eff_k = cand_k
+                break
+
+        if valid_pairs is None or valid_pairs.shape[0] == 0:
+            return None
+
+        pick = torch.randint(0, valid_pairs.shape[0], (batch_size,), device=self.device)
+        chosen = valid_pairs[pick]
+        start_pos = chosen[:, 0]                                # (B,)
+        env_ids = chosen[:, 1]                                  # (B,)
 
         offsets = torch.arange(eff_k, device=self.device, dtype=torch.long).unsqueeze(0)  # (1, eff_k)
-        cand_ring = chrono[cand_pos.unsqueeze(1) + offsets]     # (cand_n, eff_k)
-        cand_env_exp = cand_env.unsqueeze(1).expand(-1, eff_k)  # (cand_n, eff_k)
-
-        ep = self.ep_ids[cand_ring, cand_env_exp]
-        vt = self.valid_transitions[cand_ring, cand_env_exp]
-        same_ep = (ep == ep[:, :1]) & (ep[:, :1] >= 0)
-        step_ok = (vt & same_ep).to(torch.int32).cumprod(dim=1).bool()  # (cand_n, eff_k)
-
-        # Full unbroken windows score in [eff_k, eff_k + 0.5), strictly above any shorter prefix
-        scores = step_ok.float().sum(dim=1) + 0.5 * torch.rand(cand_n, device=self.device)
-        top_idx = torch.topk(scores, k=batch_size, largest=True, sorted=False).indices
-
-        ring_idx = cand_ring[top_idx]                           # (B, eff_k)
-        env_ids = cand_env[top_idx]                             # (B,)
+        ring_idx = chrono[start_pos.unsqueeze(1) + offsets]     # (B, eff_k)
         env_exp = env_ids.unsqueeze(1).expand(-1, eff_k)        # (B, eff_k)
-        chosen_ok = step_ok[top_idx]                            # (B, eff_k)
 
         s_init = self.states[ring_idx[:, 0], env_ids]
-        raw_actions = self.actions[ring_idx, env_exp]
-        raw_next_states = self.next_states[ring_idx, env_exp]
-        raw_contacts = self.contacts[ring_idx, env_exp].float()
+        actions = self.actions[ring_idx, env_exp]
+        next_states = self.next_states[ring_idx, env_exp]
+        contacts = self.contacts[ring_idx, env_exp].float()
         xi = self.env_xi[env_ids]
-
-        # Clamp any masked post-break tail slots to the last clean state so broken/pushed values never leak
-        clean_next = torch.empty_like(raw_next_states)
-        prev_clean = s_init
-        for t in range(eff_k):
-            ok_t = chosen_ok[:, t : t + 1]
-            prev_clean = torch.where(ok_t, raw_next_states[:, t], prev_clean)
-            clean_next[:, t] = prev_clean
-
-        actions = torch.where(chosen_ok.unsqueeze(-1), raw_actions, torch.zeros_like(raw_actions))
-        contacts = torch.where(chosen_ok.unsqueeze(-1), raw_contacts, torch.zeros_like(raw_contacts))
 
         return WMSequenceBatch(
             s_init=s_init,
             actions=actions,
-            next_states=clean_next,
+            next_states=next_states,
             contacts=contacts,
             xi=xi,
-            mask=chosen_ok.float(),
         )
 
     @torch.no_grad()

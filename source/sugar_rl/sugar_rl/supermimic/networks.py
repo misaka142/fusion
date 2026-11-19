@@ -37,38 +37,26 @@ class RunningMeanStd(nn.Module):
         self.register_buffer("count", torch.tensor(1e-4, dtype=torch.float64))
 
     @torch.no_grad()
-    def update(self, x: Tensor, mask: Tensor | None = None) -> None:
+    def update(self, x: Tensor) -> None:
         flat = x.detach().reshape(-1, self.mean.shape[-1]).float()
         if flat.shape[0] < 2:
             return
-        if mask is None:
-            batch_mean = flat.mean(dim=0)
-            batch_var = flat.var(dim=0, unbiased=False)
-            batch_count = torch.tensor(float(flat.shape[0]), dtype=torch.float64, device=flat.device)
-            active = torch.ones((), dtype=torch.bool, device=flat.device)
-        else:
-            w = mask.detach().reshape(-1, 1).float().clamp(0.0, 1.0)
-            w_sum = w.sum()
-            active = w_sum >= 2.0
-            denom = w_sum.clamp_min(1.0)
-            batch_mean = (flat * w).sum(dim=0) / denom
-            batch_var = (((flat - batch_mean) ** 2) * w).sum(dim=0) / denom
-            batch_count = w_sum.to(torch.float64)
+        batch_mean = flat.mean(dim=0)
+        batch_var = flat.var(dim=0, unbiased=False)
+        batch_count = float(flat.shape[0])
 
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
-        safe_tot = tot_count.float().clamp_min(1e-6)
-        bc_f = batch_count.float()
 
-        new_mean = self.mean + delta * (bc_f / safe_tot)
+        new_mean = self.mean + delta * (batch_count / tot_count.float())
         m_a = self.var * self.count.float()
-        m_b = batch_var * bc_f
-        m2 = m_a + m_b + (delta * delta) * (self.count.float() * bc_f / safe_tot)
-        new_var = (m2 / safe_tot).clamp_min(1e-6)
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + (delta * delta) * (self.count.float() * batch_count / tot_count.float())
+        new_var = (m2 / tot_count.float()).clamp_min(1e-6)
 
-        self.mean.copy_(torch.where(active, new_mean, self.mean))
-        self.var.copy_(torch.where(active, new_var, self.var))
-        self.count.copy_(torch.where(active, tot_count, self.count))
+        self.mean.copy_(new_mean)
+        self.var.copy_(new_var)
+        self.count.copy_(tot_count)
 
     def forward(self, x: Tensor) -> Tensor:
         std = torch.sqrt(self.var + self.eps)
@@ -107,16 +95,12 @@ class JointWorldModel(nn.Module):
         xi_dim: int = XI_DIM,
         delta_dim: int = DELTA_DIM,
         contact_dim: int = CONTACT_DIM,
-        hidden_dims: Sequence[int] = (1024, 1024, 1024),
-        use_bf16: bool = False,
+        hidden_dims: Sequence[int] = (512, 512, 512),
     ) -> None:
         super().__init__()
         self.in_dim = state_feat_dim + action_dim * 2 + xi_dim
-        self.use_bf16 = bool(use_bf16)
         self.feat_rms = RunningMeanStd(state_feat_dim)
         self.xi_rms = RunningMeanStd(xi_dim)
-        # Output normalizer: the head predicts the delta in units of the true one-step delta std (allmimic `out_norm`)
-        self.delta_rms = RunningMeanStd(delta_dim)
 
         self.trunk = _build_mlp(self.in_dim, hidden_dims, out_dim=None)
         last_h = hidden_dims[-1]
@@ -131,12 +115,6 @@ class JointWorldModel(nn.Module):
         self._core_fn = self._core_forward
 
     def _core_forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        if self.use_bf16 and x.is_cuda:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                h = self.trunk(x)
-                d_n = self.delta_head(h)
-                c_l = self.contact_head(h)
-            return d_n.float(), c_l.float()
         h = self.trunk(x)
         return self.delta_head(h), self.contact_head(h)
 
@@ -144,14 +122,6 @@ class JointWorldModel(nn.Module):
         """Compile inner tensor MLP + dual heads without wrapping outer `nn.Module` state_dict keys."""
         if hasattr(torch, "compile"):
             self._core_fn = torch.compile(self._core_forward, **compile_kwargs)
-
-    def delta_std(self, floor: float = 1e-4) -> Tensor:
-        """Per-dim std of the true one-step delta (also the WM loss normalizer)."""
-        return self.delta_rms.var.sqrt().clamp_min(floor)
-
-    @torch.no_grad()
-    def update_delta_stats(self, true_delta: Tensor, mask: Tensor | None = None) -> None:
-        self.delta_rms.update(true_delta, mask=mask)
 
     def forward_delta(
         self,
@@ -167,8 +137,7 @@ class JointWorldModel(nn.Module):
         f_norm = self.feat_rms(state_feat)
         xi_norm = self.xi_rms(xi)
         x = torch.cat([f_norm, raw_action.clamp(-10.0, 10.0), pd_error.clamp(-5.0, 5.0), xi_norm], dim=-1)
-        delta_n, contact_logits = self._core_fn(x)
-        return delta_n * self.delta_std() + self.delta_rms.mean, contact_logits
+        return self._core_fn(x)
 
     def step(
         self,
@@ -210,8 +179,6 @@ class SuperMimicPolicy(nn.Module):
         min_std: float = 0.02,
         max_std: float = 1.0,
         action_limit: float = 8.0,
-        residual_mask: Tensor | None = None,
-        use_bf16: bool = False,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
@@ -221,7 +188,6 @@ class SuperMimicPolicy(nn.Module):
         self.min_std = min_std
         self.max_std = max_std
         self.action_limit = action_limit
-        self.use_bf16 = bool(use_bf16)
 
         self.obs_rms = RunningMeanStd(obs_dim)
         self.backbone = _build_mlp(obs_dim, hidden_dims, out_dim=action_dim, out_gain=0.01)
@@ -235,20 +201,10 @@ class SuperMimicPolicy(nn.Module):
             action_scale = torch.ones(action_dim, dtype=torch.float32)
         self.register_buffer("default_joint_pos", default_joint_pos.clone().float())
         self.register_buffer("action_scale", action_scale.clone().float())
-        # 1 = residual on the reference joint target, 0 = absolute action around the default pose
-        # (allmimic #20: legs absolute, upper body residual)
-        if residual_mask is None:
-            residual_mask = torch.ones(action_dim, dtype=torch.float32)
-        self.register_buffer("residual_mask", residual_mask.clone().float())
         self._core_fn = self._core_forward
 
     def _core_forward(self, obs_n: Tensor) -> Tensor:
-        if self.use_bf16 and obs_n.is_cuda:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                residual = self.backbone(obs_n)
-            residual = residual.float()
-        else:
-            residual = self.backbone(obs_n)
+        residual = self.backbone(obs_n)
         return self.action_limit * torch.tanh(residual / self.action_limit)
 
     def enable_compile(self, **compile_kwargs) -> None:
@@ -273,7 +229,7 @@ class SuperMimicPolicy(nn.Module):
             # In both PrivilegedCfg and TrackerCfg/Inference, obs_raw[:, 0:29] is current ref_joint_pos!
             q_ref = obs_raw[..., 0 : self.action_dim]
             ref_bias = (q_ref - self.default_joint_pos) / self.action_scale.clamp_min(1e-6)
-            return ref_bias * self.residual_mask + residual
+            return ref_bias + residual
         return residual
 
     def act(
@@ -301,12 +257,10 @@ class SuperMimicCritic(nn.Module):
         obs_dim: int = PRIVILEGED_OBS_DIM,
         hidden_dims: Sequence[int] = (512, 256, 128),
         num_heads: int = 2,
-        use_bf16: bool = False,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
         self.num_heads = num_heads
-        self.use_bf16 = bool(use_bf16)
         self.obs_rms = RunningMeanStd(obs_dim)
         self.heads = nn.ModuleList(
             [_build_mlp(obs_dim, hidden_dims, out_dim=1, out_gain=1.0) for _ in range(num_heads)]
@@ -314,11 +268,6 @@ class SuperMimicCritic(nn.Module):
         self._core_fn = self._core_forward
 
     def _core_forward(self, obs_n: Tensor) -> Tensor:
-        if self.use_bf16 and obs_n.is_cuda:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                preds = [head(obs_n).squeeze(-1) for head in self.heads]
-                out = torch.stack(preds, dim=0)
-            return out.float()
         preds = [head(obs_n).squeeze(-1) for head in self.heads]
         return torch.stack(preds, dim=0)
 
