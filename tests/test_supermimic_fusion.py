@@ -1323,7 +1323,19 @@ def test_12_omniretarget_clean_usda_and_bridge_sync() -> None:
         for fname in ("box_spec.json", "obj_aligned.obj", "obj_aligned.usda"):
             assert (data_root / "rl_dataset" / fname).is_file(), f"Missing propagated {fname} in rl_dataset!"
 
-    # 4. Verify `scripts/supermimic/train.py` CLI motion/teacher_motion_folder override
+    # 4. Verify `scripts/supermimic/train.py` & `play.py` CLI overrides + PhysX scaling for >4096 envs
+    from sugar_rl.supermimic.env_bridge import scale_physx_cfg_for_num_envs
+
+    physx_small = _CfgNode(gpu_max_rigid_patch_count=10 * 2**15, gpu_max_rigid_contact_count=2**23)
+    cfg_4096 = _CfgNode(scene=_CfgNode(num_envs=4096), sim=_CfgNode(physx=physx_small))
+    scale_physx_cfg_for_num_envs(cfg_4096)
+    assert physx_small.gpu_max_rigid_patch_count == 10 * 2**15
+
+    physx_big = _CfgNode(gpu_max_rigid_patch_count=10 * 2**15, gpu_max_rigid_contact_count=2**23)
+    cfg_8192 = _CfgNode(scene=_CfgNode(num_envs=8192), sim=_CfgNode(physx=physx_big))
+    scale_physx_cfg_for_num_envs(cfg_8192)
+    assert physx_big.gpu_max_rigid_patch_count == 20 * 2**15
+
     train_src = (REPO_ROOT / "scripts" / "supermimic" / "train.py").read_text(encoding="utf-8")
     train_mod = ast.parse(train_src)
     main_fn = next(n for n in train_mod.body if isinstance(n, ast.FunctionDef) and n.name == "main")

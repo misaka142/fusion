@@ -90,6 +90,24 @@ def _resolve_undesired_body_ids(
     return [i for i, n in enumerate(cf_names) if n not in allowed]
 
 
+def scale_physx_cfg_for_num_envs(env_cfg: Any) -> None:
+    """Scale PhysX GPU collision buffer capacities proportionally when `num_envs > 4096`."""
+    num_envs = int(getattr(getattr(env_cfg, "scene", None), "num_envs", 0))
+    physx = getattr(getattr(env_cfg, "sim", None), "physx", None)
+    if num_envs > 4096 and physx is not None:
+        scale = (num_envs + 4095) // 4096
+        cur_patch = int(getattr(physx, "gpu_max_rigid_patch_count", 10 * 2**15))
+        physx.gpu_max_rigid_patch_count = max(cur_patch, scale * 10 * 2**15)
+        cur_contact = int(getattr(physx, "gpu_max_rigid_contact_count", 2**23))
+        physx.gpu_max_rigid_contact_count = max(cur_contact, scale * 2**22)
+        if hasattr(physx, "gpu_found_lost_pairs_capacity"):
+            cur_fl = int(getattr(physx, "gpu_found_lost_pairs_capacity", 2**21))
+            physx.gpu_found_lost_pairs_capacity = max(cur_fl, scale * 2**20)
+        if hasattr(physx, "gpu_total_aggregate_pairs_capacity"):
+            cur_agg = int(getattr(physx, "gpu_total_aggregate_pairs_capacity", 2**21))
+            physx.gpu_total_aggregate_pairs_capacity = max(cur_agg, scale * 2**20)
+
+
 def assert_privileged_obs_aligned(
     obs_analytic: Tensor,
     obs_sim: Tensor,

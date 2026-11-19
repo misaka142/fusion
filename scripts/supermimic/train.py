@@ -162,7 +162,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import sugar_rl.tasks  # noqa: F401
-from sugar_rl.supermimic.env_bridge import SugarEnvBridge
+from sugar_rl.supermimic.env_bridge import SugarEnvBridge, scale_physx_cfg_for_num_envs
 from sugar_rl.supermimic.trainer import SuperMimicTrainCfg, SuperMimicTrainer
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -174,6 +174,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
     torch.manual_seed(args_cli.seed)
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
+    scale_physx_cfg_for_num_envs(env_cfg)
     env_cfg.seed = args_cli.seed
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device

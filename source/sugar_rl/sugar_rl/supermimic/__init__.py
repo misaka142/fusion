@@ -1,6 +1,6 @@
 """SuperMimic differentiable world-model BPTT package fused into SUGAR."""
 
-from .env_bridge import SugarEnvBridge, assert_privileged_obs_aligned
+from .env_bridge import SugarEnvBridge, assert_privileged_obs_aligned, scale_physx_cfg_for_num_envs
 from .hoi_task import (
     CONTACT_DIM,
     DELTA_DIM,
@@ -66,4 +66,5 @@ __all__ = [
     "assert_privileged_obs_aligned",
     "load_supermimic_policy",
     "resolve_task_profile",
+    "scale_physx_cfg_for_num_envs",
 ]

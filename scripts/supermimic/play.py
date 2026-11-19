@@ -55,6 +55,7 @@ from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
 import sugar_rl.tasks  # noqa: F401
+from sugar_rl.supermimic.env_bridge import scale_physx_cfg_for_num_envs
 from sugar_rl.supermimic.trainer import load_supermimic_policy
 from sugar_rl.utils.parser_cfg import parse_env_cfg
 
@@ -73,6 +74,7 @@ def main() -> None:
         use_fabric=not args_cli.disable_fabric,
         entry_point_key="play_env_cfg_entry_point",
     )
+    scale_physx_cfg_for_num_envs(env_cfg)
 
     if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "motion"):
         m_cfg = env_cfg.commands.motion
