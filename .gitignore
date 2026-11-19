@@ -79,6 +79,7 @@ data
 data_kin_fixed
 data_omniretarget*
 data_lafan1*
+data_diplo*
 outputs
 demo_ckpts
 .venv*

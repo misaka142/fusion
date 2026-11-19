@@ -55,6 +55,37 @@ def com_to_ankle_margin(
     return np.linalg.norm(com_xy - closest, axis=-1)
 
 
+def build_bfs_sagittal_mirror_map(joint_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Build exact sagittal-plane (`y -> -y`) joint permutation and sign arrays for 29-DoF G1."""
+    perm = []
+    signs = []
+    for jn in joint_names:
+        if jn.startswith("left_"):
+            partner = "right_" + jn[5:]
+        elif jn.startswith("right_"):
+            partner = "left_" + jn[6:]
+        else:
+            partner = jn
+        perm.append(joint_names.index(partner))
+        is_pitch_like = any(k in jn for k in ("pitch", "knee", "elbow"))
+        signs.append(1.0 if is_pitch_like else -1.0)
+    return np.array(perm, dtype=np.int64), np.array(signs, dtype=np.float64)
+
+
+def mirror_sagittal_pose_Arrays(
+    pos_w: np.ndarray,
+    quat_wxyz: np.ndarray,
+    q_bfs: np.ndarray,
+    perm: np.ndarray,
+    signs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reflect root pose and 29-DoF joint angles across the XZ sagittal plane (`y -> -y`)."""
+    pos_m = pos_w * np.array([1.0, -1.0, 1.0], dtype=pos_w.dtype)
+    quat_m = quat_wxyz * np.array([1.0, -1.0, 1.0, -1.0], dtype=quat_wxyz.dtype)
+    q_m = q_bfs[..., perm] * signs.astype(q_bfs.dtype)
+    return pos_m, quat_m, q_m
+
+
 def _quat_to_rotmat_np(q: np.ndarray) -> np.ndarray:
     q = q / np.clip(np.linalg.norm(q, axis=-1, keepdims=True), 1e-12, None)
     w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
@@ -190,6 +221,8 @@ def load_lafan_walk_segments(
     arm_smooth_window: int = 19,
     max_arm_vel: float = 4.5,
     max_arm_acc: float = 40.0,
+    only_stand_buffer: bool = False,
+    include_mirrored: bool = True,
 ) -> list[LafanWalkSegment]:
     """Load LAFAN1 G1 `walk*.csv`, suppress upper-body IK jitter, and extract clean straight walks."""
     g1_dir = lafan_dir / "g1"
@@ -205,6 +238,7 @@ def load_lafan_walk_segments(
     lh_idx = body_names.index("left_rubber_hand")
     rh_idx = body_names.index("right_rubber_hand")
     arm_idxs = [i for i, n in enumerate(fk_35.env_joint_names) if any(k in n for k in ("shoulder", "elbow", "wrist"))]
+    mir_perm, mir_signs = build_bfs_sagittal_mirror_map(list(fk_35.env_joint_names))
 
     segments: list[LafanWalkSegment] = []
     for csv_path in csv_files:
@@ -212,128 +246,137 @@ def load_lafan_walk_segments(
         if arr.ndim != 2 or arr.shape[1] != 36 or len(arr) < 120:
             continue
 
-        pos_50 = resample_catmull_rom_fn(arr[:, 0:3], 30.0, 50.0)
+        pos_50_base = resample_catmull_rom_fn(arr[:, 0:3], 30.0, 50.0)
         quat_wxyz_30 = arr[:, [6, 3, 4, 5]]  # QX, QY, QZ, QW -> W, X, Y, Z
-        quat_50 = resample_quat_slerp_fn(quat_wxyz_30, 30.0, 50.0)
-        q_bfs_50 = resample_catmull_rom_fn(arr[:, 7:36][:, sdk_for_bfs], 30.0, 50.0)
+        quat_50_base = resample_quat_slerp_fn(quat_wxyz_30, 30.0, 50.0)
+        q_bfs_50_base = resample_catmull_rom_fn(arr[:, 7:36][:, sdk_for_bfs], 30.0, 50.0)
 
         # Suppress high-frequency mocap/IK wrist & arm chatter while keeping legs untouched
         if arm_idxs and arm_smooth_window >= 3:
-            q_bfs_50[:, arm_idxs] = _smooth_savgol_np(q_bfs_50[:, arm_idxs], window=arm_smooth_window, polyorder=2)
+            q_bfs_50_base[:, arm_idxs] = _smooth_savgol_np(q_bfs_50_base[:, arm_idxs], window=arm_smooth_window, polyorder=2)
 
-        lin_vel = np.gradient(pos_50, dt, axis=0)
-        ang_vel = ang_vel_fn(quat_50, dt)
-        qd_bfs = np.gradient(q_bfs_50, dt, axis=0)
-        arm_vel = np.abs(np.diff(q_bfs_50[:, arm_idxs], axis=0) / dt).max(axis=1) if arm_idxs else np.zeros(len(pos_50) - 1)
-        arm_acc = np.abs(np.diff(q_bfs_50[:, arm_idxs], n=2, axis=0) / (dt * dt)).max(axis=1) if arm_idxs else np.zeros(len(pos_50) - 2)
+        variants = [(csv_path.name, pos_50_base, quat_50_base, q_bfs_50_base)]
+        if include_mirrored:
+            p_m, q_m, j_m = mirror_sagittal_pose_Arrays(pos_50_base, quat_50_base, q_bfs_50_base, mir_perm, mir_signs)
+            variants.append((f"{csv_path.stem}__mirror.csv", p_m, q_m, j_m))
 
-        with torch.no_grad():
-            fk_res = fk_35(
-                torch.from_numpy(pos_50.astype(np.float32)),
-                torch.from_numpy(quat_50.astype(np.float32)),
-                torch.from_numpy(q_bfs_50.astype(np.float32)),
-            )
-        bpos = fk_res.tracked_pos_w.numpy().astype(np.float64)
-        bquat = fk_res.tracked_quat_w.numpy().astype(np.float64)
+        for src_label, pos_50, quat_50, q_bfs_50 in variants:
+            lin_vel = np.gradient(pos_50, dt, axis=0)
+            ang_vel = ang_vel_fn(quat_50, dt)
+            qd_bfs = np.gradient(q_bfs_50, dt, axis=0)
+            arm_vel = np.abs(np.diff(q_bfs_50[:, arm_idxs], axis=0) / dt).max(axis=1) if arm_idxs else np.zeros(len(pos_50) - 1)
+            arm_acc = np.abs(np.diff(q_bfs_50[:, arm_idxs], n=2, axis=0) / (dt * dt)).max(axis=1) if arm_idxs else np.zeros(len(pos_50) - 2)
 
-        rot_torso = _quat_to_rotmat_np(bquat[:, torso_idx])
-        torso_up_z = rot_torso[:, 2, 2]
-        yaw = np.unwrap(_quat_yaw(quat_50))
-        v_xy = np.linalg.norm(lin_vel[:, :2], axis=-1)
-        min_foot_z = np.minimum(bpos[:, la_idx, 2], bpos[:, ra_idx, 2])
-
-        # 1. Extract natural walk -> decelerate -> double-support stand-still buffers (~0.4s settle)
-        # 2. Extract double-support smooth straight-walking endings (both ankles <= 0.060m)
-        T50 = len(pos_50)
-        stand_ends: list[tuple[int, bool]] = []
-        last_stand = -100
-        for t_end in range(160, T50 - 5, 3):
-            if t_end - last_stand < 4:
-                continue
-            if (
-                float(v_xy[t_end - 20 : t_end - 1].max()) < 0.22
-                and float(bpos[t_end - 1, la_idx, 2]) <= 0.060
-                and float(bpos[t_end - 1, ra_idx, 2]) <= 0.060
-            ):
-                stand_ends.append((t_end, True))
-                last_stand = t_end
-
-        ds_ends: list[tuple[int, bool]] = []
-        last_ds = -100
-        for t_end in range(135, T50 - 5, 4):
-            if t_end - last_ds < 6:
-                continue
-            if float(bpos[t_end - 1, la_idx, 2]) <= 0.060 and float(bpos[t_end - 1, ra_idx, 2]) <= 0.060:
-                ds_ends.append((t_end, False))
-                last_ds = t_end
-
-        for t_end, is_stand in stand_ends + ds_ends:
-            win_choices = (150, 130, 175) if is_stand else (120, 105, 135)
-            disp_bounds = (0.95, 1.75) if is_stand else (1.02, 1.62)
-            for win_len in win_choices:
-                t_start = t_end - win_len
-                if t_start < 5:
-                    continue
-                if float(arm_vel[t_start : t_end - 1].max()) > max_arm_vel:
-                    continue
-                if float(arm_acc[t_start : t_end - 2].max()) > max_arm_acc:
-                    continue
-                dvec = pos_50[t_end - 1, :2] - pos_50[t_start, :2]
-                disp = float(np.linalg.norm(dvec))
-                if not (disp_bounds[0] <= disp <= disp_bounds[1]):
-                    continue
-                v_win = v_xy[t_start:t_end]
-                if is_stand:
-                    if float(v_win[: win_len // 2].mean()) < 0.38 or float(v_win.max()) > 1.05:
-                        continue
-                else:
-                    if v_win.min() < 0.25 or v_win.max() > 1.05 or not (0.42 <= float(v_win.mean()) <= 0.82):
-                        continue
-                if float(torso_up_z[t_start:t_end].min()) < 0.92:
-                    continue
-                if float(np.ptp(yaw[t_start:t_end])) > np.radians(22.0 if is_stand else 20.0):
-                    continue
-                move_dir = float(np.arctan2(dvec[1], dvec[0]))
-                heading_err = np.abs(((yaw[t_start:t_end] - move_dir + np.pi) % (2.0 * np.pi)) - np.pi)
-                if float(heading_err.max()) > np.radians(25.0 if is_stand else 22.0):
-                    continue
-                foot_slice = min_foot_z[t_start:t_end]
-                if float(foot_slice.min()) < 0.030 or float(foot_slice.max()) > 0.062:
-                    continue
-
-                # Check hand forward reach in final frame so arms stay tucked near sides
-                end_Rz_T = _rotate_z_mat(float(yaw[t_end - 1])).T
-                lh_rel = end_Rz_T @ (bpos[t_end - 1, lh_idx] - pos_50[t_end - 1])
-                rh_rel = end_Rz_T @ (bpos[t_end - 1, rh_idx] - pos_50[t_end - 1])
-                if max(float(lh_rel[0]), float(rh_rel[0])) > 0.34:
-                    continue
-
-                end_idx = t_end - 1
-                la_loc, ra_loc = _local_ankle_features(
-                    pos_50[end_idx], float(yaw[end_idx]), bpos[end_idx, la_idx], bpos[end_idx, ra_idx]
+            with torch.no_grad():
+                fk_res = fk_35(
+                    torch.from_numpy(pos_50.astype(np.float32)),
+                    torch.from_numpy(quat_50.astype(np.float32)),
+                    torch.from_numpy(q_bfs_50.astype(np.float32)),
                 )
-                fwd_vec = np.array([np.cos(yaw[end_idx]), np.sin(yaw[end_idx])], dtype=np.float64)
-                v_fwd = float(np.dot(lin_vel[end_idx, :2], fwd_vec))
+            bpos = fk_res.tracked_pos_w.numpy().astype(np.float64)
+            bquat = fk_res.tracked_quat_w.numpy().astype(np.float64)
 
-                segments.append(
-                    LafanWalkSegment(
-                        source_name=csv_path.name,
-                        start_frame_50hz=t_start,
-                        end_frame_50hz=t_end,
-                        pos_w=pos_50[t_start:t_end].copy(),
-                        quat_wxyz=quat_50[t_start:t_end].copy(),
-                        q_bfs=q_bfs_50[t_start:t_end].copy(),
-                        qd_bfs_end=qd_bfs[end_idx].copy(),
-                        v_pelvis_end=lin_vel[end_idx].copy(),
-                        w_pelvis_end=ang_vel[end_idx].copy(),
-                        local_la_end=la_loc,
-                        local_ra_end=ra_loc,
-                        v_fwd_end=v_fwd,
-                        walk_disp_m=disp,
-                        is_stand_buffer=is_stand,
+            rot_torso = _quat_to_rotmat_np(bquat[:, torso_idx])
+            torso_up_z = rot_torso[:, 2, 2]
+            yaw = np.unwrap(_quat_yaw(quat_50))
+            v_xy = np.linalg.norm(lin_vel[:, :2], axis=-1)
+            min_foot_z = np.minimum(bpos[:, la_idx, 2], bpos[:, ra_idx, 2])
+
+            # 1. Extract natural walk -> decelerate -> double-support stand-still buffers (~0.4s settle)
+            # 2. Optionally extract double-support smooth straight-walking endings (both ankles <= 0.060m)
+            T50 = len(pos_50)
+            stand_ends: list[tuple[int, bool]] = []
+            last_stand = -100
+            for t_end in range(160, T50 - 5, 3):
+                if t_end - last_stand < 4:
+                    continue
+                if (
+                    float(v_xy[t_end - 20 : t_end - 1].max()) < 0.22
+                    and float(bpos[t_end - 1, la_idx, 2]) <= 0.058
+                    and float(bpos[t_end - 1, ra_idx, 2]) <= 0.058
+                ):
+                    stand_ends.append((t_end, True))
+                    last_stand = t_end
+
+            ds_ends: list[tuple[int, bool]] = []
+            if not only_stand_buffer:
+                last_ds = -100
+                for t_end in range(135, T50 - 5, 4):
+                    if t_end - last_ds < 6:
+                        continue
+                    if float(bpos[t_end - 1, la_idx, 2]) <= 0.060 and float(bpos[t_end - 1, ra_idx, 2]) <= 0.060:
+                        ds_ends.append((t_end, False))
+                        last_ds = t_end
+
+            for t_end, is_stand in stand_ends + ds_ends:
+                win_choices = (150, 130, 175) if is_stand else (120, 105, 135)
+                disp_bounds = (0.95, 1.75) if is_stand else (1.02, 1.62)
+                for win_len in win_choices:
+                    t_start = t_end - win_len
+                    if t_start < 5:
+                        continue
+                    if float(arm_vel[t_start : t_end - 1].max()) > max_arm_vel:
+                        continue
+                    if float(arm_acc[t_start : t_end - 2].max()) > max_arm_acc:
+                        continue
+                    dvec = pos_50[t_end - 1, :2] - pos_50[t_start, :2]
+                    disp = float(np.linalg.norm(dvec))
+                    if not (disp_bounds[0] <= disp <= disp_bounds[1]):
+                        continue
+                    v_win = v_xy[t_start:t_end]
+                    if is_stand:
+                        if float(v_win[: win_len // 2].mean()) < 0.38 or float(v_win.max()) > 1.05:
+                            continue
+                    else:
+                        if v_win.min() < 0.25 or v_win.max() > 1.05 or not (0.42 <= float(v_win.mean()) <= 0.82):
+                            continue
+                    if float(torso_up_z[t_start:t_end].min()) < 0.92:
+                        continue
+                    if float(np.ptp(yaw[t_start:t_end])) > np.radians(22.0 if is_stand else 20.0):
+                        continue
+                    move_dir = float(np.arctan2(dvec[1], dvec[0]))
+                    heading_err = np.abs(((yaw[t_start:t_end] - move_dir + np.pi) % (2.0 * np.pi)) - np.pi)
+                    if float(heading_err.max()) > np.radians(25.0 if is_stand else 22.0):
+                        continue
+                    foot_slice = min_foot_z[t_start:t_end]
+                    if float(foot_slice.min()) < 0.030 or float(foot_slice.max()) > 0.062:
+                        continue
+
+                    # Ensure uncrossed ankles & arms in final frame so arms stay tucked near sides
+                    end_Rz_T = _rotate_z_mat(float(yaw[t_end - 1])).T
+                    lh_rel = end_Rz_T @ (bpos[t_end - 1, lh_idx] - pos_50[t_end - 1])
+                    rh_rel = end_Rz_T @ (bpos[t_end - 1, rh_idx] - pos_50[t_end - 1])
+                    if max(float(lh_rel[0]), float(rh_rel[0])) > 0.34 or float(lh_rel[1] - rh_rel[1]) < 0.24:
+                        continue
+
+                    end_idx = t_end - 1
+                    la_loc, ra_loc = _local_ankle_features(
+                        pos_50[end_idx], float(yaw[end_idx]), bpos[end_idx, la_idx], bpos[end_idx, ra_idx]
                     )
-                )
-                break
+                    if float(la_loc[1] - ra_loc[1]) < 0.08:
+                        continue
+                    fwd_vec = np.array([np.cos(yaw[end_idx]), np.sin(yaw[end_idx])], dtype=np.float64)
+                    v_fwd = float(np.dot(lin_vel[end_idx, :2], fwd_vec))
+
+                    segments.append(
+                        LafanWalkSegment(
+                            source_name=src_label,
+                            start_frame_50hz=t_start,
+                            end_frame_50hz=t_end,
+                            pos_w=pos_50[t_start:t_end].copy(),
+                            quat_wxyz=quat_50[t_start:t_end].copy(),
+                            q_bfs=q_bfs_50[t_start:t_end].copy(),
+                            qd_bfs_end=qd_bfs[end_idx].copy(),
+                            v_pelvis_end=lin_vel[end_idx].copy(),
+                            w_pelvis_end=ang_vel[end_idx].copy(),
+                            local_la_end=la_loc,
+                            local_ra_end=ra_loc,
+                            v_fwd_end=v_fwd,
+                            walk_disp_m=disp,
+                            is_stand_buffer=is_stand,
+                        )
+                    )
+                    break
 
     if not segments:
         raise RuntimeError(f"Failed to extract any clean straight walking windows from `{g1_dir}`.")
@@ -371,12 +414,16 @@ def stitch_lafan_walk_to_omni_clip(
     ang_vel_fn,
     blend_frames: int = 25,
     dt: float = 0.02,
+    pin_stance_foot: bool = True,
+    approach_yaw_offset_rad: float = 0.0,
 ) -> dict:
     """Select phase-matched LAFAN1 walk segment and smoothly stitch it ahead of `omni[0]`."""
     pelvis_idx = body_names.index("pelvis")
     la_idx = body_names.index("left_ankle_roll_link")
     ra_idx = body_names.index("right_ankle_roll_link")
     torso_idx = body_names.index("torso_link")
+    lh_idx = body_names.index("left_rubber_hand")
+    rh_idx = body_names.index("right_rubber_hand")
     check_body_names = [
         "pelvis",
         "torso_link",
@@ -425,13 +472,16 @@ def stitch_lafan_walk_to_omni_clip(
 
     ranked: list[tuple[float, int]] = []
     prefer_stand = v_fwd_omni0 <= 0.28
+    omni_stance_span = la_omni - ra_omni
     for idx, seg in enumerate(segments):
+        seg_span = seg.local_la_end - seg.local_ra_end
         ankle_err = float(np.linalg.norm(seg.local_la_end - la_omni) + np.linalg.norm(seg.local_ra_end - ra_omni))
+        span_err = float(np.linalg.norm(seg_span[:2] - omni_stance_span[:2]))
         pz_err = abs(float(seg.pos_w[-1, 2]) - float(omni_pos[0, 2]))
         vel_err = abs(seg.v_fwd_end - v_fwd_omni0)
-        div_pen = 0.025 * usage_counts.get(seg.source_name, 0)
+        div_pen = 0.045 * usage_counts.get(f"{seg.source_name}:{seg.end_frame_50hz}", 0) + 0.015 * usage_counts.get(seg.source_name, 0)
         stand_adj = -0.35 if (prefer_stand and seg.is_stand_buffer) else (0.15 if (not prefer_stand and seg.is_stand_buffer) else 0.0)
-        score = ankle_err + 1.5 * pz_err + 0.45 * vel_err + div_pen + stand_adj
+        score = 0.7 * ankle_err + 0.8 * span_err + 1.2 * pz_err + 0.45 * vel_err + div_pen + stand_adj
         ranked.append((score, idx))
     ranked.sort(key=lambda x: x[0])
 
@@ -444,11 +494,14 @@ def stitch_lafan_walk_to_omni_clip(
     # Precompute constant box pose for pre-contact sequence and try top phase-matched candidates
     T_dur = (blend_frames + 1) * dt
     u = np.arange(1, blend_frames + 1, dtype=np.float64) / float(blend_frames + 1)
+    stance_idx = la_idx if float(omni_bpos[0, la_idx, 2]) <= float(omni_bpos[0, ra_idx, 2]) else ra_idx
+    v_foot_B = np.clip(_estimate_initial_slope(omni_bpos[:, stance_idx], dt, n_frames=6), -0.15, 0.15)
 
     for score, seg_idx in ranked[:150]:
         seg = segments[seg_idx]
         yaw_w_end = float(_quat_yaw(seg.quat_wxyz[-1]))
-        d_yaw = float((yaw_omni0 - yaw_w_end + np.pi) % (2.0 * np.pi) - np.pi)
+        target_walk_yaw = yaw_omni0 + float(approach_yaw_offset_rad)
+        d_yaw = float((target_walk_yaw - yaw_w_end + np.pi) % (2.0 * np.pi) - np.pi)
         Rz = _rotate_z_mat(d_yaw)
         qz_delta = np.array([np.cos(0.5 * d_yaw), 0.0, 0.0, np.sin(0.5 * d_yaw)], dtype=np.float64)
 
@@ -475,16 +528,9 @@ def stitch_lafan_walk_to_omni_clip(
         w_A = Rz @ seg.w_pelvis_end
         qd_A = np.clip(seg.qd_bfs_end, -4.5, 4.5)
 
-        # Exact average-velocity anchor for W[-1] before omni[0] so blend arc never reverses
-        pos_A_xy = omni_pos[0, :2] - 0.5 * (v_A[:2] + v_omni_0_c[:2]) * T_dur
-        pos_A = np.array([pos_A_xy[0], pos_A_xy[1], float(seg.pos_w[-1, 2])], dtype=np.float64)
-        pos_w_aligned = pos_w_rot + pos_A
-
-        # Cubic Hermite blend for pelvis XYZ and 29 DoFs
-        blend_pos = _cubic_hermite(pos_A, v_A, omni_pos[0], v_omni_0_c, u, T_dur)
+        # Cubic Hermite blend for 29 DoFs and Lie-group SO(3) orientation first
         blend_q = _cubic_hermite(seg.q_bfs[-1], qd_A, omni_q_bfs[0], qd_omni_0_c, u, T_dur)
 
-        # Lie-group cubic Hermite SO(3) orientation blend
         R_A = _quat_to_rotmat_np(quat_w_rot[-1])
         R_B = _quat_to_rotmat_np(omni_quat_wxyz[0])
         theta_rel = _rotmat_to_rotvec(R_A.T @ R_B)
@@ -495,6 +541,39 @@ def stitch_lafan_walk_to_omni_clip(
         quat_blend = _rotmat_to_quat_wxyz(R_blend)
         if np.dot(quat_blend[0], quat_w_rot[-1]) < 0.0:
             quat_blend = -quat_blend
+
+        if pin_stance_foot and seg.is_stand_buffer and float(np.linalg.norm(v_omni_0[:2])) <= 0.25:
+            # Closed-chain stance-foot pinning: lock grounded stance foot on floor so knees/hips naturally sit back
+            q_chain = np.concatenate([seg.q_bfs[-4:], blend_q, omni_q_bfs[0:1]], axis=0)
+            quat_chain = np.concatenate([quat_w_rot[-4:], quat_blend, omni_quat_wxyz[0:1]], axis=0)
+            for ti in range(1, len(quat_chain)):
+                if np.dot(quat_chain[ti], quat_chain[ti - 1]) < 0.0:
+                    quat_chain[ti] = -quat_chain[ti]
+            zero_p = np.zeros((len(q_chain), 3), dtype=np.float32)
+            with torch.no_grad():
+                fk_rel = fk_35(
+                    torch.from_numpy(zero_p),
+                    torch.from_numpy(quat_chain.astype(np.float32)),
+                    torch.from_numpy(q_chain.astype(np.float32)),
+                )
+            r_stance_all = fk_rel.tracked_pos_w[:, stance_idx, :].numpy().astype(np.float64)
+            foot_tail_w = pos_w_rot[-4:] + r_stance_all[:4]
+            v_foot_A = np.clip(_estimate_initial_slope(foot_tail_w[::-1], -dt, n_frames=4), -0.12, 0.12)
+            r_A = r_stance_all[3]
+            r_blend = r_stance_all[4:-1]
+            r_B = r_stance_all[-1]
+            foot_B = omni_pos[0] + r_B
+            foot_A_xy = foot_B[:2] - 0.5 * (v_foot_A[:2] + v_foot_B[:2]) * T_dur
+            foot_A = np.array([foot_A_xy[0], foot_A_xy[1], float(seg.pos_w[-1, 2]) + float(r_A[2])], dtype=np.float64)
+            foot_blend = _cubic_hermite(foot_A, v_foot_A, foot_B, v_foot_B, u, T_dur)
+            pos_A = foot_A - r_A
+            pos_w_aligned = pos_w_rot + pos_A
+            blend_pos = foot_blend - r_blend
+        else:
+            pos_A_xy = omni_pos[0, :2] - 0.5 * (v_A[:2] + v_omni_0_c[:2]) * T_dur
+            pos_A = np.array([pos_A_xy[0], pos_A_xy[1], float(seg.pos_w[-1, 2])], dtype=np.float64)
+            pos_w_aligned = pos_w_rot + pos_A
+            blend_pos = _cubic_hermite(pos_A, v_A, omni_pos[0], v_omni_0_c, u, T_dur)
 
         pre_pos = np.concatenate([pos_w_aligned, blend_pos], axis=0)
         pre_quat = np.concatenate([quat_w_rot, quat_blend], axis=0)
@@ -516,10 +595,27 @@ def stitch_lafan_walk_to_omni_clip(
                 torch.from_numpy(pre_q.astype(np.float32)),
             )
         bpos_pre = fk_pre.tracked_pos_w.numpy().astype(np.float64)
+        bquat_pre = fk_pre.tracked_quat_w.numpy().astype(np.float64)
 
         # Verify strict ground foot height across approach & blend (never airborne > 5.8cm or sunk < 2.2cm)
         min_fz = np.minimum(bpos_pre[:, la_idx, 2], bpos_pre[:, ra_idx, 2])
         if float(min_fz.min()) < 0.022 or float(min_fz.max()) > 0.058:
+            continue
+
+        # Verify uncrossed arms & uncrossed legs throughout approach + blend!
+        R_torso_pre = _quat_to_rotmat_np(bquat_pre[:, torso_idx])
+        lh_loc_y = np.einsum("ti,ti->t", R_torso_pre[:, :, 1], bpos_pre[:, lh_idx] - bpos_pre[:, torso_idx])
+        rh_loc_y = np.einsum("ti,ti->t", R_torso_pre[:, :, 1], bpos_pre[:, rh_idx] - bpos_pre[:, torso_idx])
+        if float((lh_loc_y - rh_loc_y).min()) < 0.22:
+            continue
+        ank_diff = bpos_pre[:, la_idx, :2] - bpos_pre[:, ra_idx, :2]
+        yaw_pre = _quat_yaw(full_quat[: len(pre_pos)])
+        fwd_pre = np.stack([np.cos(yaw_pre), np.sin(yaw_pre)], axis=-1)
+        left_pre = np.stack([-np.sin(yaw_pre), np.cos(yaw_pre)], axis=-1)
+        dx_ank = np.abs(np.sum(ank_diff * fwd_pre, axis=-1))
+        dy_ank = np.sum(ank_diff * left_pre, axis=-1)
+        if np.any((dx_ank < 0.16) & (dy_ank < 0.04)):
+            continue
             continue
 
         # Verify upper-body COM projection stays safely within <= 0.14m of the ankle support segment across seam
@@ -571,6 +667,8 @@ def stitch_lafan_walk_to_omni_clip(
 
         pre_walk_path = float(np.linalg.norm(np.diff(pre_pos[:, :2], axis=0), axis=-1).sum())
         usage_counts[seg.source_name] = usage_counts.get(seg.source_name, 0) + 1
+        win_key = f"{seg.source_name}:{seg.end_frame_50hz}"
+        usage_counts[win_key] = usage_counts.get(win_key, 0) + 1
 
         return {
             "joint_pos": full_q.astype(np.float32),

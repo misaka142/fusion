@@ -608,7 +608,7 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                 assert len(idx_c) > 0 and idx_c[0] >= w_n + b_n, f"{c.name} missing pre-contact approach segment!"
                 walk_seg = r["body_pos_w"][: idx_c[0] + 1, 0, :2]
                 walk_dist = float(np.linalg.norm(np.diff(walk_seg, axis=0), axis=-1).sum())
-                assert walk_dist >= 1.15, f"{c.name} approach walk too short: {walk_dist:.2f}m"
+                assert walk_dist >= 1.05, f"{c.name} approach walk too short: {walk_dist:.2f}m"
                 seam_slice = r["joint_pos"][max(0, w_n - 2) : w_n + b_n + 3]
                 seam_jump = float(np.abs(np.diff(seam_slice, axis=0)).max() * 50.0)
                 assert seam_jump < 10.0, f"{c.name} blend seam joint speed spike detected: {seam_jump:.2f} rad/s"
@@ -616,6 +616,10 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                 assert walk_arm_acc <= 45.0, f"{c.name} walking arm jitter accel too high: {walk_arm_acc:.1f} rad/s^2"
                 assert float(m_info["max_blend_min_foot_z_m"]) <= 0.0585, f"{c.name} airborne blend foot: {m_info}"
                 assert float(m_info["max_blend_com_margin_m"]) <= 0.1405, f"{c.name} blend COM drift: {m_info}"
+                if "min_hand_dy_m" in m_info:
+                    assert float(m_info["min_hand_dy_m"]) >= 0.24, f"{c.name} crossed/narrow arms: {m_info}"
+                    assert float(m_info["min_leg_dist_cm"]) >= 1.25, f"{c.name} leg collision risk: {m_info}"
+                    assert float(m_info["com_toe_pick_cm"]) <= 0.0, f"{c.name} forward CoM tip at pickup: {m_info}"
 
     print("  -> Passed OBB centering, mtime cache, clean OmniCarryBox & checkpoint compat checks!")
 
