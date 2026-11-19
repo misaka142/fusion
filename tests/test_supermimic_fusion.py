@@ -1367,9 +1367,22 @@ def test_13_lafan_walk_stitcher_continuity_and_clearance() -> None:
     from scripts.sugar_rl.lafan_walk_stitcher import (
         LafanWalkSegment,
         _box_obb_surface_distance,
+        _smooth_savgol_np,
         stitch_lafan_walk_to_omni_clip,
     )
     from scripts.sugar_rl.convert_omniretarget_to_sugar import SUGAR_RAW_35_BODY_NAMES, _ang_vel_world_from_quats
+
+    # 0. Verify Savitzky-Golay upper-body smoothing suppresses high-frequency chatter while keeping DC/low-freq swing
+    t_test = np.arange(150, dtype=np.float64) * 0.02
+    clean_sig = 0.25 * np.sin(2.0 * np.pi * 0.8 * t_test)[:, None]
+    noisy_sig = clean_sig + 0.08 * ((-1.0) ** np.arange(150))[:, None]
+    smoothed_sig = _smooth_savgol_np(noisy_sig, window=19, polyorder=2)
+    raw_acc_rms = float(np.sqrt(np.mean((np.diff(noisy_sig[10:-10], n=2, axis=0) / 0.0004) ** 2)))
+    sm_acc_rms = float(np.sqrt(np.mean((np.diff(smoothed_sig[10:-10], n=2, axis=0) / 0.0004) ** 2)))
+    recon_rmse = float(np.sqrt(np.mean((smoothed_sig[10:-10] - clean_sig[10:-10]) ** 2)))
+    assert sm_acc_rms < 0.12 * raw_acc_rms and recon_rmse < 0.015, (
+        f"SavGol failed to attenuate jitter cleanly: sm_acc={sm_acc_rms:.1f}, raw={raw_acc_rms:.1f}, recon={recon_rmse:.4f}"
+    )
 
     fk = FastTreeKinematics(device="cpu")
     dt = 0.02

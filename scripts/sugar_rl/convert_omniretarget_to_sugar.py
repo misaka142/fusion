@@ -330,14 +330,33 @@ def main() -> None:
     ap.add_argument(
         "--subset",
         type=str,
-        default="pick_carry_place_original",
+        default="pick_carry_place_all",
         choices=["pick_carry_place_original", "all_original", "pick_carry_place_all", "all"],
         help=(
-            "'pick_carry_place_original' (default, 86 clean floor-to-floor carry clips), "
-            "'all_original' (312 clips), 'pick_carry_place_all' (~516 clips w/ spatial aug), or 'all' (1826 clips)."
+            "'pick_carry_place_all' (default, all valid floor-to-floor carry clips w/ spatial aug), "
+            "'pick_carry_place_original' (original-only subset), "
+            "'all_original' (312 clips), or 'all' (1826 clips)."
         ),
     )
     ap.add_argument("--max_clips", type=int, default=None, help="Optional cap on number of converted clips.")
+    ap.add_argument(
+        "--max_variants_per_base",
+        type=int,
+        default=3,
+        help="Cap variants per base motion for balanced diversity (default: 3 -> ~159 clips; 0 = keep all smooth).",
+    )
+    ap.add_argument(
+        "--max_joint_vel",
+        type=float,
+        default=10.0,
+        help="Reject raw clips exceeding this joint speed (rad/s) when posture filtering is active (default: 10.0).",
+    )
+    ap.add_argument(
+        "--max_joint_acc",
+        type=float,
+        default=260.0,
+        help="Reject raw clips exceeding this joint accel (rad/s^2) when posture filtering is active (default: 260.0).",
+    )
     ap.add_argument(
         "--no_floor_offset",
         action="store_true",
@@ -379,8 +398,20 @@ def main() -> None:
     if not largebox_obj.is_file():
         raise FileNotFoundError(f"Missing `{largebox_obj}`. Run `download_omniretarget.py` first.")
 
+    # SDK -> IsaacLab BFS permutation
+    sdk_to_idx = {n: i for i, n in enumerate(G1_29DOF_SDK_JOINT_NAMES)}
+    sdk_for_bfs = np.array([sdk_to_idx[n] for n in G1_ISAACLAB_BFS_JOINT_NAMES], dtype=np.int64)
+
+    urdf_path = _FUSION_ROOT / "descriptions" / "robots" / "g1" / "g1_29dof_rev_1_0_with_rubber_hand.urdf"
+    fk_35 = FastTreeKinematics(
+        urdf_or_xml_path=urdf_path if urdf_path.exists() else None,
+        env_joint_names=G1_ISAACLAB_BFS_JOINT_NAMES,
+        tracked_body_names=SUGAR_RAW_35_BODY_NAMES,
+        device="cpu",
+    )
+
     all_files = sorted(npz_dir.glob("*.npz"))
-    selected: list[Path] = []
+    candidate_paths: list[Path] = []
     for p in all_files:
         is_orig = p.stem.endswith("_original")
         if "original" in args.subset and not is_orig:
@@ -394,20 +425,105 @@ def main() -> None:
             min_xy_disp = 0.30 if args.no_posture_filter else 0.50
             if not (z0 < 0.30 and z1 < 0.30 and (zmax - max(z0, z1)) > 0.12 and xy_disp >= min_xy_disp):
                 continue
-        selected.append(p)
+        candidate_paths.append(p)
 
-    if args.max_clips is not None:
-        selected = selected[: args.max_clips]
-    if not selected:
+    if not candidate_paths:
         raise RuntimeError(f"No clips matched subset='{args.subset}' under {npz_dir}")
 
-    # Compute canonical +Z-up OBB alignment using first selected clip's resting pose
-    with np.load(selected[0]) as d0:
+    # Compute canonical +Z-up OBB alignment using first original (or first candidate) resting pose
+    ref_clip = next((p for p in candidate_paths if p.stem.endswith("_original")), candidate_paths[0])
+    with np.load(ref_clip) as d0:
         ref_raw_rot0 = _quat_to_rotmat(d0["qpos"][0:1, 36:40].astype(np.float64))[0]
 
     m_box = trimesh.load(str(largebox_obj), force="mesh", process=False)
     hull_raw = m_box.convex_hull
     R_obb, p_obb, hull_aligned, box_size_al = _compute_canonical_obb_alignment(hull_raw, ref_raw_rot0)
+    half_ext_al = 0.5 * box_size_al
+
+    # Quality & diversity pre-filtering before heavy resampling/stitching
+    torso_raw_idx = SUGAR_RAW_35_BODY_NAMES.index("torso_link")
+    la_raw_idx = SUGAR_RAW_35_BODY_NAMES.index("left_ankle_roll_link")
+    ra_raw_idx = SUGAR_RAW_35_BODY_NAMES.index("right_ankle_roll_link")
+    chk_names = ["pelvis", "torso_link", "head_link", "left_knee_link", "right_knee_link", "left_ankle_roll_link", "right_ankle_roll_link"]
+    chk_idxs = [SUGAR_RAW_35_BODY_NAMES.index(n) for n in chk_names]
+
+    skipped_bent = 0
+    skipped_floating = 0
+    skipped_t0_contact = 0
+    skipped_spike = 0
+    skipped_pen = 0
+    skipped_stitch = 0
+    selected_scored: list[tuple[str, bool, float, Path]] = []
+
+    if args.subset.startswith("pick_carry_place") and not args.no_posture_filter:
+        for p in candidate_paths:
+            with np.load(p) as d:
+                q_raw = d["qpos"].astype(np.float64)
+                fps_raw = float(d["fps"])
+            q_bfs_raw = q_raw[:, 7:36][:, sdk_for_bfs]
+            max_v = float(np.abs(np.diff(q_bfs_raw, axis=0) * fps_raw).max())
+            max_a = float(np.abs(np.diff(q_bfs_raw, n=2, axis=0) * (fps_raw * fps_raw)).max())
+            if max_v > args.max_joint_vel or max_a > args.max_joint_acc:
+                skipped_spike += 1
+                continue
+
+            with torch.no_grad():
+                fk_chk = fk_35(
+                    torch.from_numpy(q_raw[:, 4:7].astype(np.float32)),
+                    torch.from_numpy(q_raw[:, 0:4].astype(np.float32)),
+                    torch.from_numpy(q_bfs_raw.astype(np.float32)),
+                )
+            bpos_raw = fk_chk.tracked_pos_w.numpy().astype(np.float64)
+            bquat0 = fk_chk.tracked_quat_w[0].numpy().astype(np.float64)
+            rot_torso0 = _quat_to_rotmat(bquat0[torso_raw_idx : torso_raw_idx + 1])[0]
+            torso_up_z0 = float(rot_torso0[2, 2])
+            if torso_up_z0 < 0.80:
+                skipped_bent += 1
+                continue
+            min_foot_z0 = float(min(bpos_raw[0, la_raw_idx, 2], bpos_raw[0, ra_raw_idx, 2]))
+            if not (0.026 <= min_foot_z0 <= 0.068):
+                skipped_floating += 1
+                continue
+
+            oxyz = q_raw[:, 40:43]
+            ov = np.linalg.norm(np.diff(oxyz[: min(5, len(oxyz))], axis=0) * fps_raw, axis=-1)
+            if (len(ov) > 0 and ov[0] > 0.08) or (len(oxyz) > 1 and oxyz[1, 2] > float(oxyz[0, 2]) + 0.015):
+                skipped_t0_contact += 1
+                continue
+
+            # Reject clips with deep non-hand penetration into largebox OBB
+            orot_raw = _quat_to_rotmat(q_raw[:, 36:40])
+            orot_al = np.einsum("tij,jk->tik", orot_raw, R_obb)
+            opos_al = oxyz + np.einsum("tij,j->ti", orot_raw, p_obb)
+            rel = bpos_raw[:, chk_idxs, :] - opos_al[:, None, :]
+            loc = np.einsum("tij,tkj->tki", orot_al, rel)
+            min_sd = float((np.abs(loc) - half_ext_al[None, None, :]).max(axis=-1).min())
+            if min_sd < -0.02:
+                skipped_pen += 1
+                continue
+
+            base_id = "_".join(p.stem.split("_")[:3])
+            is_orig = p.stem.endswith("_original")
+            smooth_cost = max_v + 0.02 * max_a
+            selected_scored.append((base_id, is_orig, smooth_cost, p))
+
+        if args.max_variants_per_base > 0:
+            by_base: dict[str, list[tuple[bool, float, Path]]] = {}
+            for base_id, is_orig, sc, p in selected_scored:
+                by_base.setdefault(base_id, []).append((is_orig, sc, p))
+            selected = []
+            for base_id in sorted(by_base.keys()):
+                grp = sorted(by_base[base_id], key=lambda item: (0 if item[0] else 1, item[1]))
+                selected.extend(item[2] for item in grp[: args.max_variants_per_base])
+        else:
+            selected = [item[3] for item in selected_scored]
+    else:
+        selected = candidate_paths
+
+    if args.max_clips is not None:
+        selected = selected[: args.max_clips]
+    if not selected:
+        raise RuntimeError(f"All {len(candidate_paths)} candidates were filtered out under '{args.subset}'!")
 
     out_root = Path(args.out_dir).resolve()
     if out_root.exists():
@@ -431,20 +547,12 @@ def main() -> None:
     }
     (out_root / "box_spec.json").write_text(json.dumps(box_spec, indent=2), encoding="utf-8")
 
-    # SDK -> IsaacLab BFS permutation
-    sdk_to_idx = {n: i for i, n in enumerate(G1_29DOF_SDK_JOINT_NAMES)}
-    sdk_for_bfs = np.array([sdk_to_idx[n] for n in G1_ISAACLAB_BFS_JOINT_NAMES], dtype=np.int64)
-
-    urdf_path = _FUSION_ROOT / "descriptions" / "robots" / "g1" / "g1_29dof_rev_1_0_with_rubber_hand.urdf"
-    fk_35 = FastTreeKinematics(
-        urdf_or_xml_path=urdf_path if urdf_path.exists() else None,
-        env_joint_names=G1_ISAACLAB_BFS_JOINT_NAMES,
-        tracked_body_names=SUGAR_RAW_35_BODY_NAMES,
-        device="cpu",
-    )
-
     print("=" * 82)
-    print(f"[OmniRetarget -> SUGAR] Subset: {args.subset} | Clips: {len(selected)} / {len(all_files)}")
+    print(f"[OmniRetarget -> SUGAR] Subset: {args.subset} | Selected: {len(selected)} / {len(candidate_paths)} candidates (total raw={len(all_files)})")
+    print(
+        f"[OmniRetarget -> SUGAR] Quality filters dropped: bent_t0={skipped_bent}, float_t0={skipped_floating}, "
+        f"contact_t0={skipped_t0_contact}, spike={skipped_spike}, penetration={skipped_pen} | max_per_base={args.max_variants_per_base}"
+    )
     print(
         f"[OmniRetarget -> SUGAR] Aligned OBB size: {box_spec['box_size_xyz']} m "
         f"| ConvexHull verts={len(hull_aligned.vertices)}, faces={len(hull_aligned.faces)}"
@@ -469,17 +577,13 @@ def main() -> None:
     print("=" * 82)
 
     t0 = time.perf_counter()
-    half_ext_al = 0.5 * box_size_al
     verts_al = np.asarray(hull_aligned.vertices, dtype=np.float64)  # (V, 3)
     lk_bfs = G1_ISAACLAB_BFS_JOINT_NAMES.index("left_knee_joint")
     rk_bfs = G1_ISAACLAB_BFS_JOINT_NAMES.index("right_knee_joint")
-    torso_raw_idx = SUGAR_RAW_35_BODY_NAMES.index("torso_link")
 
     manifest = []
     floor_shifts_mm = []
     kept_idx = 0
-    skipped_bent = 0
-    skipped_t0_contact = 0
     for idx, src_npz in enumerate(selected):
         with np.load(src_npz) as d:
             q_in = d["qpos"].astype(np.float64)
@@ -554,29 +658,30 @@ def main() -> None:
                 skipped_t0_contact += 1
                 continue
 
-        floor_shifts_mm.append(dz_const * 1000.0)
-        clip_folder = out_root / f"data_{kept_idx:03d}"
-        clip_folder.mkdir(parents=True, exist_ok=True)
-
         stitch_meta: dict = {}
         if use_lafan:
-            stitched = stitch_lafan_walk_to_omni_clip(
-                omni_pos=rob_pos_50,
-                omni_quat_wxyz=rob_quat_50,
-                omni_q_bfs=q_bfs_50,
-                omni_bpos=b_pos.astype(np.float64),
-                omni_obj_pos=obj_pos_al,
-                omni_obj_rot=obj_rot_al,
-                omni_contact=contact_50,
-                box_half_extents=half_ext_al,
-                segments=lafan_segments,
-                usage_counts=lafan_usage,
-                fk_35=fk_35,
-                body_names=SUGAR_RAW_35_BODY_NAMES,
-                ang_vel_fn=_ang_vel_world_from_quats,
-                blend_frames=args.blend_frames,
-                dt=DT,
-            )
+            try:
+                stitched = stitch_lafan_walk_to_omni_clip(
+                    omni_pos=rob_pos_50,
+                    omni_quat_wxyz=rob_quat_50,
+                    omni_q_bfs=q_bfs_50,
+                    omni_bpos=b_pos.astype(np.float64),
+                    omni_obj_pos=obj_pos_al,
+                    omni_obj_rot=obj_rot_al,
+                    omni_contact=contact_50,
+                    box_half_extents=half_ext_al,
+                    segments=lafan_segments,
+                    usage_counts=lafan_usage,
+                    fk_35=fk_35,
+                    body_names=SUGAR_RAW_35_BODY_NAMES,
+                    ang_vel_fn=_ang_vel_world_from_quats,
+                    blend_frames=args.blend_frames,
+                    dt=DT,
+                )
+            except RuntimeError as exc:
+                skipped_stitch += 1
+                print(f"  [Skip stitch] {src_npz.name}: {exc}")
+                continue
             q_out = stitched["joint_pos"]
             qd_out = stitched["joint_vel"]
             bpos_out = stitched["body_pos_w"]
@@ -601,6 +706,10 @@ def main() -> None:
             olin_out = obj_lin_vel
             oang_out = obj_ang_vel
             contact_out = contact_50.astype(bool)
+
+        floor_shifts_mm.append(dz_const * 1000.0)
+        clip_folder = out_root / f"data_{kept_idx:03d}"
+        clip_folder.mkdir(parents=True, exist_ok=True)
 
         np.savez(
             clip_folder / "robot_50hz.npz",
@@ -638,7 +747,7 @@ def main() -> None:
         manifest.append(entry)
         kept_idx += 1
 
-        if kept_idx % 15 == 0 or kept_idx == 1 or (idx + 1) == len(selected):
+        if kept_idx % 20 == 0 or kept_idx == 1 or (idx + 1) == len(selected):
             walk_info = f" | walk=+{stitch_meta['pre_walk_path_m']:.2f}m ({stitch_meta['lafan_source']})" if stitch_meta else ""
             print(
                 f"  [{kept_idx:3d} kept | scan {idx + 1:3d}/{len(selected)}] {clip_folder.name} <- {src_npz.name:34s} | "
@@ -651,8 +760,9 @@ def main() -> None:
     (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print("=" * 82)
     print(
-        f"[DONE] Converted {len(manifest)} clean clips -> `{out_root}` in {time.perf_counter() - t0:.1f}s "
-        f"(filtered: bent_t0={skipped_bent}, contact_t0={skipped_t0_contact} | "
+        f"[DONE] Converted {len(manifest)} high-quality clips -> `{out_root}` in {time.perf_counter() - t0:.1f}s "
+        f"(filtered: bent_t0={skipped_bent}, float_t0={skipped_floating}, contact_t0={skipped_t0_contact}, "
+        f"spike={skipped_spike}, pen={skipped_pen}, stitch={skipped_stitch} | "
         f"floor dz median=+{np.median(floor_shifts_mm):.2f}mm, max=+{np.max(floor_shifts_mm):.2f}mm)"
     )
     print("=" * 82)

@@ -126,6 +126,36 @@ def _cubic_hermite(p0: np.ndarray, v0: np.ndarray, p1: np.ndarray, v1: np.ndarra
     )
 
 
+def _smooth_savgol_np(x: np.ndarray, window: int = 19, polyorder: int = 2) -> np.ndarray:
+    """Zero-phase pure-NumPy Savitzky-Golay filter (no scipy/OpenMP dependency)."""
+    if len(x) < window or window < 3:
+        return x.copy()
+    m = window // 2
+    t = np.arange(-m, m + 1, dtype=np.float64)
+    A = np.vander(t, polyorder + 1, increasing=True)
+    kernel = (A @ np.linalg.pinv(A))[m]
+    pad = np.pad(x, ((m, m), (0, 0)), mode="edge")
+    out = np.empty_like(x, dtype=np.float64)
+    for col in range(x.shape[1]):
+        out[:, col] = np.convolve(pad[:, col], kernel[::-1], mode="valid")
+    return out
+
+
+def _estimate_initial_slope(x: np.ndarray, dt: float, n_frames: int = 6) -> np.ndarray:
+    """Estimate robust t=0 velocity via ordinary least-squares slope over the first `n_frames`."""
+    k = min(n_frames, len(x))
+    if k < 2:
+        return np.zeros(x.shape[1:], dtype=np.float64)
+    t = np.arange(k, dtype=np.float64) * dt
+    t_c = t - t.mean()
+    denom = float(np.dot(t_c, t_c))
+    if denom < 1e-12:
+        return np.zeros(x.shape[1:], dtype=np.float64)
+    flat = x[:k].reshape(k, -1)
+    slope = (t_c @ (flat - flat.mean(axis=0, keepdims=True))) / denom
+    return slope.reshape(x.shape[1:])
+
+
 def _local_ankle_features(pelvis_pos: np.ndarray, pelvis_yaw: float, l_ankle: np.ndarray, r_ankle: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     Rz_T = _rotate_z_mat(pelvis_yaw).T
     origin = np.array([pelvis_pos[0], pelvis_pos[1], 0.0], dtype=np.float64)
@@ -141,8 +171,11 @@ def load_lafan_walk_segments(
     resample_quat_slerp_fn,
     ang_vel_fn,
     dt: float = 0.02,
+    arm_smooth_window: int = 19,
+    max_arm_vel: float = 4.5,
+    max_arm_acc: float = 40.0,
 ) -> list[LafanWalkSegment]:
-    """Load LAFAN1 G1 `walk*.csv` files and extract clean straight walking segments (~1.05m - 1.65m)."""
+    """Load LAFAN1 G1 `walk*.csv`, suppress upper-body IK jitter, and extract clean straight walks."""
     g1_dir = lafan_dir / "g1"
     csv_files = sorted(g1_dir.glob("walk*.csv"))
     if not csv_files:
@@ -155,6 +188,7 @@ def load_lafan_walk_segments(
     ra_idx = body_names.index("right_ankle_roll_link")
     lh_idx = body_names.index("left_rubber_hand")
     rh_idx = body_names.index("right_rubber_hand")
+    arm_idxs = [i for i, n in enumerate(fk_35.env_joint_names) if any(k in n for k in ("shoulder", "elbow", "wrist"))]
 
     segments: list[LafanWalkSegment] = []
     for csv_path in csv_files:
@@ -167,9 +201,15 @@ def load_lafan_walk_segments(
         quat_50 = resample_quat_slerp_fn(quat_wxyz_30, 30.0, 50.0)
         q_bfs_50 = resample_catmull_rom_fn(arr[:, 7:36][:, sdk_for_bfs], 30.0, 50.0)
 
+        # Suppress high-frequency mocap/IK wrist & arm chatter while keeping legs untouched
+        if arm_idxs and arm_smooth_window >= 3:
+            q_bfs_50[:, arm_idxs] = _smooth_savgol_np(q_bfs_50[:, arm_idxs], window=arm_smooth_window, polyorder=2)
+
         lin_vel = np.gradient(pos_50, dt, axis=0)
         ang_vel = ang_vel_fn(quat_50, dt)
         qd_bfs = np.gradient(q_bfs_50, dt, axis=0)
+        arm_vel = np.abs(np.diff(q_bfs_50[:, arm_idxs], axis=0) / dt).max(axis=1) if arm_idxs else np.zeros(len(pos_50) - 1)
+        arm_acc = np.abs(np.diff(q_bfs_50[:, arm_idxs], n=2, axis=0) / (dt * dt)).max(axis=1) if arm_idxs else np.zeros(len(pos_50) - 2)
 
         with torch.no_grad():
             fk_res = fk_35(
@@ -196,6 +236,10 @@ def load_lafan_walk_segments(
             for win_len in (120, 105, 135):
                 t_start = t_end - win_len
                 if t_start < 5:
+                    continue
+                if float(arm_vel[t_start : t_end - 1].max()) > max_arm_vel:
+                    continue
+                if float(arm_acc[t_start : t_end - 2].max()) > max_arm_acc:
                     continue
                 dvec = pos_50[t_end - 1, :2] - pos_50[t_start, :2]
                 disp = float(np.linalg.norm(dvec))
@@ -316,11 +360,10 @@ def stitch_lafan_walk_to_omni_clip(
     la_omni, ra_omni = _local_ankle_features(omni_pos[0], yaw_omni0, omni_bpos[0, la_idx], omni_bpos[0, ra_idx])
     fwd_omni = np.array([np.cos(yaw_omni0), np.sin(yaw_omni0)], dtype=np.float64)
 
-    # Estimate omni initial velocities safely from first few frames
-    n_v = min(6, len(omni_pos))
-    v_omni_0 = np.gradient(omni_pos[:n_v], dt, axis=0)[0]
-    qd_omni_0 = np.gradient(omni_q_bfs[:n_v], dt, axis=0)[0]
-    w_omni_0 = ang_vel_fn(omni_quat_wxyz[:n_v], dt)[0]
+    # Estimate omni initial velocities safely via OLS slope over the first few frames (avoids single-frame noise)
+    v_omni_0 = _estimate_initial_slope(omni_pos, dt, n_frames=6)
+    qd_omni_0 = _estimate_initial_slope(omni_q_bfs, dt, n_frames=6)
+    w_omni_0 = ang_vel_fn(omni_quat_wxyz[: min(6, len(omni_quat_wxyz))], dt)[0]
     v_fwd_omni0 = float(np.dot(v_omni_0[:2], fwd_omni))
 
     # Clamp endpoint joint rates to physical motor range so Cubic Hermite never overshoots wildly
@@ -348,7 +391,7 @@ def stitch_lafan_walk_to_omni_clip(
     T_dur = (blend_frames + 1) * dt
     u = np.arange(1, blend_frames + 1, dtype=np.float64) / float(blend_frames + 1)
 
-    for score, seg_idx in ranked[:60]:
+    for score, seg_idx in ranked[:150]:
         seg = segments[seg_idx]
         yaw_w_end = float(_quat_yaw(seg.quat_wxyz[-1]))
         d_yaw = float((yaw_omni0 - yaw_w_end + np.pi) % (2.0 * np.pi) - np.pi)
@@ -487,5 +530,5 @@ def stitch_lafan_walk_to_omni_clip(
         }
 
     raise RuntimeError(
-        f"No collision-free & ground-safe LAFAN1 walk match found among top-60 candidates (best score={ranked[0][0]:.3f})."
+        f"No collision-free & ground-safe LAFAN1 walk match found among top-150 candidates (best score={ranked[0][0]:.3f})."
     )
