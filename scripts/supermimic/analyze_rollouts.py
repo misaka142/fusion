@@ -25,9 +25,16 @@ import argparse
 import glob
 import json
 import os
-import pickle
+import pathlib
+import sys
 
 import numpy as np
+
+_FUSION_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_SUGAR_RL_SRC = _FUSION_ROOT / "source" / "sugar_rl"
+if str(_SUGAR_RL_SRC) not in sys.path:
+    sys.path.insert(0, str(_SUGAR_RL_SRC))
+from sugar_rl.pickle_compat import load_pickle_compat  # noqa: E402
 
 DT = 0.02
 LEFT_ANKLE, RIGHT_ANKLE = 3, 6  # indices in MotionCommandCfg.body_names (rollout body order)
@@ -124,7 +131,7 @@ class _RefData:
                 anc_p = bpos[:, REF_ANCHOR_IDX, :]  # torso_link = anchor
                 anc_q = bquat[:, REF_ANCHOR_IDX, :]
             with open(os.path.join(folder, "obj_motion_global_50hz.pkl"), "rb") as f:
-                obj = np.asarray(pickle.load(f)["obj_trans"])
+                obj = np.asarray(load_pickle_compat(f)["obj_trans"])
             t = min(len(root), len(obj))
             self._cache[motion_id] = (root[:t], anc_p[:t], anc_q[:t], obj[:t])
         return self._cache[motion_id]

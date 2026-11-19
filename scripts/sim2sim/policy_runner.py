@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import pickle
 import sys
 from typing import Any
 
@@ -31,6 +30,7 @@ for _p in (_SUGAR_RL_SRC, _SUGAR_IL_SRC):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+from sugar_rl.pickle_compat import load_pickle_compat  # noqa: E402
 from sugar_rl.supermimic.hoi_task import HISTORY_LEN, TRACKER_OBS_DIM, TrackerHistoryState  # noqa: E402
 from sugar_rl.supermimic.rotations import (  # noqa: E402
     quat_apply_inverse,
@@ -228,7 +228,7 @@ def load_single_motion_clip(
         bang = torch.as_tensor(rob_npz["body_ang_vel_w"], dtype=torch.float32, device=device)
 
     with open(clip_dir / "obj_motion_global_50hz.pkl", "rb") as f:
-        obj_pkl = pickle.load(f)
+        obj_pkl = load_pickle_compat(f)
 
     contact_np = np.load(clip_dir / "contact_labels_50hz.npy")
     T = min(int(jpos.shape[0]), int(len(obj_pkl["obj_trans"])), int(len(contact_np)))

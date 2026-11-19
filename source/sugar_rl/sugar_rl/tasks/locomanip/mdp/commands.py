@@ -7,8 +7,9 @@ import torch
 from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
-import pickle
 import time
+
+from sugar_rl.pickle_compat import load_pickle_compat
 
 
 from isaaclab.assets import Articulation
@@ -66,7 +67,7 @@ class MotionLoader:
             with np.load(f'{motion_list[i]}/robot_50hz.npz') as f:
                 robot_data = {k: v for k, v in f.items()}
             with open(f'{motion_list[i]}/obj_motion_global_50hz.pkl', 'rb') as f:
-                object_data = pickle.load(f)
+                object_data = load_pickle_compat(f)
 
             data_list.append((robot_data, object_data))
             time_step_total_permotion.append(robot_data["joint_pos"].shape[0])

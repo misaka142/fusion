@@ -44,6 +44,7 @@ from scripts.sim2sim.scene_builder import (  # noqa: E402
 from sugar_il.model.common.normalizer import SingleFieldLinearNormalizer  # noqa: E402
 from sugar_il.model.encoder.generator_state_encoder import GeneratorStateObsEncoder  # noqa: E402
 from sugar_il.policy.generator import Generator  # noqa: E402
+from sugar_rl.pickle_compat import loads_pickle_compat  # noqa: E402
 from sugar_rl.supermimic.hoi_task import SugarHOITask, TRACKER_OBS_DIM  # noqa: E402
 from sugar_rl.supermimic.networks import SuperMimicPolicy  # noqa: E402
 from sugar_rl.supermimic.rotations import quat_apply, quat_normalize  # noqa: E402
@@ -625,7 +626,29 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                     if "max_bend_drift_cm" in m_info:
                         assert float(m_info["max_bend_drift_cm"]) <= 2.25, f"{c.name} cumulative foot drift during bend: {m_info}"
 
-    print("  -> Passed OBB centering, mtime cache, clean OmniCarryBox & checkpoint compat checks!")
+    # 5. Verify cross-NumPy (2.x -> 1.x) pickle deserialization for `obj_motion_global_50hz.pkl`
+    import importlib
+    importlib.import_module("numpy.core.multiarray")
+    pkl_path = real_omni / "data_000" / "obj_motion_global_50hz.pkl"
+    pkl_sample = pkl_path.read_bytes() if pkl_path.is_file() else pickle.dumps({"obj_trans": np.zeros((10, 3), dtype=np.float32)})
+    saved_mods = {k: sys.modules[k] for k in list(sys.modules) if k == "numpy._core" or k.startswith("numpy._core.")}
+    try:
+        for k in list(saved_mods):
+            sys.modules[k] = None  # type: ignore[assignment]
+        sys.modules["numpy._core"] = None  # type: ignore[assignment]
+        sys.modules["numpy._core.multiarray"] = None  # type: ignore[assignment]
+        obj_loaded = loads_pickle_compat(pkl_sample)
+        assert isinstance(obj_loaded, dict) and "obj_trans" in obj_loaded and obj_loaded["obj_trans"].ndim == 2
+        cmd_src = (FUSION_ROOT / "source" / "sugar_rl" / "sugar_rl" / "tasks" / "locomanip" / "mdp" / "commands.py").read_text(encoding="utf-8")
+        ana_src = (FUSION_ROOT / "scripts" / "supermimic" / "analyze_rollouts.py").read_text(encoding="utf-8")
+        assert "load_pickle_compat" in cmd_src and "pickle.load(" not in cmd_src
+        assert "load_pickle_compat" in ana_src and "pickle.load(" not in ana_src
+    finally:
+        for k in ("numpy._core", "numpy._core.multiarray"):
+            sys.modules.pop(k, None)
+        sys.modules.update(saved_mods)
+
+    print("  -> Passed OBB centering, mtime cache, clean OmniCarryBox, NumPy compat & checkpoint checks!")
 
 
 def main() -> None:
