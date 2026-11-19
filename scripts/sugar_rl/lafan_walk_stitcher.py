@@ -37,6 +37,22 @@ class LafanWalkSegment:
     local_ra_end: np.ndarray # (3,) ending right_ankle_roll_link in heading-aligned pelvis frame (z wrt ground)
     v_fwd_end: float         # scalar forward speed along ending heading
     walk_disp_m: float       # net XY displacement of pure walking segment
+    is_stand_buffer: bool = False  # True if clip naturally decelerates to double-support stand buffer
+
+
+def com_to_ankle_margin(
+    pelvis_xy: np.ndarray,
+    torso_xy: np.ndarray,
+    la_xy: np.ndarray,
+    ra_xy: np.ndarray,
+) -> np.ndarray:
+    """Compute XY distance from upper-body COM proxy to the line segment connecting both ankles."""
+    com_xy = 0.5 * (pelvis_xy + torso_xy)
+    seg = ra_xy - la_xy
+    seg2 = np.sum(seg * seg, axis=-1) + 1e-9
+    t_proj = np.clip(np.sum((com_xy - la_xy) * seg, axis=-1) / seg2, 0.0, 1.0)
+    closest = la_xy + t_proj[..., None] * seg
+    return np.linalg.norm(com_xy - closest, axis=-1)
 
 
 def _quat_to_rotmat_np(q: np.ndarray) -> np.ndarray:
@@ -226,14 +242,35 @@ def load_lafan_walk_segments(
         v_xy = np.linalg.norm(lin_vel[:, :2], axis=-1)
         min_foot_z = np.minimum(bpos[:, la_idx, 2], bpos[:, ra_idx, 2])
 
-        # Sliding end-index sampling across smooth straight walking windows (105..140 frames = 2.1s..2.8s).
-        # Together with the ~0.20m - 0.30m blend zone, total pre-contact walk stays in [1.20m, 1.85m].
+        # 1. Extract natural walk -> decelerate -> double-support stand-still buffers (~0.4s settle)
+        # 2. Extract double-support smooth straight-walking endings (both ankles <= 0.060m)
         T50 = len(pos_50)
-        last_accepted_end = -100
-        for t_end in range(135, T50 - 5, 4):
-            if t_end - last_accepted_end < 6:
+        stand_ends: list[tuple[int, bool]] = []
+        last_stand = -100
+        for t_end in range(160, T50 - 5, 3):
+            if t_end - last_stand < 4:
                 continue
-            for win_len in (120, 105, 135):
+            if (
+                float(v_xy[t_end - 20 : t_end - 1].max()) < 0.22
+                and float(bpos[t_end - 1, la_idx, 2]) <= 0.060
+                and float(bpos[t_end - 1, ra_idx, 2]) <= 0.060
+            ):
+                stand_ends.append((t_end, True))
+                last_stand = t_end
+
+        ds_ends: list[tuple[int, bool]] = []
+        last_ds = -100
+        for t_end in range(135, T50 - 5, 4):
+            if t_end - last_ds < 6:
+                continue
+            if float(bpos[t_end - 1, la_idx, 2]) <= 0.060 and float(bpos[t_end - 1, ra_idx, 2]) <= 0.060:
+                ds_ends.append((t_end, False))
+                last_ds = t_end
+
+        for t_end, is_stand in stand_ends + ds_ends:
+            win_choices = (150, 130, 175) if is_stand else (120, 105, 135)
+            disp_bounds = (0.95, 1.75) if is_stand else (1.02, 1.62)
+            for win_len in win_choices:
                 t_start = t_end - win_len
                 if t_start < 5:
                     continue
@@ -243,27 +280,28 @@ def load_lafan_walk_segments(
                     continue
                 dvec = pos_50[t_end - 1, :2] - pos_50[t_start, :2]
                 disp = float(np.linalg.norm(dvec))
-                if not (1.02 <= disp <= 1.62):
+                if not (disp_bounds[0] <= disp <= disp_bounds[1]):
                     continue
                 v_win = v_xy[t_start:t_end]
-                if v_win.min() < 0.25 or v_win.max() > 1.05:
-                    continue
-                v_mean = float(v_win.mean())
-                if not (0.42 <= v_mean <= 0.82):
-                    continue
+                if is_stand:
+                    if float(v_win[: win_len // 2].mean()) < 0.38 or float(v_win.max()) > 1.05:
+                        continue
+                else:
+                    if v_win.min() < 0.25 or v_win.max() > 1.05 or not (0.42 <= float(v_win.mean()) <= 0.82):
+                        continue
                 if float(torso_up_z[t_start:t_end].min()) < 0.92:
                     continue
-                if float(np.ptp(yaw[t_start:t_end])) > np.radians(20.0):
+                if float(np.ptp(yaw[t_start:t_end])) > np.radians(22.0 if is_stand else 20.0):
                     continue
                 move_dir = float(np.arctan2(dvec[1], dvec[0]))
                 heading_err = np.abs(((yaw[t_start:t_end] - move_dir + np.pi) % (2.0 * np.pi)) - np.pi)
-                if float(heading_err.max()) > np.radians(22.0):
+                if float(heading_err.max()) > np.radians(25.0 if is_stand else 22.0):
                     continue
                 foot_slice = min_foot_z[t_start:t_end]
-                if float(foot_slice.min()) < 0.032 or float(foot_slice.max()) > 0.095:
+                if float(foot_slice.min()) < 0.030 or float(foot_slice.max()) > 0.062:
                     continue
 
-                # Check hand forward reach in final 20 frames so arms stay tucked near sides
+                # Check hand forward reach in final frame so arms stay tucked near sides
                 end_Rz_T = _rotate_z_mat(float(yaw[t_end - 1])).T
                 lh_rel = end_Rz_T @ (bpos[t_end - 1, lh_idx] - pos_50[t_end - 1])
                 rh_rel = end_Rz_T @ (bpos[t_end - 1, rh_idx] - pos_50[t_end - 1])
@@ -292,9 +330,9 @@ def load_lafan_walk_segments(
                         local_ra_end=ra_loc,
                         v_fwd_end=v_fwd,
                         walk_disp_m=disp,
+                        is_stand_buffer=is_stand,
                     )
                 )
-                last_accepted_end = t_end
                 break
 
     if not segments:
@@ -335,8 +373,10 @@ def stitch_lafan_walk_to_omni_clip(
     dt: float = 0.02,
 ) -> dict:
     """Select phase-matched LAFAN1 walk segment and smoothly stitch it ahead of `omni[0]`."""
+    pelvis_idx = body_names.index("pelvis")
     la_idx = body_names.index("left_ankle_roll_link")
     ra_idx = body_names.index("right_ankle_roll_link")
+    torso_idx = body_names.index("torso_link")
     check_body_names = [
         "pelvis",
         "torso_link",
@@ -371,13 +411,27 @@ def stitch_lafan_walk_to_omni_clip(
     v_omni_0_c = v_omni_0.copy()
     v_omni_0_c[2] = float(np.clip(v_omni_0_c[2], -0.25, 0.25))
 
+    # Baseline omni[0] grounding & COM stability quick check
+    omni0_min_fz = float(min(omni_bpos[0, la_idx, 2], omni_bpos[0, ra_idx, 2]))
+    if not (0.024 <= omni0_min_fz <= 0.058):
+        raise RuntimeError(f"Omni[0] min foot Z={omni0_min_fz:.4f}m violates ground-contact limit [0.024, 0.058]m.")
+    omni0_margin = float(
+        com_to_ankle_margin(
+            omni_pos[0, :2], omni_bpos[0, torso_idx, :2], omni_bpos[0, la_idx, :2], omni_bpos[0, ra_idx, :2]
+        )
+    )
+    if omni0_margin > 0.14:
+        raise RuntimeError(f"Omni[0] COM-to-ankle margin={omni0_margin:.4f}m exceeds 0.14m limit.")
+
     ranked: list[tuple[float, int]] = []
+    prefer_stand = v_fwd_omni0 <= 0.28
     for idx, seg in enumerate(segments):
         ankle_err = float(np.linalg.norm(seg.local_la_end - la_omni) + np.linalg.norm(seg.local_ra_end - ra_omni))
         pz_err = abs(float(seg.pos_w[-1, 2]) - float(omni_pos[0, 2]))
         vel_err = abs(seg.v_fwd_end - v_fwd_omni0)
-        div_pen = 0.03 * usage_counts.get(seg.source_name, 0)
-        score = ankle_err + 1.5 * pz_err + 0.35 * vel_err + div_pen
+        div_pen = 0.025 * usage_counts.get(seg.source_name, 0)
+        stand_adj = -0.35 if (prefer_stand and seg.is_stand_buffer) else (0.15 if (not prefer_stand and seg.is_stand_buffer) else 0.0)
+        score = ankle_err + 1.5 * pz_err + 0.45 * vel_err + div_pen + stand_adj
         ranked.append((score, idx))
     ranked.sort(key=lambda x: x[0])
 
@@ -463,9 +517,21 @@ def stitch_lafan_walk_to_omni_clip(
             )
         bpos_pre = fk_pre.tracked_pos_w.numpy().astype(np.float64)
 
-        # Verify ground foot height on pre segment (avoid floor penetration < 2.2cm or floating > 9.5cm)
+        # Verify strict ground foot height across approach & blend (never airborne > 5.8cm or sunk < 2.2cm)
         min_fz = np.minimum(bpos_pre[:, la_idx, 2], bpos_pre[:, ra_idx, 2])
-        if float(min_fz.min()) < 0.022 or float(min_fz.max()) > 0.095:
+        if float(min_fz.min()) < 0.022 or float(min_fz.max()) > 0.058:
+            continue
+
+        # Verify upper-body COM projection stays safely within <= 0.14m of the ankle support segment across seam
+        seam_s = max(0, len(seg.pos_w) - 1)
+        seam_margins = com_to_ankle_margin(
+            bpos_pre[seam_s:, pelvis_idx, :2],
+            bpos_pre[seam_s:, torso_idx, :2],
+            bpos_pre[seam_s:, la_idx, :2],
+            bpos_pre[seam_s:, ra_idx, :2],
+        )
+        max_seam_margin = float(max(float(seam_margins.max()), omni0_margin))
+        if max_seam_margin > 0.14:
             continue
 
         # Verify walking start is genuinely farther from box than omni[0] (approach from front, not behind)
@@ -520,12 +586,15 @@ def stitch_lafan_walk_to_omni_clip(
             "contact": full_contact,
             "meta": {
                 "lafan_source": seg.source_name,
+                "is_stand_buffer": bool(seg.is_stand_buffer),
                 "lafan_frames_50hz": int(len(seg.pos_w)),
                 "blend_frames_50hz": int(blend_frames),
                 "pre_walk_path_m": round(pre_walk_path, 3),
                 "phase_score": round(float(score), 4),
                 "min_box_clearance_m": round(min_any_clr, 4),
                 "min_foot_z_m": round(float(min_fz.min()), 4),
+                "max_blend_min_foot_z_m": round(float(max(float(min_fz[seam_s:].max()), omni0_min_fz)), 4),
+                "max_blend_com_margin_m": round(max_seam_margin, 4),
             },
         }
 

@@ -1490,7 +1490,9 @@ def test_13_lafan_walk_stitcher_continuity_and_clearance() -> None:
         out["body_pos_w"][: T_w + T_b, [la_i, ra_i], :], obj_pos[0], obj_rot[0], np.array([0.17, 0.17, 0.18])
     ).min()
     assert clr >= 0.035, f"Approach feet violated box clearance: {clr:.4f}m"
-    print(f"[PASS] Test 13: LAFAN1 walk stitcher SE(2) phase blend smooth (pre_walk={out['meta']['pre_walk_path_m']:.2f}m, clr={clr:.3f}m)")
+    assert out["meta"]["max_blend_min_foot_z_m"] <= 0.058, f"Blend feet airborne: {out['meta']}"
+    assert out["meta"]["max_blend_com_margin_m"] <= 0.14, f"Blend COM margin exceeded: {out['meta']}"
+    print(f"[PASS] Test 13: LAFAN1 walk stitcher SE(2) phase blend smooth (pre_walk={out['meta']['pre_walk_path_m']:.2f}m, clr={clr:.3f}m, com={out['meta']['max_blend_com_margin_m']:.3f}m)")
 
 
 if __name__ == "__main__":

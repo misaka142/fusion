@@ -584,7 +584,7 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
         m_mj = mujoco.MjModel.from_xml_path(str(xml_r))
         assert m_mj.nq == 43
         clips = sorted(real_omni.glob("data_*"))
-        assert len(clips) >= 120, f"Too few high-quality OmniCarryBox clips: {len(clips)}"
+        assert len(clips) >= 100, f"Too few high-quality OmniCarryBox clips: {len(clips)}"
         arm_bfs_idx = [i for i, n in enumerate(G1_ISAACLAB_BFS_JOINT_NAMES) if any(k in n for k in ("shoulder", "elbow", "wrist"))]
         manifest_file = real_omni / "manifest.json"
         has_lafan_walk = manifest_file.is_file() and ("lafan_source" in manifest_file.read_text(encoding="utf-8"))
@@ -614,6 +614,8 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                 assert seam_jump < 10.0, f"{c.name} blend seam joint speed spike detected: {seam_jump:.2f} rad/s"
                 walk_arm_acc = float(np.abs(np.diff(r["joint_pos"][:w_n, arm_bfs_idx], n=2, axis=0)).max() * 2500.0)
                 assert walk_arm_acc <= 45.0, f"{c.name} walking arm jitter accel too high: {walk_arm_acc:.1f} rad/s^2"
+                assert float(m_info["max_blend_min_foot_z_m"]) <= 0.0585, f"{c.name} airborne blend foot: {m_info}"
+                assert float(m_info["max_blend_com_margin_m"]) <= 0.1405, f"{c.name} blend COM drift: {m_info}"
 
     print("  -> Passed OBB centering, mtime cache, clean OmniCarryBox & checkpoint compat checks!")
 

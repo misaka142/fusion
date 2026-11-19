@@ -41,7 +41,7 @@ for _p in (_FUSION_ROOT, _SUGAR_RL_SRC):
         sys.path.insert(0, str(_p))
 
 from scripts.sim2sim.scene_builder import G1_ISAACLAB_BFS_JOINT_NAMES
-from scripts.sugar_rl.lafan_walk_stitcher import load_lafan_walk_segments, stitch_lafan_walk_to_omni_clip
+from scripts.sugar_rl.lafan_walk_stitcher import com_to_ankle_margin, load_lafan_walk_segments, stitch_lafan_walk_to_omni_clip
 from sugar_rl.supermimic.urdf_kinematics import FastTreeKinematics, G1_29DOF_SDK_JOINT_NAMES
 
 TARGET_FPS = 50.0
@@ -481,7 +481,18 @@ def main() -> None:
                 skipped_bent += 1
                 continue
             min_foot_z0 = float(min(bpos_raw[0, la_raw_idx, 2], bpos_raw[0, ra_raw_idx, 2]))
-            if not (0.026 <= min_foot_z0 <= 0.068):
+            if not (0.026 <= min_foot_z0 <= 0.058):
+                skipped_floating += 1
+                continue
+            com_margin_0 = float(
+                com_to_ankle_margin(
+                    bpos_raw[0, 0, :2],
+                    bpos_raw[0, torso_raw_idx, :2],
+                    bpos_raw[0, la_raw_idx, :2],
+                    bpos_raw[0, ra_raw_idx, :2],
+                )
+            )
+            if com_margin_0 > 0.14:
                 skipped_floating += 1
                 continue
 
@@ -507,16 +518,14 @@ def main() -> None:
             smooth_cost = max_v + 0.02 * max_a
             selected_scored.append((base_id, is_orig, smooth_cost, p))
 
-        if args.max_variants_per_base > 0:
-            by_base: dict[str, list[tuple[bool, float, Path]]] = {}
-            for base_id, is_orig, sc, p in selected_scored:
-                by_base.setdefault(base_id, []).append((is_orig, sc, p))
-            selected = []
-            for base_id in sorted(by_base.keys()):
-                grp = sorted(by_base[base_id], key=lambda item: (0 if item[0] else 1, item[1]))
-                selected.extend(item[2] for item in grp[: args.max_variants_per_base])
-        else:
-            selected = [item[3] for item in selected_scored]
+        # Sort within each base so backup candidates can fill the per-base quota if an earlier clip fails strict seam checks
+        by_base: dict[str, list[tuple[bool, float, Path]]] = {}
+        for base_id, is_orig, sc, p in selected_scored:
+            by_base.setdefault(base_id, []).append((is_orig, sc, p))
+        selected = []
+        for base_id in sorted(by_base.keys()):
+            grp = sorted(by_base[base_id], key=lambda item: (0 if item[0] else 1, item[1]))
+            selected.extend(item[2] for item in grp)
     else:
         selected = candidate_paths
 
@@ -584,7 +593,16 @@ def main() -> None:
     manifest = []
     floor_shifts_mm = []
     kept_idx = 0
+    kept_per_base: dict[str, int] = {}
     for idx, src_npz in enumerate(selected):
+        base_id = "_".join(src_npz.stem.split("_")[:3])
+        if (
+            args.subset.startswith("pick_carry_place")
+            and not args.no_posture_filter
+            and args.max_variants_per_base > 0
+            and kept_per_base.get(base_id, 0) >= args.max_variants_per_base
+        ):
+            continue
         with np.load(src_npz) as d:
             q_in = d["qpos"].astype(np.float64)
             src_fps = float(d["fps"])
@@ -746,6 +764,7 @@ def main() -> None:
         entry.update(stitch_meta)
         manifest.append(entry)
         kept_idx += 1
+        kept_per_base[base_id] = kept_per_base.get(base_id, 0) + 1
 
         if kept_idx % 20 == 0 or kept_idx == 1 or (idx + 1) == len(selected):
             walk_info = f" | walk=+{stitch_meta['pre_walk_path_m']:.2f}m ({stitch_meta['lafan_source']})" if stitch_meta else ""
