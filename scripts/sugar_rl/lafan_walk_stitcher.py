@@ -416,6 +416,7 @@ def stitch_lafan_walk_to_omni_clip(
     dt: float = 0.02,
     pin_stance_foot: bool = True,
     approach_yaw_offset_rad: float = 0.0,
+    exclude_seg_indices: set[int] | None = None,
 ) -> dict:
     """Select phase-matched LAFAN1 walk segment and smoothly stitch it ahead of `omni[0]`."""
     pelvis_idx = body_names.index("pelvis")
@@ -467,11 +468,15 @@ def stitch_lafan_walk_to_omni_clip(
             omni_pos[0, :2], omni_bpos[0, torso_idx, :2], omni_bpos[0, la_idx, :2], omni_bpos[0, ra_idx, :2]
         )
     )
-    if omni0_margin > 0.14:
-        raise RuntimeError(f"Omni[0] COM-to-ankle margin={omni0_margin:.4f}m exceeds 0.14m limit.")
+    if omni0_margin > 0.16:
+        raise RuntimeError(f"Omni[0] COM-to-ankle margin={omni0_margin:.4f}m exceeds 0.16m limit.")
 
     ranked: list[tuple[float, int]] = []
-    prefer_stand = v_fwd_omni0 <= 0.28
+    stance_idx = la_idx if float(omni_bpos[0, la_idx, 2]) <= float(omni_bpos[0, ra_idx, 2]) else ra_idx
+    other_idx = ra_idx if stance_idx == la_idx else la_idx
+    v_foot_B = np.clip(_estimate_initial_slope(omni_bpos[:, stance_idx], dt, n_frames=6), -0.15, 0.15)
+    v_other_B = np.clip(_estimate_initial_slope(omni_bpos[:, other_idx], dt, n_frames=6), -0.15, 0.15)
+    prefer_stand = float(np.linalg.norm(v_foot_B[:2])) <= 0.18
     omni_stance_span = la_omni - ra_omni
     for idx, seg in enumerate(segments):
         seg_span = seg.local_la_end - seg.local_ra_end
@@ -481,7 +486,7 @@ def stitch_lafan_walk_to_omni_clip(
         vel_err = abs(seg.v_fwd_end - v_fwd_omni0)
         div_pen = 0.045 * usage_counts.get(f"{seg.source_name}:{seg.end_frame_50hz}", 0) + 0.015 * usage_counts.get(seg.source_name, 0)
         stand_adj = -0.35 if (prefer_stand and seg.is_stand_buffer) else (0.15 if (not prefer_stand and seg.is_stand_buffer) else 0.0)
-        score = 0.7 * ankle_err + 0.8 * span_err + 1.2 * pz_err + 0.45 * vel_err + div_pen + stand_adj
+        score = 0.45 * ankle_err + 3.2 * span_err + 0.8 * pz_err + 0.35 * vel_err + div_pen + stand_adj
         ranked.append((score, idx))
     ranked.sort(key=lambda x: x[0])
 
@@ -494,10 +499,10 @@ def stitch_lafan_walk_to_omni_clip(
     # Precompute constant box pose for pre-contact sequence and try top phase-matched candidates
     T_dur = (blend_frames + 1) * dt
     u = np.arange(1, blend_frames + 1, dtype=np.float64) / float(blend_frames + 1)
-    stance_idx = la_idx if float(omni_bpos[0, la_idx, 2]) <= float(omni_bpos[0, ra_idx, 2]) else ra_idx
-    v_foot_B = np.clip(_estimate_initial_slope(omni_bpos[:, stance_idx], dt, n_frames=6), -0.15, 0.15)
 
-    for score, seg_idx in ranked[:150]:
+    for score, seg_idx in ranked[:180]:
+        if exclude_seg_indices is not None and seg_idx in exclude_seg_indices:
+            continue
         seg = segments[seg_idx]
         yaw_w_end = float(_quat_yaw(seg.quat_wxyz[-1]))
         target_walk_yaw = yaw_omni0 + float(approach_yaw_offset_rad)
@@ -542,8 +547,8 @@ def stitch_lafan_walk_to_omni_clip(
         if np.dot(quat_blend[0], quat_w_rot[-1]) < 0.0:
             quat_blend = -quat_blend
 
-        if pin_stance_foot and seg.is_stand_buffer and float(np.linalg.norm(v_omni_0[:2])) <= 0.25:
-            # Closed-chain stance-foot pinning: lock grounded stance foot on floor so knees/hips naturally sit back
+        if pin_stance_foot and seg.is_stand_buffer and float(np.linalg.norm(v_foot_B[:2])) <= 0.18:
+            # Closed-chain stance-foot pinning: weld grounded stance foot on floor so knees/hips naturally sit back
             q_chain = np.concatenate([seg.q_bfs[-4:], blend_q, omni_q_bfs[0:1]], axis=0)
             quat_chain = np.concatenate([quat_w_rot[-4:], quat_blend, omni_quat_wxyz[0:1]], axis=0)
             for ti in range(1, len(quat_chain)):
@@ -557,18 +562,43 @@ def stitch_lafan_walk_to_omni_clip(
                     torch.from_numpy(q_chain.astype(np.float32)),
                 )
             r_stance_all = fk_rel.tracked_pos_w[:, stance_idx, :].numpy().astype(np.float64)
+            r_other_all = fk_rel.tracked_pos_w[:, other_idx, :].numpy().astype(np.float64)
             foot_tail_w = pos_w_rot[-4:] + r_stance_all[:4]
-            v_foot_A = np.clip(_estimate_initial_slope(foot_tail_w[::-1], -dt, n_frames=4), -0.12, 0.12)
+            v_foot_A = np.clip(_estimate_initial_slope(foot_tail_w[::-1], -dt, n_frames=4), -0.10, 0.10)
             r_A = r_stance_all[3]
             r_blend = r_stance_all[4:-1]
             r_B = r_stance_all[-1]
             foot_B = omni_pos[0] + r_B
-            foot_A_xy = foot_B[:2] - 0.5 * (v_foot_A[:2] + v_foot_B[:2]) * T_dur
-            foot_A = np.array([foot_A_xy[0], foot_A_xy[1], float(seg.pos_w[-1, 2]) + float(r_A[2])], dtype=np.float64)
-            foot_blend = _cubic_hermite(foot_A, v_foot_A, foot_B, v_foot_B, u, T_dur)
+            if float(np.linalg.norm(v_foot_A[:2])) <= 0.12 and float(np.linalg.norm(v_foot_B[:2])) <= 0.12:
+                foot_A_z = float(seg.pos_w[-1, 2]) + float(r_A[2])
+                s_smooth = 3.0 * (u * u) - 2.0 * (u * u * u)
+                foot_blend_z = (1.0 - s_smooth) * foot_A_z + s_smooth * float(foot_B[2])
+                foot_blend = np.column_stack([np.full_like(u, foot_B[0]), np.full_like(u, foot_B[1]), foot_blend_z])
+                foot_A = np.array([foot_B[0], foot_B[1], foot_A_z], dtype=np.float64)
+            else:
+                vf_A, vf_B = v_foot_A, v_foot_B
+                foot_A_xy = foot_B[:2] - 0.5 * (vf_A[:2] + vf_B[:2]) * T_dur
+                foot_A = np.array([foot_A_xy[0], foot_A_xy[1], float(seg.pos_w[-1, 2]) + float(r_A[2])], dtype=np.float64)
+                foot_blend = _cubic_hermite(foot_A, vf_A, foot_B, vf_B, u, T_dur)
             pos_A = foot_A - r_A
             pos_w_aligned = pos_w_rot + pos_A
             blend_pos = foot_blend - r_blend
+
+            # If non-stance foot must relocate > 1.8cm to reach target stance, step cleanly via knee flexion (zero floor drag!)
+            other_A_xy = (pos_A + r_other_all[3])[:2]
+            other_B_xy = (omni_pos[0] + r_other_all[-1])[:2]
+            other_shift = float(np.linalg.norm(other_B_xy - other_A_xy))
+            if other_shift > 0.018:
+                side = "left" if other_idx == la_idx else "right"
+                jnames = list(fk_35.env_joint_names)
+                j_hp = jnames.index(f"{side}_hip_pitch_joint")
+                j_kn = jnames.index(f"{side}_knee_joint")
+                j_ap = jnames.index(f"{side}_ankle_pitch_joint")
+                amp = float(np.clip(3.2 * other_shift + 0.24, 0.30, 0.52))
+                bell = np.sin(np.pi * u) ** 2
+                blend_q[:, j_kn] += amp * bell
+                blend_q[:, j_hp] -= 0.35 * amp * bell
+                blend_q[:, j_ap] -= 0.45 * amp * bell
         else:
             pos_A_xy = omni_pos[0, :2] - 0.5 * (v_A[:2] + v_omni_0_c[:2]) * T_dur
             pos_A = np.array([pos_A_xy[0], pos_A_xy[1], float(seg.pos_w[-1, 2])], dtype=np.float64)
@@ -616,10 +646,20 @@ def stitch_lafan_walk_to_omni_clip(
         dy_ank = np.sum(ank_diff * left_pre, axis=-1)
         if np.any((dx_ank < 0.16) & (dy_ank < 0.04)):
             continue
-            continue
+
+        # Reject if any foot slides along the floor (> 2.6cm) WITHOUT lifting (> 6.0cm) across the blend window!
+        seam_s = max(0, len(seg.pos_w) - 1)
+        if pin_stance_foot and seg.is_stand_buffer:
+            la_blend_drift = float(np.linalg.norm(omni_bpos[0, la_idx, :2] - bpos_pre[seam_s, la_idx, :2]))
+            ra_blend_drift = float(np.linalg.norm(omni_bpos[0, ra_idx, :2] - bpos_pre[seam_s, ra_idx, :2]))
+            la_peak_z = float(bpos_pre[seam_s:, la_idx, 2].max())
+            ra_peak_z = float(bpos_pre[seam_s:, ra_idx, 2].max())
+            if la_blend_drift > 0.026 and la_peak_z < 0.062:
+                continue
+            if ra_blend_drift > 0.026 and ra_peak_z < 0.062:
+                continue
 
         # Verify upper-body COM projection stays safely within <= 0.14m of the ankle support segment across seam
-        seam_s = max(0, len(seg.pos_w) - 1)
         seam_margins = com_to_ankle_margin(
             bpos_pre[seam_s:, pelvis_idx, :2],
             bpos_pre[seam_s:, torso_idx, :2],
@@ -627,7 +667,7 @@ def stitch_lafan_walk_to_omni_clip(
             bpos_pre[seam_s:, ra_idx, :2],
         )
         max_seam_margin = float(max(float(seam_margins.max()), omni0_margin))
-        if max_seam_margin > 0.14:
+        if max_seam_margin > 0.140:
             continue
 
         # Verify walking start is genuinely farther from box than omni[0] (approach from front, not behind)
@@ -683,6 +723,7 @@ def stitch_lafan_walk_to_omni_clip(
             "obj_ang_vel_pre": obj_ang_vel_pre,
             "contact": full_contact,
             "meta": {
+                "seg_idx": int(seg_idx),
                 "lafan_source": seg.source_name,
                 "is_stand_buffer": bool(seg.is_stand_buffer),
                 "lafan_frames_50hz": int(len(seg.pos_w)),

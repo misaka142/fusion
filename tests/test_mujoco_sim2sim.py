@@ -620,6 +620,10 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                     assert float(m_info["min_hand_dy_m"]) >= 0.24, f"{c.name} crossed/narrow arms: {m_info}"
                     assert float(m_info["min_leg_dist_cm"]) >= 1.25, f"{c.name} leg collision risk: {m_info}"
                     assert float(m_info["com_toe_pick_cm"]) <= 0.0, f"{c.name} forward CoM tip at pickup: {m_info}"
+                    if "max_pre_skate_cm" in m_info:
+                        assert float(m_info["max_pre_skate_cm"]) <= 2.25, f"{c.name} foot skating before pickup: {m_info}"
+                    if "max_bend_drift_cm" in m_info:
+                        assert float(m_info["max_bend_drift_cm"]) <= 2.25, f"{c.name} cumulative foot drift during bend: {m_info}"
 
     print("  -> Passed OBB centering, mtime cache, clean OmniCarryBox & checkpoint compat checks!")
 
