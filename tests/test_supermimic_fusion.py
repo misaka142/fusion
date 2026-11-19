@@ -1361,6 +1361,125 @@ def test_12_omniretarget_clean_usda_and_bridge_sync() -> None:
     print("[PASS] Test 12: CarryBox v1 strict anti-collision, hands-only sensor, fail-fast USDA & train.py override")
 
 
+def test_13_lafan_walk_stitcher_continuity_and_clearance() -> None:
+    """Verify SE(2) phase-matched stitching produces C1-smooth positions, consistent gradients, and safe box clearance."""
+    import numpy as np
+    from scripts.sugar_rl.lafan_walk_stitcher import (
+        LafanWalkSegment,
+        _box_obb_surface_distance,
+        stitch_lafan_walk_to_omni_clip,
+    )
+    from scripts.sugar_rl.convert_omniretarget_to_sugar import SUGAR_RAW_35_BODY_NAMES, _ang_vel_world_from_quats
+
+    fk = FastTreeKinematics(device="cpu")
+    dt = 0.02
+    T_w, T_b, T_o = 120, 25, 40
+
+    # Synthetic LAFAN walk along +X at 0.65 m/s in standing posture
+    t_w = np.arange(T_w, dtype=np.float64) * dt
+    pos_w = np.zeros((T_w, 3), dtype=np.float64)
+    pos_w[:, 0] = 0.65 * t_w
+    pos_w[:, 2] = 0.79
+    quat_w = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (T_w, 1))
+    q_w = np.zeros((T_w, 29), dtype=np.float64)
+    q_w[:, 0] = 0.15 * np.sin(2.0 * np.pi * t_w / 0.8)  # subtle walking swing
+    with torch.no_grad():
+        fk_w = fk(
+            torch.from_numpy(pos_w.astype(np.float32)),
+            torch.from_numpy(quat_w.astype(np.float32)),
+            torch.from_numpy(q_w.astype(np.float32)),
+        )
+    bpos_w = fk_w.tracked_pos_w.numpy().astype(np.float64)
+    fk_35 = FastTreeKinematics(
+        urdf_or_xml_path=(REPO_ROOT / "descriptions" / "robots" / "g1" / "g1_29dof_rev_1_0_with_rubber_hand.urdf")
+        if (REPO_ROOT / "descriptions" / "robots" / "g1" / "g1_29dof_rev_1_0_with_rubber_hand.urdf").is_file()
+        else None,
+        tracked_body_names=[n for n in SUGAR_RAW_35_BODY_NAMES if n in FastTreeKinematics(device="cpu").link_to_idx],
+        device="cpu",
+    )
+    body_names_35 = list(fk_35.tracked_body_names)
+    la_i = body_names_35.index("left_ankle_roll_link")
+    ra_i = body_names_35.index("right_ankle_roll_link")
+    with torch.no_grad():
+        fk_w35 = fk_35(
+            torch.from_numpy(pos_w.astype(np.float32)),
+            torch.from_numpy(quat_w.astype(np.float32)),
+            torch.from_numpy(q_w.astype(np.float32)),
+        )
+    bpos_w35 = fk_w35.tracked_pos_w.numpy().astype(np.float64)
+    vel_w = np.gradient(pos_w, dt, axis=0)
+    qd_w = np.gradient(q_w, dt, axis=0)
+    ang_w = _ang_vel_world_from_quats(quat_w, dt)
+
+    seg = LafanWalkSegment(
+        source_name="walk_synth.csv",
+        start_frame_50hz=0,
+        end_frame_50hz=T_w,
+        pos_w=pos_w,
+        quat_wxyz=quat_w,
+        q_bfs=q_w,
+        qd_bfs_end=qd_w[-1],
+        v_pelvis_end=vel_w[-1],
+        w_pelvis_end=ang_w[-1],
+        local_la_end=bpos_w35[-1, la_i] - np.array([pos_w[-1, 0], pos_w[-1, 1], 0.0]),
+        local_ra_end=bpos_w35[-1, ra_i] - np.array([pos_w[-1, 0], pos_w[-1, 1], 0.0]),
+        v_fwd_end=0.65,
+        walk_disp_m=float(pos_w[-1, 0] - pos_w[0, 0]),
+    )
+
+    # Synthetic rotated OmniCarryBox clip starting upright 0.48m behind box along yaw=pi/4
+    yaw_o = np.pi / 4.0
+    t_o = np.arange(T_o, dtype=np.float64) * dt
+    pos_o = np.zeros((T_o, 3), dtype=np.float64)
+    pos_o[:, 0] = 0.25 * t_o * np.cos(yaw_o)
+    pos_o[:, 1] = 0.25 * t_o * np.sin(yaw_o)
+    pos_o[:, 2] = 0.785
+    quat_o = np.tile(np.array([np.cos(0.5 * yaw_o), 0.0, 0.0, np.sin(0.5 * yaw_o)]), (T_o, 1))
+    q_o = np.zeros((T_o, 29), dtype=np.float64)
+    with torch.no_grad():
+        fk_o35 = fk_35(
+            torch.from_numpy(pos_o.astype(np.float32)),
+            torch.from_numpy(quat_o.astype(np.float32)),
+            torch.from_numpy(q_o.astype(np.float32)),
+        )
+    bpos_o35 = fk_o35.tracked_pos_w.numpy().astype(np.float64)
+    obj_pos = np.repeat(np.array([[0.48 * np.cos(yaw_o), 0.48 * np.sin(yaw_o), 0.18]]), T_o, axis=0)
+    obj_rot = np.repeat(np.eye(3)[None, ...], T_o, axis=0)
+    contact_o = np.zeros(T_o, dtype=bool)
+    contact_o[15:] = True
+
+    out = stitch_lafan_walk_to_omni_clip(
+        omni_pos=pos_o,
+        omni_quat_wxyz=quat_o,
+        omni_q_bfs=q_o,
+        omni_bpos=bpos_o35,
+        omni_obj_pos=obj_pos,
+        omni_obj_rot=obj_rot,
+        omni_contact=contact_o,
+        box_half_extents=np.array([0.17, 0.17, 0.18]),
+        segments=[seg],
+        usage_counts={},
+        fk_35=fk_35,
+        body_names=body_names_35,
+        ang_vel_fn=_ang_vel_world_from_quats,
+        blend_frames=T_b,
+        dt=dt,
+    )
+    assert out["joint_pos"].shape == (T_w + T_b + T_o, 29)
+    assert out["meta"]["pre_walk_path_m"] >= 1.20
+    assert not out["contact"][: T_w + T_b].any() and out["contact"][-1]
+    # Check smooth velocity across join (no sudden step discontinuity)
+    q_step_diff = np.abs(np.diff(out["joint_pos"], axis=0) / dt).max()
+    assert q_step_diff < 5.0, f"Excessive joint speed spike at blend seam: {q_step_diff:.2f} rad/s"
+    pelvis_v_diff = np.abs(np.diff(out["body_lin_vel_w"][:, 0, :], axis=0)).max()
+    assert pelvis_v_diff < 0.08, f"Excessive pelvis accel jump across blend: {pelvis_v_diff:.4f} m/s/step"
+    clr = _box_obb_surface_distance(
+        out["body_pos_w"][: T_w + T_b, [la_i, ra_i], :], obj_pos[0], obj_rot[0], np.array([0.17, 0.17, 0.18])
+    ).min()
+    assert clr >= 0.035, f"Approach feet violated box clearance: {clr:.4f}m"
+    print(f"[PASS] Test 13: LAFAN1 walk stitcher SE(2) phase blend smooth (pre_walk={out['meta']['pre_walk_path_m']:.2f}m, clr={clr:.3f}m)")
+
+
 if __name__ == "__main__":
     print(f"Running SuperMimic x SUGAR test suite on device: {DEVICE} (PyTorch {torch.__version__})")
     test_1_rotations_and_zero_angle_gradients()
@@ -1375,4 +1494,5 @@ if __name__ == "__main__":
     test_10_colab_interrupt_auto_resume_and_generator_ckpt()
     test_11_fast_fk_depth_vectorization_and_scale_grad()
     test_12_omniretarget_clean_usda_and_bridge_sync()
-    print("\nALL 12 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")
+    test_13_lafan_walk_stitcher_continuity_and_clearance()
+    print("\nALL 13 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")

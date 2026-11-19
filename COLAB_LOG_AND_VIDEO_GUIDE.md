@@ -14,7 +14,7 @@
 cd /content/fusion
 
 # ==================== 按需修改实验目录名 ====================
-EXP_FOLDER="CarryBox_sm_v1_omni_clean_full"   # 对应 outputs/<EXP_FOLDER>；若留空或不存在则自动打包 outputs 下全部日志
+EXP_FOLDER="CarryBox_sm_v1_lafan_omni_full"   # 对应 outputs/<EXP_FOLDER>；若留空或不存在则自动打包 outputs 下全部日志
 # ==========================================================
 
 STAMP=$(date +%Y%m%d_%H%M%S)
@@ -103,7 +103,7 @@ ls -lh "$LOCAL_ZIP"
 
 - **命令作用**：只提取 `outputs/<EXP_FOLDER>` 下的 `events.out.tfevents.*` 与训练日志 `*.log`（跳过所有大体积模型权重），额外导出一份全量标量数据表 `tb_scalars_all.csv` 与统计摘要 `tb_scalars_summary.json`，打包成仅几百 KB ~ 几 MB 的 `.zip`，同时保存在 `/content/` 与 Google Drive。
 - **关键参数含义**：
-  - `EXP_FOLDER`：实验目录名（默认为 `"CarryBox_sm_v1_omni_clean_full"`；若改成其他实验名如 `"CarryBox_sm_v1_omni_clean_fast_verify"` 则只打包对应目录）。
+  - `EXP_FOLDER`：实验目录名（默认为 `"CarryBox_sm_v1_lafan_omni_full"`；若改成其他实验名如 `"CarryBox_sm_v1_lafan_omni_fast_verify"` 则只打包对应目录）。
   - `size_guidance={"scalars": 0}`：关闭 TensorBoard 默认抽样截断，100% 导出从第 0 轮到最新轮的每一个点。
 - **预期结果与下载方式**：
   1. **方式 A（Colab 网页直接下载）**：点击 Colab 左侧边栏的文件夹图标（Files）并点刷新，在 `/content/` 根目录下找到 `tb_logs_CarryBox_...zip`，右键点击 **`Download`（下载）**；
@@ -308,7 +308,7 @@ cd /content/fusion || exit 1
 # ==================== 换模型生成视频时，修改以下配置区 ====================
 TASK_NAME="CarryBox"          # 1. 任务名: CarryBox | PushBox | KickBox | PickBottle | StandBottle | SitChair
 STAGE_MODE="refiner"          # 2. 阶段模式: refiner (Stage 1) | tracker (Stage 3) | inference (Stage 6 闭环)
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/logs/refiner/model_latest.pt"  # 3. 策略 .pt 权重路径（也可指定 model_200.pt / model_400.pt / model_600.pt）
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_lafan_omni_full/logs/refiner/model_latest.pt"  # 3. 策略 .pt 权重路径（也可指定 model_200.pt / model_400.pt / model_600.pt）
 GEN_CKPT=""                   # 4. 扩散生成器 .ckpt 路径（仅 STAGE_MODE="inference" 必填，其余保持 ""）
 MOTION_DIR="data/OmniCarryBox" # 5. 参考轨迹目录（OmniRetarget 推荐用 data/OmniCarryBox；tracker 模式也可指向 .../rl_dataset）
 
@@ -372,7 +372,7 @@ ls -lh "$DRIVE_VIDEO_DIR"/*.mp4
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="refiner"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/logs/refiner/model_400.pt"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_lafan_omni_full/logs/refiner/model_400.pt"
 GEN_CKPT=""
 MOTION_DIR="data/OmniCarryBox"
 ```
@@ -381,17 +381,17 @@ MOTION_DIR="data/OmniCarryBox"
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="tracker"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/logs/tracker/model_1000.pt"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_lafan_omni_full/logs/tracker/model_1000.pt"
 GEN_CKPT=""
-MOTION_DIR="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/rollout_datasets/refiner/rl_dataset"
+MOTION_DIR="/content/fusion/outputs/CarryBox_sm_v1_lafan_omni_full/rollout_datasets/refiner/rl_dataset"
 ```
 
 #### 模板 3：查看 Stage 6 最终闭环自主推理（`tracker.pt` + `generator.ckpt`）
 ```bash
 TASK_NAME="CarryBox"
 STAGE_MODE="inference"
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/ckpts/tracker.pt"
-GEN_CKPT="/content/fusion/outputs/CarryBox_sm_v1_omni_clean_full/ckpts/generator.ckpt"
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v1_lafan_omni_full/ckpts/tracker.pt"
+GEN_CKPT="/content/fusion/outputs/CarryBox_sm_v1_lafan_omni_full/ckpts/generator.ckpt"
 MOTION_DIR="data/OmniCarryBox"
 ```
 
@@ -399,7 +399,7 @@ MOTION_DIR="data/OmniCarryBox"
 ```bash
 TASK_NAME="PickBottle"
 STAGE_MODE="refiner"
-CKPT_PATH="/content/fusion/outputs/PickBottle_sm_v1_omni_clean_full/logs/refiner/model_1000.pt"
+CKPT_PATH="/content/fusion/outputs/PickBottle_sm_v1_lafan_omni_full/logs/refiner/model_1000.pt"
 GEN_CKPT=""
 MOTION_DIR="data/PickBottle"
 ```

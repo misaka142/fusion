@@ -4,12 +4,12 @@
 #
 # Usage:
 #   bash inference_fusion.sh <TASK_NAME> <EXP_NAME> [NUM_ENVS] [VIDEO_LEN]
-#   (Optional env override: MOTION_DIR=data/OmniCarryBox bash inference_fusion.sh CarryBox sm_v1_omni_clean)
+#   (Optional env override: MOTION_DIR=data/OmniCarryBox bash inference_fusion.sh CarryBox sm_v1_lafan_omni)
 # =============================================================================
 set -uo pipefail
 
 TASK_NAME="${1:-CarryBox}"
-EXP_NAME="${2:-sm_v1_omni_clean}"
+EXP_NAME="${2:-sm_v1_lafan_omni}"
 NUM_ENVS="${3:-4}"
 VIDEO_LEN="${4:-200}"
 

@@ -41,6 +41,7 @@ for _p in (_FUSION_ROOT, _SUGAR_RL_SRC):
         sys.path.insert(0, str(_p))
 
 from scripts.sim2sim.scene_builder import G1_ISAACLAB_BFS_JOINT_NAMES
+from scripts.sugar_rl.lafan_walk_stitcher import load_lafan_walk_segments, stitch_lafan_walk_to_omni_clip
 from sugar_rl.supermimic.urdf_kinematics import FastTreeKinematics, G1_29DOF_SDK_JOINT_NAMES
 
 TARGET_FPS = 50.0
@@ -349,6 +350,24 @@ def main() -> None:
         default=False,
         help="Disable t=0 upright torso & non-contact filtering for pick_carry_place subsets.",
     )
+    ap.add_argument(
+        "--lafan_dir",
+        type=str,
+        default=str(_FUSION_ROOT / "data_lafan1_raw"),
+        help="Path to Unitree G1 LAFAN1 walk CSV directory (`data_lafan1_raw`, expects `g1/walk*.csv`).",
+    )
+    ap.add_argument(
+        "--no_lafan_walk",
+        action="store_true",
+        default=False,
+        help="Disable prepending LAFAN1 straight-walk approach segments ahead of clean CarryBox clips.",
+    )
+    ap.add_argument(
+        "--blend_frames",
+        type=int,
+        default=25,
+        help="Number of 50Hz transition blend frames between LAFAN1 walk and OmniCarryBox (default: 25 = 0.50s).",
+    )
     args = ap.parse_args()
 
     raw_root = Path(args.raw_dir).resolve()
@@ -431,6 +450,22 @@ def main() -> None:
         f"| ConvexHull verts={len(hull_aligned.vertices)}, faces={len(hull_aligned.faces)}"
     )
     print(f"[OmniRetarget -> SUGAR] Floor calibration: {'OFF' if args.no_floor_offset else 'ON (per-clip const Z)'} -> {out_root}")
+    use_lafan = args.subset.startswith("pick_carry_place") and not args.no_lafan_walk
+    lafan_segments = []
+    lafan_usage: dict[str, int] = {}
+    if use_lafan:
+        lafan_root = Path(args.lafan_dir).resolve()
+        lafan_segments = load_lafan_walk_segments(
+            lafan_dir=lafan_root,
+            fk_35=fk_35,
+            sdk_for_bfs=sdk_for_bfs,
+            body_names=SUGAR_RAW_35_BODY_NAMES,
+            resample_catmull_rom_fn=_resample_catmull_rom,
+            resample_quat_slerp_fn=_resample_quat_slerp,
+            ang_vel_fn=_ang_vel_world_from_quats,
+            dt=DT,
+        )
+        print(f"[OmniRetarget + LAFAN1] Loaded {len(lafan_segments)} clean straight-walk windows from `{lafan_root / 'g1'}` (blend={args.blend_frames} frames)")
     print("=" * 82)
 
     t0 = time.perf_counter()
@@ -522,46 +557,92 @@ def main() -> None:
         floor_shifts_mm.append(dz_const * 1000.0)
         clip_folder = out_root / f"data_{kept_idx:03d}"
         clip_folder.mkdir(parents=True, exist_ok=True)
+
+        stitch_meta: dict = {}
+        if use_lafan:
+            stitched = stitch_lafan_walk_to_omni_clip(
+                omni_pos=rob_pos_50,
+                omni_quat_wxyz=rob_quat_50,
+                omni_q_bfs=q_bfs_50,
+                omni_bpos=b_pos.astype(np.float64),
+                omni_obj_pos=obj_pos_al,
+                omni_obj_rot=obj_rot_al,
+                omni_contact=contact_50,
+                box_half_extents=half_ext_al,
+                segments=lafan_segments,
+                usage_counts=lafan_usage,
+                fk_35=fk_35,
+                body_names=SUGAR_RAW_35_BODY_NAMES,
+                ang_vel_fn=_ang_vel_world_from_quats,
+                blend_frames=args.blend_frames,
+                dt=DT,
+            )
+            q_out = stitched["joint_pos"]
+            qd_out = stitched["joint_vel"]
+            bpos_out = stitched["body_pos_w"]
+            bquat_out = stitched["body_quat_w"]
+            blin_out = stitched["body_lin_vel_w"]
+            bang_out = stitched["body_ang_vel_w"]
+            opos_out = stitched["obj_pos"]
+            orot_out = stitched["obj_rot"]
+            olin_out = stitched["obj_lin_vel"]
+            oang_out = np.concatenate([stitched["obj_ang_vel_pre"], obj_ang_vel], axis=0).astype(np.float32)
+            contact_out = stitched["contact"]
+            stitch_meta = stitched["meta"]
+        else:
+            q_out = q_bfs_50.astype(np.float32)
+            qd_out = q_vel_bfs
+            bpos_out = b_pos
+            bquat_out = b_quat
+            blin_out = b_lin
+            bang_out = b_ang
+            opos_out = obj_pos_al.astype(np.float32)
+            orot_out = obj_rot_al.astype(np.float32)
+            olin_out = obj_lin_vel
+            oang_out = obj_ang_vel
+            contact_out = contact_50.astype(bool)
+
         np.savez(
             clip_folder / "robot_50hz.npz",
             fps=np.array([50], dtype=np.int32),
-            joint_pos=q_bfs_50.astype(np.float32),
-            joint_vel=q_vel_bfs,
-            body_pos_w=b_pos,
-            body_quat_w=b_quat,
-            body_lin_vel_w=b_lin,
-            body_ang_vel_w=b_ang,
+            joint_pos=q_out,
+            joint_vel=qd_out,
+            body_pos_w=bpos_out,
+            body_quat_w=bquat_out,
+            body_lin_vel_w=blin_out,
+            body_ang_vel_w=bang_out,
         )
         with open(clip_folder / "obj_motion_global_50hz.pkl", "wb") as f:
             pickle.dump(
                 {
-                    "obj_trans": obj_pos_al.astype(np.float32),
-                    "obj_rot": obj_rot_al.astype(np.float32),
+                    "obj_trans": opos_out,
+                    "obj_rot": orot_out,
                     "obj_scale": float(1.0),
-                    "obj_lin_vel": obj_lin_vel,
-                    "obj_ang_vel": obj_ang_vel,
+                    "obj_lin_vel": olin_out,
+                    "obj_ang_vel": oang_out,
                 },
                 f,
             )
-        np.save(clip_folder / "contact_labels_50hz.npy", contact_50.astype(bool))
+        np.save(clip_folder / "contact_labels_50hz.npy", contact_out)
 
-        knees_deg = np.degrees(q_bfs_50[:, [lk_bfs, rk_bfs]])
-        manifest.append(
-            {
-                "index": kept_idx,
-                "folder": clip_folder.name,
-                "source": src_npz.name,
-                "frames_50hz": len(q_bfs_50),
-                "floor_z_shift_mm": round(dz_const * 1000.0, 3),
-                "t0_torso_up_z": round(torso_up_z0, 4),
-            }
-        )
+        knees_deg = np.degrees(q_out[:, [lk_bfs, rk_bfs]])
+        entry = {
+            "index": kept_idx,
+            "folder": clip_folder.name,
+            "source": src_npz.name,
+            "frames_50hz": int(len(q_out)),
+            "floor_z_shift_mm": round(dz_const * 1000.0, 3),
+            "t0_torso_up_z": round(torso_up_z0, 4),
+        }
+        entry.update(stitch_meta)
+        manifest.append(entry)
         kept_idx += 1
 
         if kept_idx % 15 == 0 or kept_idx == 1 or (idx + 1) == len(selected):
+            walk_info = f" | walk=+{stitch_meta['pre_walk_path_m']:.2f}m ({stitch_meta['lafan_source']})" if stitch_meta else ""
             print(
                 f"  [{kept_idx:3d} kept | scan {idx + 1:3d}/{len(selected)}] {clip_folder.name} <- {src_npz.name:34s} | "
-                f"T={len(q_bfs_50):3d} | torso_up={torso_up_z0:.2f} | knee={knees_deg.mean():4.1f}° | dz=+{dz_const*1000:4.2f}mm"
+                f"T={len(q_out):3d} | torso_up={torso_up_z0:.2f} | dz=+{dz_const*1000:4.2f}mm{walk_info}"
             )
 
     if not manifest:

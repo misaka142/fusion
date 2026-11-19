@@ -585,6 +585,13 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
         assert m_mj.nq == 43
         clips = sorted(real_omni.glob("data_*"))
         assert len(clips) >= 40, f"Too few cleaned OmniCarryBox clips: {len(clips)}"
+        manifest_file = real_omni / "manifest.json"
+        has_lafan_walk = manifest_file.is_file() and ("lafan_source" in manifest_file.read_text(encoding="utf-8"))
+        manifest_by_folder = (
+            {m["folder"]: m for m in json.loads(manifest_file.read_text(encoding="utf-8"))}
+            if has_lafan_walk
+            else {}
+        )
         for c in clips:
             r = np.load(c / "robot_50hz.npz")
             cl = np.load(c / "contact_labels_50hz.npy")
@@ -592,6 +599,18 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
             up_z = float(R.from_quat([tq[1], tq[2], tq[3], tq[0]]).as_matrix()[2, 2])
             assert up_z >= 0.80, f"{c.name} has bent t=0 start: torso_up_z={up_z:.3f}"
             assert not bool(cl[0]), f"{c.name} has t=0 contact=True!"
+            if has_lafan_walk:
+                m_info = manifest_by_folder[c.name]
+                w_n = int(m_info["lafan_frames_50hz"])
+                b_n = int(m_info["blend_frames_50hz"])
+                idx_c = np.flatnonzero(cl)
+                assert len(idx_c) > 0 and idx_c[0] >= w_n + b_n, f"{c.name} missing pre-contact approach segment!"
+                walk_seg = r["body_pos_w"][: idx_c[0] + 1, 0, :2]
+                walk_dist = float(np.linalg.norm(np.diff(walk_seg, axis=0), axis=-1).sum())
+                assert walk_dist >= 1.15, f"{c.name} approach walk too short: {walk_dist:.2f}m"
+                seam_slice = r["joint_pos"][max(0, w_n - 2) : w_n + b_n + 3]
+                seam_jump = float(np.abs(np.diff(seam_slice, axis=0)).max() * 50.0)
+                assert seam_jump < 10.0, f"{c.name} blend seam joint speed spike detected: {seam_jump:.2f} rad/s"
 
     print("  -> Passed OBB centering, mtime cache, clean OmniCarryBox & checkpoint compat checks!")
 

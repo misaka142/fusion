@@ -78,6 +78,7 @@ descriptions
 data
 data_kin_fixed
 data_omniretarget*
+data_lafan1*
 outputs
 demo_ckpts
 .venv*
