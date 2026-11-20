@@ -64,7 +64,7 @@ class SuperMimicTrainCfg:
     # Policy BPTT & decoupled exploration settings
     policy_hidden_dims: tuple[int, ...] = (512, 256, 128)
     use_ref_residual: bool = True
-    legs_use_residual: bool = False                  # Legs default to free balance around q_default; waist/arms use q_ref
+    legs_use_residual: bool = True                   # Apply smooth q_ref feed-forward baseline across all 29 joints
     init_noise_std: float = 0.20
     leg_explore_std_init: float = 0.12
     arm_explore_std_init: float = 0.30
@@ -73,7 +73,8 @@ class SuperMimicTrainCfg:
     policy_updates_per_iter: int = 8
     policy_batch_size: int = 2048
     frontier_sample_frac: float = 0.40               # 40% imagination starts prioritize highest reached trajectory steps
-    residual_rate_weight: float = 0.02               # Smoothness penalty on pure network residual (avoids wrist scale spikes)
+    residual_rate_weight: float = 0.15               # Smoothness penalty on 1st-order residual rate (dampens oscillation)
+    residual_jerk_weight: float = 0.10               # 2nd-order residual jerk penalty (suppresses 25Hz sawtooth chatter)
     policy_lr: float = 3e-4
     lr_min_scale: float = 0.15                       # Cosine LR decay floor multiplier
     bptt_grad_decay: float = 0.98                    # Mild state Jacobian damping across 32 steps for stability
@@ -646,7 +647,9 @@ class SuperMimicTrainer:
         fk_aquat: Tensor,
         fk_rmat: Tensor,
         prev_res: Tensor,
+        prev2_res: Tensor,
         step0_flag: Tensor,
+        step_ge2_flag: Tensor,
         feet_air_cur: Tensor,
         prev_feet_gnd: Tensor,
         t_cur: Tensor,
@@ -779,6 +782,8 @@ class SuperMimicTrainer:
             step_bc = self._zero_scalar
 
         step_res_rate = ((res_cur - prev_res) ** 2).sum(dim=-1) * (1.0 - step0_flag)
+        step_res_jerk = ((res_cur - 2.0 * prev_res + prev2_res) ** 2).sum(dim=-1) * step_ge2_flag
+        next_prev2_res = prev_res
         next_prev_res = res_cur * (1.0 - step0_flag) + res_cur.detach() * step0_flag
 
         s_next, c_logits = self._raw_world_model.step(
@@ -828,12 +833,14 @@ class SuperMimicTrainer:
             fk_next_scaled.root_rotmat_w,
             a_cur,
             next_prev_res,
+            next_prev2_res,
             r_info["next_feet_air_time"],
             r_info["curr_feet_gnd"],
             r_step,
             p_term,
             step_bc,
             step_res_rate,
+            step_res_jerk,
             r_info["rew/tracking_obj"].mean(),
             h_ang_n,
             h_q_n,
@@ -867,6 +874,7 @@ class SuperMimicTrainer:
         bc_accum = torch.zeros((), dtype=torch.float32, device=self.device)
         surv_accum = torch.zeros((), dtype=torch.float32, device=self.device)
         obj_rew_accum = torch.zeros((), dtype=torch.float32, device=self.device)
+        res_jerk_accum = torch.zeros((), dtype=torch.float32, device=self.device)
 
         try:
             for _ in range(self.cfg.policy_updates_per_iter):
@@ -942,9 +950,11 @@ class SuperMimicTrainer:
                 imagined_return = torch.zeros(B, dtype=torch.float32, device=self.device)
                 bc_loss_sum = torch.zeros((), dtype=torch.float32, device=self.device)
                 res_smooth_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+                res_jerk_sum = torch.zeros((), dtype=torch.float32, device=self.device)
                 discount_weight = torch.ones(B, dtype=torch.float32, device=self.device)
                 step_obj_rew_sum = torch.zeros((), dtype=torch.float32, device=self.device)
                 prev_res = torch.zeros_like(prev_a)
+                prev2_res = torch.zeros_like(prev_a)
 
                 fk_tpos = fk_cur.tracked_pos_w
                 fk_tmat = fk_cur.tracked_rotmat_w
@@ -1015,6 +1025,7 @@ class SuperMimicTrainer:
                         t_fut_obj_pos = t_fut_obj_quat = t_fut_obj_v = t_fut_obj_w = None
 
                     step0_flag = self._one_scalar if tau == 0 else self._zero_scalar
+                    step_ge2_flag = self._one_scalar if tau >= 2 else self._zero_scalar
                     (
                         s_next_raw,
                         s_cur,
@@ -1028,12 +1039,14 @@ class SuperMimicTrainer:
                         fk_rmat,
                         prev_a,
                         prev_res,
+                        prev2_res,
                         feet_air_cur,
                         prev_feet_gnd,
                         r_step,
                         p_term,
                         step_bc,
                         step_res_rate,
+                        step_res_jerk,
                         step_obj_rew,
                         h_ang,
                         h_q,
@@ -1052,7 +1065,9 @@ class SuperMimicTrainer:
                         fk_aquat,
                         fk_rmat,
                         prev_res,
+                        prev2_res,
                         step0_flag,
+                        step_ge2_flag,
                         feet_air_cur,
                         prev_feet_gnd,
                         t_cur,
@@ -1098,6 +1113,7 @@ class SuperMimicTrainer:
                     if self.teacher_policy is not None:
                         bc_loss_sum = bc_loss_sum + (discount_weight.detach() * step_bc).mean()
                     res_smooth_sum = res_smooth_sum + (discount_weight.detach() * step_res_rate).mean()
+                    res_jerk_sum = res_jerk_sum + (discount_weight.detach() * step_res_jerk).mean()
                     step_obj_rew_sum = step_obj_rew_sum + step_obj_rew
                     imagined_return = imagined_return + discount_weight * r_step
 
@@ -1188,7 +1204,8 @@ class SuperMimicTrainer:
 
                 bc_term = bc_loss_sum / float(H)
                 res_rate_loss = self.cfg.residual_rate_weight * self.task.step_dt * res_smooth_sum
-                policy_loss = -imagined_return.mean() + bc_coef * bc_term + res_rate_loss
+                res_jerk_loss = self.cfg.residual_jerk_weight * self.task.step_dt * res_jerk_sum
+                policy_loss = -imagined_return.mean() + bc_coef * bc_term + res_rate_loss + res_jerk_loss
 
                 self.policy_opt.zero_grad(set_to_none=True)
                 policy_loss.backward()
@@ -1202,6 +1219,7 @@ class SuperMimicTrainer:
                 bc_accum = bc_accum + bc_term.detach()
                 surv_accum = surv_accum + discount_weight.mean().detach()
                 obj_rew_accum = obj_rew_accum + (step_obj_rew_sum / float(max(1, H))).detach()
+                res_jerk_accum = res_jerk_accum + (res_jerk_sum / float(max(1, H))).detach()
         finally:
             _freeze_params(self._raw_world_model, False)
             _freeze_params(self._raw_critic, False)
@@ -1211,6 +1229,7 @@ class SuperMimicTrainer:
             "policy/imagined_return": float((ret_accum / denom).item()),
             "policy/tail_survival_weight": float((surv_accum / denom).item()),
             "policy/imagined_obj_rew": float((obj_rew_accum / denom).item()),
+            "policy/res_jerk": float((res_jerk_accum / denom).item()),
             "policy/action_std": float(self._raw_policy.std().mean().detach().item()),
         }
         if self.teacher_policy is not None:

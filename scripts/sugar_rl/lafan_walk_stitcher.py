@@ -282,21 +282,25 @@ def load_lafan_walk_segments(
             v_xy = np.linalg.norm(lin_vel[:, :2], axis=-1)
             min_foot_z = np.minimum(bpos[:, la_idx, 2], bpos[:, ra_idx, 2])
 
-            # 1. Extract natural walk -> decelerate -> double-support stand-still buffers (~0.4s settle)
+            # 1. Extract natural walk -> decelerate -> compact double-support stand-still buffers
+            #    (strictly 4..18 slow tail frames = 0.08..0.36s; no ~2s lingering idle stand!)
             # 2. Optionally extract double-support smooth straight-walking endings (both ankles <= 0.060m)
             T50 = len(pos_50)
             stand_ends: list[tuple[int, bool]] = []
             last_stand = -100
-            for t_end in range(160, T50 - 5, 3):
-                if t_end - last_stand < 4:
+            for t_end in range(130, T50 - 5, 3):
+                if t_end - last_stand < 5:
                     continue
                 if (
-                    float(v_xy[t_end - 20 : t_end - 1].max()) < 0.22
+                    float(v_xy[t_end - 8 : t_end].max()) < 0.22
                     and float(bpos[t_end - 1, la_idx, 2]) <= 0.058
                     and float(bpos[t_end - 1, ra_idx, 2]) <= 0.058
                 ):
-                    stand_ends.append((t_end, True))
-                    last_stand = t_end
+                    slow_tail = int((v_xy[t_end - 35 : t_end] < 0.22).sum())
+                    pre_mean_v = float(v_xy[t_end - 45 : t_end - 16].mean())
+                    if 4 <= slow_tail <= 18 and pre_mean_v >= 0.24:
+                        stand_ends.append((t_end, True))
+                        last_stand = t_end
 
             ds_ends: list[tuple[int, bool]] = []
             if not only_stand_buffer:
@@ -309,8 +313,8 @@ def load_lafan_walk_segments(
                         last_ds = t_end
 
             for t_end, is_stand in stand_ends + ds_ends:
-                win_choices = (150, 130, 175) if is_stand else (120, 105, 135)
-                disp_bounds = (0.95, 1.75) if is_stand else (1.02, 1.62)
+                win_choices = (105, 120, 140, 160) if is_stand else (120, 105, 135)
+                disp_bounds = (0.78, 1.75) if is_stand else (1.02, 1.62)
                 for win_len in win_choices:
                     t_start = t_end - win_len
                     if t_start < 5:
@@ -323,23 +327,28 @@ def load_lafan_walk_segments(
                     disp = float(np.linalg.norm(dvec))
                     if not (disp_bounds[0] <= disp <= disp_bounds[1]):
                         continue
+                    u_move = dvec / disp
+                    s_proj = (pos_50[t_start:t_end, :2] - pos_50[t_start, :2]) @ u_move
+                    max_back = float((np.maximum.accumulate(s_proj) - s_proj).max())
+                    if max_back > 0.008:
+                        continue
                     v_win = v_xy[t_start:t_end]
                     if is_stand:
-                        if float(v_win[: win_len // 2].mean()) < 0.38 or float(v_win.max()) > 1.05:
+                        if float(v_win[: win_len // 2].mean()) < 0.32 or float(v_win.max()) > 1.05:
                             continue
                     else:
                         if v_win.min() < 0.25 or v_win.max() > 1.05 or not (0.42 <= float(v_win.mean()) <= 0.82):
                             continue
                     if float(torso_up_z[t_start:t_end].min()) < 0.92:
                         continue
-                    if float(np.ptp(yaw[t_start:t_end])) > np.radians(22.0 if is_stand else 20.0):
+                    if float(np.ptp(yaw[t_start:t_end])) > np.radians(24.0 if is_stand else 20.0):
                         continue
                     move_dir = float(np.arctan2(dvec[1], dvec[0]))
                     heading_err = np.abs(((yaw[t_start:t_end] - move_dir + np.pi) % (2.0 * np.pi)) - np.pi)
-                    if float(heading_err.max()) > np.radians(25.0 if is_stand else 22.0):
+                    if float(heading_err.max()) > np.radians(26.0 if is_stand else 22.0):
                         continue
                     foot_slice = min_foot_z[t_start:t_end]
-                    if float(foot_slice.min()) < 0.030 or float(foot_slice.max()) > 0.062:
+                    if float(foot_slice.min()) < 0.028 or float(foot_slice.max()) > 0.062:
                         continue
 
                     # Ensure uncrossed ankles & arms in final frame so arms stay tucked near sides
@@ -472,7 +481,14 @@ def stitch_lafan_walk_to_omni_clip(
         raise RuntimeError(f"Omni[0] COM-to-ankle margin={omni0_margin:.4f}m exceeds 0.16m limit.")
 
     ranked: list[tuple[float, int]] = []
-    stance_idx = la_idx if float(omni_bpos[0, la_idx, 2]) <= float(omni_bpos[0, ra_idx, 2]) else ra_idx
+    la_gnd0 = float(omni_bpos[0, la_idx, 2]) <= 0.055
+    ra_gnd0 = float(omni_bpos[0, ra_idx, 2]) <= 0.055
+    if la_gnd0 and ra_gnd0:
+        proj_la = float(np.dot(omni_bpos[0, la_idx, :2] - omni_pos[0, :2], fwd_omni))
+        proj_ra = float(np.dot(omni_bpos[0, ra_idx, :2] - omni_pos[0, :2], fwd_omni))
+        stance_idx = la_idx if proj_la >= proj_ra else ra_idx
+    else:
+        stance_idx = la_idx if float(omni_bpos[0, la_idx, 2]) <= float(omni_bpos[0, ra_idx, 2]) else ra_idx
     other_idx = ra_idx if stance_idx == la_idx else la_idx
     v_foot_B = np.clip(_estimate_initial_slope(omni_bpos[:, stance_idx], dt, n_frames=6), -0.15, 0.15)
     v_other_B = np.clip(_estimate_initial_slope(omni_bpos[:, other_idx], dt, n_frames=6), -0.15, 0.15)
@@ -534,7 +550,7 @@ def stitch_lafan_walk_to_omni_clip(
         qd_A = np.clip(seg.qd_bfs_end, -4.5, 4.5)
 
         # Cubic Hermite blend for 29 DoFs and Lie-group SO(3) orientation first
-        blend_q = _cubic_hermite(seg.q_bfs[-1], qd_A, omni_q_bfs[0], qd_omni_0_c, u, T_dur)
+        blend_q_base = _cubic_hermite(seg.q_bfs[-1], qd_A, omni_q_bfs[0], qd_omni_0_c, u, T_dur)
 
         R_A = _quat_to_rotmat_np(quat_w_rot[-1])
         R_B = _quat_to_rotmat_np(omni_quat_wxyz[0])
@@ -547,195 +563,223 @@ def stitch_lafan_walk_to_omni_clip(
         if np.dot(quat_blend[0], quat_w_rot[-1]) < 0.0:
             quat_blend = -quat_blend
 
-        if pin_stance_foot and seg.is_stand_buffer and float(np.linalg.norm(v_foot_B[:2])) <= 0.18:
-            # Closed-chain stance-foot pinning: weld grounded stance foot on floor so knees/hips naturally sit back
-            q_chain = np.concatenate([seg.q_bfs[-4:], blend_q, omni_q_bfs[0:1]], axis=0)
-            quat_chain = np.concatenate([quat_w_rot[-4:], quat_blend, omni_quat_wxyz[0:1]], axis=0)
-            for ti in range(1, len(quat_chain)):
-                if np.dot(quat_chain[ti], quat_chain[ti - 1]) < 0.0:
-                    quat_chain[ti] = -quat_chain[ti]
-            zero_p = np.zeros((len(q_chain), 3), dtype=np.float32)
-            with torch.no_grad():
-                fk_rel = fk_35(
-                    torch.from_numpy(zero_p),
-                    torch.from_numpy(quat_chain.astype(np.float32)),
-                    torch.from_numpy(q_chain.astype(np.float32)),
-                )
-            r_stance_all = fk_rel.tracked_pos_w[:, stance_idx, :].numpy().astype(np.float64)
-            r_other_all = fk_rel.tracked_pos_w[:, other_idx, :].numpy().astype(np.float64)
-            foot_tail_w = pos_w_rot[-4:] + r_stance_all[:4]
-            v_foot_A = np.clip(_estimate_initial_slope(foot_tail_w[::-1], -dt, n_frames=4), -0.10, 0.10)
-            r_A = r_stance_all[3]
-            r_blend = r_stance_all[4:-1]
-            r_B = r_stance_all[-1]
-            foot_B = omni_pos[0] + r_B
-            if float(np.linalg.norm(v_foot_A[:2])) <= 0.12 and float(np.linalg.norm(v_foot_B[:2])) <= 0.12:
-                foot_A_z = float(seg.pos_w[-1, 2]) + float(r_A[2])
-                s_smooth = 3.0 * (u * u) - 2.0 * (u * u * u)
-                foot_blend_z = (1.0 - s_smooth) * foot_A_z + s_smooth * float(foot_B[2])
-                foot_blend = np.column_stack([np.full_like(u, foot_B[0]), np.full_like(u, foot_B[1]), foot_blend_z])
-                foot_A = np.array([foot_B[0], foot_B[1], foot_A_z], dtype=np.float64)
-            else:
-                vf_A, vf_B = v_foot_A, v_foot_B
-                foot_A_xy = foot_B[:2] - 0.5 * (vf_A[:2] + vf_B[:2]) * T_dur
-                foot_A = np.array([foot_A_xy[0], foot_A_xy[1], float(seg.pos_w[-1, 2]) + float(r_A[2])], dtype=np.float64)
-                foot_blend = _cubic_hermite(foot_A, vf_A, foot_B, vf_B, u, T_dur)
-            pos_A = foot_A - r_A
-            pos_w_aligned = pos_w_rot + pos_A
-            blend_pos = foot_blend - r_blend
-
-            # If non-stance foot must relocate > 1.8cm to reach target stance, step cleanly via knee flexion (zero floor drag!)
-            other_A_xy = (pos_A + r_other_all[3])[:2]
-            other_B_xy = (omni_pos[0] + r_other_all[-1])[:2]
-            other_shift = float(np.linalg.norm(other_B_xy - other_A_xy))
-            if other_shift > 0.018:
-                side = "left" if other_idx == la_idx else "right"
-                jnames = list(fk_35.env_joint_names)
-                j_hp = jnames.index(f"{side}_hip_pitch_joint")
-                j_kn = jnames.index(f"{side}_knee_joint")
-                j_ap = jnames.index(f"{side}_ankle_pitch_joint")
-                amp = float(np.clip(3.2 * other_shift + 0.24, 0.30, 0.52))
-                bell = np.sin(np.pi * u) ** 2
-                blend_q[:, j_kn] += amp * bell
-                blend_q[:, j_hp] -= 0.35 * amp * bell
-                blend_q[:, j_ap] -= 0.45 * amp * bell
+        # Build candidate anchor foot pairings when stance-pinning a walk-to-stand clip
+        use_pin = pin_stance_foot and seg.is_stand_buffer and float(np.linalg.norm(v_foot_B[:2])) <= 0.18
+        if use_pin:
+            anchor_pairs: list[tuple[int, int, np.ndarray] | None] = [(stance_idx, other_idx, v_foot_B)]
+            if float(omni_bpos[0, other_idx, 2]) <= 0.055 and float(np.linalg.norm(v_other_B[:2])) <= 0.18:
+                anchor_pairs.append((other_idx, stance_idx, v_other_B))
         else:
-            pos_A_xy = omni_pos[0, :2] - 0.5 * (v_A[:2] + v_omni_0_c[:2]) * T_dur
-            pos_A = np.array([pos_A_xy[0], pos_A_xy[1], float(seg.pos_w[-1, 2])], dtype=np.float64)
-            pos_w_aligned = pos_w_rot + pos_A
-            blend_pos = _cubic_hermite(pos_A, v_A, omni_pos[0], v_omni_0_c, u, T_dur)
+            anchor_pairs = [None]
 
-        pre_pos = np.concatenate([pos_w_aligned, blend_pos], axis=0)
-        pre_quat = np.concatenate([quat_w_rot, quat_blend], axis=0)
-        pre_q = np.concatenate([seg.q_bfs, blend_q], axis=0)
+        for anchor_opt in anchor_pairs:
+            blend_q = blend_q_base.copy()
+            if anchor_opt is not None:
+                s_idx, o_idx, v_s_B = anchor_opt
+                # Closed-chain stance-foot pinning: weld grounded stance foot on floor so knees/hips naturally sit back
+                q_chain = np.concatenate([seg.q_bfs[-4:], blend_q, omni_q_bfs[0:1]], axis=0)
+                quat_chain = np.concatenate([quat_w_rot[-4:], quat_blend, omni_quat_wxyz[0:1]], axis=0)
+                for ti in range(1, len(quat_chain)):
+                    if np.dot(quat_chain[ti], quat_chain[ti - 1]) < 0.0:
+                        quat_chain[ti] = -quat_chain[ti]
+                zero_p = np.zeros((len(q_chain), 3), dtype=np.float32)
+                with torch.no_grad():
+                    fk_rel = fk_35(
+                        torch.from_numpy(zero_p),
+                        torch.from_numpy(quat_chain.astype(np.float32)),
+                        torch.from_numpy(q_chain.astype(np.float32)),
+                    )
+                r_stance_all = fk_rel.tracked_pos_w[:, s_idx, :].numpy().astype(np.float64)
+                r_other_all = fk_rel.tracked_pos_w[:, o_idx, :].numpy().astype(np.float64)
+                foot_tail_w = pos_w_rot[-4:] + r_stance_all[:4]
+                v_foot_A = np.clip(_estimate_initial_slope(foot_tail_w[::-1], -dt, n_frames=4), -0.10, 0.10)
+                r_A = r_stance_all[3]
+                r_blend = r_stance_all[4:-1]
+                r_B = r_stance_all[-1]
+                foot_B = omni_pos[0] + r_B
+                if float(np.linalg.norm(v_foot_A[:2])) <= 0.12 and float(np.linalg.norm(v_s_B[:2])) <= 0.12:
+                    foot_A_z = float(seg.pos_w[-1, 2]) + float(r_A[2])
+                    s_smooth = 3.0 * (u * u) - 2.0 * (u * u * u)
+                    foot_blend_z = (1.0 - s_smooth) * foot_A_z + s_smooth * float(foot_B[2])
+                    foot_blend = np.column_stack([np.full_like(u, foot_B[0]), np.full_like(u, foot_B[1]), foot_blend_z])
+                    foot_A = np.array([foot_B[0], foot_B[1], foot_A_z], dtype=np.float64)
+                else:
+                    vf_A, vf_B = v_foot_A, v_s_B
+                    foot_A_xy = foot_B[:2] - 0.5 * (vf_A[:2] + vf_B[:2]) * T_dur
+                    foot_A = np.array([foot_A_xy[0], foot_A_xy[1], float(seg.pos_w[-1, 2]) + float(r_A[2])], dtype=np.float64)
+                    foot_blend = _cubic_hermite(foot_A, vf_A, foot_B, vf_B, u, T_dur)
+                pos_A = foot_A - r_A
+                # Reject pin placement that overshoots past omni[0] along forward heading
+                if float(np.dot(pos_A[:2] - omni_pos[0, :2], fwd_omni)) > 0.002:
+                    continue
+                pos_w_aligned = pos_w_rot + pos_A
+                blend_pos = foot_blend - r_blend
 
-        # Ensure sign-continuous quaternions across W -> blend -> omni
-        full_quat = np.concatenate([pre_quat, omni_quat_wxyz], axis=0)
-        for t in range(1, len(full_quat)):
-            if np.dot(full_quat[t], full_quat[t - 1]) < 0.0:
-                full_quat[t] = -full_quat[t]
-        full_pos = np.concatenate([pre_pos, omni_pos], axis=0)
-        full_q = np.concatenate([pre_q, omni_q_bfs], axis=0)
+                # If non-stance foot must relocate > 1.8cm to reach target stance, step cleanly via knee flexion (zero floor drag!)
+                other_A_xy = (pos_A + r_other_all[3])[:2]
+                other_B_xy = (omni_pos[0] + r_other_all[-1])[:2]
+                other_shift = float(np.linalg.norm(other_B_xy - other_A_xy))
+                if other_shift > 0.018:
+                    side = "left" if o_idx == la_idx else "right"
+                    jnames = list(fk_35.env_joint_names)
+                    j_hp = jnames.index(f"{side}_hip_pitch_joint")
+                    j_kn = jnames.index(f"{side}_knee_joint")
+                    j_ap = jnames.index(f"{side}_ankle_pitch_joint")
+                    amp = float(np.clip(3.2 * other_shift + 0.24, 0.30, 0.52))
+                    bell = np.sin(np.pi * u) ** 2
+                    blend_q[:, j_kn] += amp * bell
+                    blend_q[:, j_hp] -= 0.35 * amp * bell
+                    blend_q[:, j_ap] -= 0.45 * amp * bell
+            else:
+                pos_A_xy = omni_pos[0, :2] - 0.5 * (v_A[:2] + v_omni_0_c[:2]) * T_dur
+                pos_A = np.array([pos_A_xy[0], pos_A_xy[1], float(seg.pos_w[-1, 2])], dtype=np.float64)
+                pos_w_aligned = pos_w_rot + pos_A
+                blend_pos = _cubic_hermite(pos_A, v_A, omni_pos[0], v_omni_0_c, u, T_dur)
 
-        # Forward kinematics check on pre_pos + pre_q segment (with full velocity recomputation next)
-        with torch.no_grad():
-            fk_pre = fk_35(
-                torch.from_numpy(pre_pos.astype(np.float32)),
-                torch.from_numpy(full_quat[: len(pre_pos)].astype(np.float32)),
-                torch.from_numpy(pre_q.astype(np.float32)),
-            )
-        bpos_pre = fk_pre.tracked_pos_w.numpy().astype(np.float64)
-        bquat_pre = fk_pre.tracked_quat_w.numpy().astype(np.float64)
+            pre_pos = np.concatenate([pos_w_aligned, blend_pos], axis=0)
+            pre_quat = np.concatenate([quat_w_rot, quat_blend], axis=0)
+            pre_q = np.concatenate([seg.q_bfs, blend_q], axis=0)
 
-        # Verify strict ground foot height across approach & blend (never airborne > 5.8cm or sunk < 2.2cm)
-        min_fz = np.minimum(bpos_pre[:, la_idx, 2], bpos_pre[:, ra_idx, 2])
-        if float(min_fz.min()) < 0.022 or float(min_fz.max()) > 0.058:
-            continue
+            # Ensure sign-continuous quaternions across W -> blend -> omni
+            full_quat = np.concatenate([pre_quat, omni_quat_wxyz], axis=0)
+            for t in range(1, len(full_quat)):
+                if np.dot(full_quat[t], full_quat[t - 1]) < 0.0:
+                    full_quat[t] = -full_quat[t]
+            full_pos = np.concatenate([pre_pos, omni_pos], axis=0)
+            full_q = np.concatenate([pre_q, omni_q_bfs], axis=0)
 
-        # Verify uncrossed arms & uncrossed legs throughout approach + blend!
-        R_torso_pre = _quat_to_rotmat_np(bquat_pre[:, torso_idx])
-        lh_loc_y = np.einsum("ti,ti->t", R_torso_pre[:, :, 1], bpos_pre[:, lh_idx] - bpos_pre[:, torso_idx])
-        rh_loc_y = np.einsum("ti,ti->t", R_torso_pre[:, :, 1], bpos_pre[:, rh_idx] - bpos_pre[:, torso_idx])
-        if float((lh_loc_y - rh_loc_y).min()) < 0.22:
-            continue
-        ank_diff = bpos_pre[:, la_idx, :2] - bpos_pre[:, ra_idx, :2]
-        yaw_pre = _quat_yaw(full_quat[: len(pre_pos)])
-        fwd_pre = np.stack([np.cos(yaw_pre), np.sin(yaw_pre)], axis=-1)
-        left_pre = np.stack([-np.sin(yaw_pre), np.cos(yaw_pre)], axis=-1)
-        dx_ank = np.abs(np.sum(ank_diff * fwd_pre, axis=-1))
-        dy_ank = np.sum(ank_diff * left_pre, axis=-1)
-        if np.any((dx_ank < 0.16) & (dy_ank < 0.04)):
-            continue
+            # Forward kinematics check on pre_pos + pre_q segment (with full velocity recomputation next)
+            with torch.no_grad():
+                fk_pre = fk_35(
+                    torch.from_numpy(pre_pos.astype(np.float32)),
+                    torch.from_numpy(full_quat[: len(pre_pos)].astype(np.float32)),
+                    torch.from_numpy(pre_q.astype(np.float32)),
+                )
+            bpos_pre = fk_pre.tracked_pos_w.numpy().astype(np.float64)
+            bquat_pre = fk_pre.tracked_quat_w.numpy().astype(np.float64)
 
-        # Reject if any foot slides along the floor (> 2.6cm) WITHOUT lifting (> 6.0cm) across the blend window!
-        seam_s = max(0, len(seg.pos_w) - 1)
-        if pin_stance_foot and seg.is_stand_buffer:
-            la_blend_drift = float(np.linalg.norm(omni_bpos[0, la_idx, :2] - bpos_pre[seam_s, la_idx, :2]))
-            ra_blend_drift = float(np.linalg.norm(omni_bpos[0, ra_idx, :2] - bpos_pre[seam_s, ra_idx, :2]))
-            la_peak_z = float(bpos_pre[seam_s:, la_idx, 2].max())
-            ra_peak_z = float(bpos_pre[seam_s:, ra_idx, 2].max())
-            if la_blend_drift > 0.026 and la_peak_z < 0.062:
+            # Verify strict ground foot height across approach & blend (never airborne > 5.8cm or sunk < 2.2cm)
+            min_fz = np.minimum(bpos_pre[:, la_idx, 2], bpos_pre[:, ra_idx, 2])
+            if float(min_fz.min()) < 0.022 or float(min_fz.max()) > 0.058:
                 continue
-            if ra_blend_drift > 0.026 and ra_peak_z < 0.062:
+
+            # Verify uncrossed arms & uncrossed legs throughout approach + blend!
+            R_torso_pre = _quat_to_rotmat_np(bquat_pre[:, torso_idx])
+            lh_loc_y = np.einsum("ti,ti->t", R_torso_pre[:, :, 1], bpos_pre[:, lh_idx] - bpos_pre[:, torso_idx])
+            rh_loc_y = np.einsum("ti,ti->t", R_torso_pre[:, :, 1], bpos_pre[:, rh_idx] - bpos_pre[:, torso_idx])
+            if float((lh_loc_y - rh_loc_y).min()) < 0.22:
+                continue
+            ank_diff = bpos_pre[:, la_idx, :2] - bpos_pre[:, ra_idx, :2]
+            yaw_pre = _quat_yaw(full_quat[: len(pre_pos)])
+            fwd_pre = np.stack([np.cos(yaw_pre), np.sin(yaw_pre)], axis=-1)
+            left_pre = np.stack([-np.sin(yaw_pre), np.cos(yaw_pre)], axis=-1)
+            dx_ank = np.abs(np.sum(ank_diff * fwd_pre, axis=-1))
+            dy_ank = np.sum(ank_diff * left_pre, axis=-1)
+            if np.any((dx_ank < 0.16) & (dy_ank < 0.04)):
                 continue
 
-        # Verify upper-body COM projection stays safely within <= 0.14m of the ankle support segment across seam
-        seam_margins = com_to_ankle_margin(
-            bpos_pre[seam_s:, pelvis_idx, :2],
-            bpos_pre[seam_s:, torso_idx, :2],
-            bpos_pre[seam_s:, la_idx, :2],
-            bpos_pre[seam_s:, ra_idx, :2],
-        )
-        max_seam_margin = float(max(float(seam_margins.max()), omni0_margin))
-        if max_seam_margin > 0.140:
-            continue
+            # Reject if any foot slides along the floor (> 2.6cm) WITHOUT lifting (> 6.0cm) across the blend window!
+            seam_s = max(0, len(seg.pos_w) - 1)
+            if anchor_opt is not None:
+                la_blend_drift = float(np.linalg.norm(omni_bpos[0, la_idx, :2] - bpos_pre[seam_s, la_idx, :2]))
+                ra_blend_drift = float(np.linalg.norm(omni_bpos[0, ra_idx, :2] - bpos_pre[seam_s, ra_idx, :2]))
+                la_peak_z = float(bpos_pre[seam_s:, la_idx, 2].max())
+                ra_peak_z = float(bpos_pre[seam_s:, ra_idx, 2].max())
+                if la_blend_drift > 0.026 and la_peak_z < 0.062:
+                    continue
+                if ra_blend_drift > 0.026 and ra_peak_z < 0.062:
+                    continue
 
-        # Verify walking start is genuinely farther from box than omni[0] (approach from front, not behind)
-        d_start_box = float(np.linalg.norm(pre_pos[0, :2] - omni_obj_pos[0, :2]))
-        d_omni0_box = float(np.linalg.norm(omni_pos[0, :2] - omni_obj_pos[0, :2]))
-        if d_start_box < d_omni0_box + 0.75:
-            continue
-
-        # Verify static-box clearance across entire approach & blend sequence
-        pts_chk = bpos_pre[:, check_idxs, :]  # (T_pre, K, 3)
-        dists = _box_obb_surface_distance(pts_chk, omni_obj_pos[0], omni_obj_rot[0], box_half_extents)
-        min_lower_clr = float(dists[:, lower_mask].min())
-        min_any_clr = float(dists.min())
-        if min_lower_clr < 0.035 or min_any_clr < min_allowed_hand_clr:
-            continue
-
-        # Recompute unified velocities & 35-body FK across the complete stitched trajectory
-        full_lin_vel = np.gradient(full_pos, dt, axis=0).astype(np.float32)
-        full_ang_vel = ang_vel_fn(full_quat, dt).astype(np.float32)
-        full_q_vel = np.gradient(full_q, dt, axis=0).astype(np.float32)
-        with torch.no_grad():
-            fk_full = fk_35(
-                torch.from_numpy(full_pos.astype(np.float32)),
-                torch.from_numpy(full_quat.astype(np.float32)),
-                torch.from_numpy(full_q.astype(np.float32)),
-                torch.from_numpy(full_lin_vel),
-                torch.from_numpy(full_ang_vel),
-                torch.from_numpy(full_q_vel),
+            # Verify upper-body COM projection stays safely within <= 0.14m of the ankle support segment across seam
+            seam_margins = com_to_ankle_margin(
+                bpos_pre[seam_s:, pelvis_idx, :2],
+                bpos_pre[seam_s:, torso_idx, :2],
+                bpos_pre[seam_s:, la_idx, :2],
+                bpos_pre[seam_s:, ra_idx, :2],
             )
+            max_seam_margin = float(max(float(seam_margins.max()), omni0_margin))
+            if max_seam_margin > 0.140:
+                continue
 
-        T_pre = len(pre_pos)
-        full_obj_pos = np.concatenate([np.repeat(omni_obj_pos[0:1], T_pre, axis=0), omni_obj_pos], axis=0)
-        full_obj_rot = np.concatenate([np.repeat(omni_obj_rot[0:1], T_pre, axis=0), omni_obj_rot], axis=0)
-        full_obj_lin_vel = np.gradient(full_obj_pos, dt, axis=0).astype(np.float32)
-        obj_ang_vel_pre = np.zeros((T_pre, 3), dtype=np.float32)
-        full_contact = np.concatenate([np.zeros(T_pre, dtype=bool), omni_contact.astype(bool)], axis=0)
+            # Verify monotonic forward approach to box (zero backward retreat > 1.0cm & compact stand settle <= 28 frames)
+            d_start_box = float(np.linalg.norm(pre_pos[0, :2] - omni_obj_pos[0, :2]))
+            d_omni0_box = float(np.linalg.norm(omni_pos[0, :2] - omni_obj_pos[0, :2]))
+            if d_start_box < d_omni0_box + 0.68:
+                continue
 
-        pre_walk_path = float(np.linalg.norm(np.diff(pre_pos[:, :2], axis=0), axis=-1).sum())
-        usage_counts[seg.source_name] = usage_counts.get(seg.source_name, 0) + 1
-        win_key = f"{seg.source_name}:{seg.end_frame_50hz}"
-        usage_counts[win_key] = usage_counts.get(win_key, 0) + 1
+            pre_and_o0_xy = np.vstack([pre_pos[:, :2], omni_pos[0:1, :2]])
+            d_box_seq = np.linalg.norm(pre_and_o0_xy - omni_obj_pos[0, :2], axis=-1)
+            max_retreat_m = float((d_box_seq - np.minimum.accumulate(d_box_seq)).max())
+            if max_retreat_m > 0.010:
+                continue
 
-        return {
-            "joint_pos": full_q.astype(np.float32),
-            "joint_vel": full_q_vel,
-            "body_pos_w": fk_full.tracked_pos_w.numpy().astype(np.float32),
-            "body_quat_w": fk_full.tracked_quat_w.numpy().astype(np.float32),
-            "body_lin_vel_w": fk_full.tracked_lin_vel_w.numpy().astype(np.float32),
-            "body_ang_vel_w": fk_full.tracked_ang_vel_w.numpy().astype(np.float32),
-            "obj_pos": full_obj_pos.astype(np.float32),
-            "obj_rot": full_obj_rot.astype(np.float32),
-            "obj_lin_vel": full_obj_lin_vel,
-            "obj_ang_vel_pre": obj_ang_vel_pre,
-            "contact": full_contact,
-            "meta": {
-                "seg_idx": int(seg_idx),
-                "lafan_source": seg.source_name,
-                "is_stand_buffer": bool(seg.is_stand_buffer),
-                "lafan_frames_50hz": int(len(seg.pos_w)),
-                "blend_frames_50hz": int(blend_frames),
-                "pre_walk_path_m": round(pre_walk_path, 3),
-                "phase_score": round(float(score), 4),
-                "min_box_clearance_m": round(min_any_clr, 4),
-                "min_foot_z_m": round(float(min_fz.min()), 4),
-                "max_blend_min_foot_z_m": round(float(max(float(min_fz[seam_s:].max()), omni0_min_fz)), 4),
-                "max_blend_com_margin_m": round(max_seam_margin, 4),
-            },
-        }
+            if seg.is_stand_buffer:
+                v_pre_xy = np.linalg.norm(np.gradient(pre_pos[:, :2], dt, axis=0), axis=-1)
+                slow_pre_frames = int((v_pre_xy[-min(45, len(v_pre_xy)) :] < 0.18).sum())
+                if slow_pre_frames > 28:
+                    continue
+
+            # Verify static-box clearance across entire approach & blend sequence
+            pts_chk = bpos_pre[:, check_idxs, :]  # (T_pre, K, 3)
+            dists = _box_obb_surface_distance(pts_chk, omni_obj_pos[0], omni_obj_rot[0], box_half_extents)
+            min_lower_clr = float(dists[:, lower_mask].min())
+            min_any_clr = float(dists.min())
+            if min_lower_clr < 0.045 or min_any_clr < min_allowed_hand_clr:
+                continue
+
+            # Recompute unified velocities & 35-body FK across the complete stitched trajectory
+            full_lin_vel = np.gradient(full_pos, dt, axis=0).astype(np.float32)
+            full_ang_vel = ang_vel_fn(full_quat, dt).astype(np.float32)
+            full_q_vel = np.gradient(full_q, dt, axis=0).astype(np.float32)
+            with torch.no_grad():
+                fk_full = fk_35(
+                    torch.from_numpy(full_pos.astype(np.float32)),
+                    torch.from_numpy(full_quat.astype(np.float32)),
+                    torch.from_numpy(full_q.astype(np.float32)),
+                    torch.from_numpy(full_lin_vel),
+                    torch.from_numpy(full_ang_vel),
+                    torch.from_numpy(full_q_vel),
+                )
+
+            T_pre = len(pre_pos)
+            full_obj_pos = np.concatenate([np.repeat(omni_obj_pos[0:1], T_pre, axis=0), omni_obj_pos], axis=0)
+            full_obj_rot = np.concatenate([np.repeat(omni_obj_rot[0:1], T_pre, axis=0), omni_obj_rot], axis=0)
+            full_obj_lin_vel = np.gradient(full_obj_pos, dt, axis=0).astype(np.float32)
+            obj_ang_vel_pre = np.zeros((T_pre, 3), dtype=np.float32)
+            full_contact = np.concatenate([np.zeros(T_pre, dtype=bool), omni_contact.astype(bool)], axis=0)
+
+            pre_walk_path = float(np.linalg.norm(np.diff(pre_pos[:, :2], axis=0), axis=-1).sum())
+            usage_counts[seg.source_name] = usage_counts.get(seg.source_name, 0) + 1
+            win_key = f"{seg.source_name}:{seg.end_frame_50hz}"
+            usage_counts[win_key] = usage_counts.get(win_key, 0) + 1
+
+            return {
+                "joint_pos": full_q.astype(np.float32),
+                "joint_vel": full_q_vel,
+                "body_pos_w": fk_full.tracked_pos_w.numpy().astype(np.float32),
+                "body_quat_w": fk_full.tracked_quat_w.numpy().astype(np.float32),
+                "body_lin_vel_w": fk_full.tracked_lin_vel_w.numpy().astype(np.float32),
+                "body_ang_vel_w": fk_full.tracked_ang_vel_w.numpy().astype(np.float32),
+                "obj_pos": full_obj_pos.astype(np.float32),
+                "obj_rot": full_obj_rot.astype(np.float32),
+                "obj_lin_vel": full_obj_lin_vel,
+                "obj_ang_vel_pre": obj_ang_vel_pre,
+                "contact": full_contact,
+                "meta": {
+                    "seg_idx": int(seg_idx),
+                    "lafan_source": seg.source_name,
+                    "is_stand_buffer": bool(seg.is_stand_buffer),
+                    "lafan_frames_50hz": int(len(seg.pos_w)),
+                    "blend_frames_50hz": int(blend_frames),
+                    "pre_walk_path_m": round(pre_walk_path, 3),
+                    "phase_score": round(float(score), 4),
+                    "min_box_clearance_m": round(min_any_clr, 4),
+                    "min_foot_z_m": round(float(min_fz.min()), 4),
+                    "max_blend_min_foot_z_m": round(float(max(float(min_fz[seam_s:].max()), omni0_min_fz)), 4),
+                    "max_blend_com_margin_m": round(max_seam_margin, 4),
+                    "max_approach_retreat_cm": round(max_retreat_m * 100.0, 2),
+                },
+            }
 
     raise RuntimeError(
         f"No collision-free & ground-safe LAFAN1 walk match found among top-150 candidates (best score={ranked[0][0]:.3f})."

@@ -79,9 +79,7 @@ def _resolve_undesired_body_ids(
     if hoi_mode == "hands":
         allowed.update({"left_rubber_hand", "right_rubber_hand"})
         if task_name == "CarryBox":
-            for n in cf_names:
-                if re.fullmatch(r"(left|right)_wrist_.*_link", n):
-                    allowed.add(n)
+            allowed.update({"left_wrist_yaw_link", "right_wrist_yaw_link"})
         elif task_name == "StandBottle":
             allowed.update({"left_knee_link", "right_knee_link"})
     elif hoi_mode == "sit":

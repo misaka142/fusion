@@ -244,6 +244,7 @@ def feet_air_time_min_penalty(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
     threshold: float,
+    command_name: str = "motion",
 ) -> torch.Tensor:
 
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
@@ -265,8 +266,19 @@ def feet_air_time_min_penalty(
     penalty = torch.sum(penalty, dim=1)
 
     env_ready_mask = env.episode_length_buf > 50
-    
-    return penalty * env_ready_mask
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_names = getattr(getattr(command, "cfg", None), "body_names", None)
+    if body_names and "left_ankle_roll_link" in body_names and "right_ankle_roll_link" in body_names:
+        foot_idx = [body_names.index("left_ankle_roll_link"), body_names.index("right_ankle_roll_link")]
+    else:
+        foot_idx = [3, 6]
+    ref_feet_vxy = torch.sqrt(
+        torch.square(command.body_lin_vel_w[:, foot_idx, :2]).sum(dim=-1) + 1e-8
+    ).max(dim=-1)[0]
+    walk_gate = ((ref_feet_vxy - 0.04) / 0.05).clamp(0.0, 1.0)
+
+    return penalty * env_ready_mask * walk_gate
 
 def motion_joint_pos_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)

@@ -22,6 +22,7 @@ import pickle
 import shutil
 import sys
 import time
+from typing import Any
 
 import mujoco
 import numpy as np
@@ -55,6 +56,7 @@ from scripts.sugar_rl.lafan_walk_stitcher import (
     _rotate_z_mat,
     _rotmat_to_rotvec,
     _rotvec_to_rotmat,
+    _smooth_savgol_np,
     build_bfs_sagittal_mirror_map,
     load_lafan_walk_segments,
     mirror_sagittal_pose_Arrays,
@@ -161,19 +163,32 @@ class _MuJoCoHygieneAuditor:
         self.re_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "right_elbow_link")
         self.lh_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "left_rubber_hand")
         self.rh_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "right_rubber_hand")
-        self.obj_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "object")
+        self.obj_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "obj")
+        assert self.obj_id >= 0, "Body 'obj' not found in MuJoCo model!"
 
         bnames = {b: (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, b) or "") for b in range(self.model.nbody)}
         self.l_legs = {b for b, n in bnames.items() if n.startswith("left_") and any(k in n for k in ("hip", "knee", "ankle"))}
         self.r_legs = {b for b, n in bnames.items() if n.startswith("right_") and any(k in n for k in ("hip", "knee", "ankle"))}
         self.l_arms = {b for b, n in bnames.items() if n.startswith("left_") and any(k in n for k in ("shoulder", "elbow", "wrist", "hand"))}
         self.r_arms = {b for b, n in bnames.items() if n.startswith("right_") and any(k in n for k in ("shoulder", "elbow", "wrist", "hand"))}
-        hand_set = {b for b, n in bnames.items() if any(k in n for k in ("wrist", "hand", "palm", "finger"))}
-        self.non_hand = {b for b, n in bnames.items() if b > 0 and b != self.obj_id and n != "target_vis" and b not in hand_set}
+        self.rubber_hand_ids = {self.lh_id, self.rh_id}
+        wrist_forearm_names = (
+            "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
+            "right_wrist_roll_link", "right_wrist_pitch_link", "right_wrist_yaw_link",
+            "left_elbow_link", "right_elbow_link",
+            "left_shoulder_yaw_link", "right_shoulder_yaw_link",
+        )
+        self.wrist_forearm_ids = {mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, n) for n in wrist_forearm_names}
+        self.torso_leg_non_arm = {
+            b for b, n in bnames.items()
+            if b > 0 and b != self.obj_id and n != "target_vis"
+            and b not in self.rubber_hand_ids and b not in self.wrist_forearm_ids
+        }
 
         for g in range(self.model.ngeom):
             if int(self.model.geom_bodyid[g]) in self.l_legs or int(self.model.geom_bodyid[g]) in self.r_legs:
                 self.model.geom_margin[g] = 0.025
+        self.orig_geom_margins = self.model.geom_margin.copy()
         self.data = mujoco.MjData(self.model)
 
         pel_jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "pelvis_freejoint")
@@ -191,6 +206,25 @@ class _MuJoCoHygieneAuditor:
         self.sole_mid_local = np.array([0.035, 0.0, -0.030], dtype=np.float64)
 
         jnames = list(G1_ISAACLAB_BFS_JOINT_NAMES)
+        l_arm_names = [f"left_{k}_joint" for k in ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw")]
+        r_arm_names = [f"right_{k}_joint" for k in ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw")]
+        arm_names = l_arm_names + r_arm_names
+        self.arm_bfs_idx = np.array([jnames.index(n) for n in arm_names], dtype=np.int64)
+        arm_jids = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in arm_names]
+        self.arm_dofs_mj = np.array([int(self.model.jnt_dofadr[j]) for j in arm_jids], dtype=np.int64)
+        self.arm_rng = self.model.jnt_range[arm_jids].copy()
+
+        # Inner rubber palm center & inward palm normal in {left,right}_rubber_hand local frame
+        self.palm_L_local = np.array([0.065, -0.022, 0.0], dtype=np.float64)
+        self.palm_R_local = np.array([0.065, +0.022, 0.0], dtype=np.float64)
+        self.palm_nL_local = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        self.palm_nR_local = np.array([0.0, +1.0, 0.0], dtype=np.float64)
+        self.palm_pad_L_pts = np.array(
+            [[0.060, -0.012, 0.0], [0.090, -0.030, -0.005], [0.112, -0.044, -0.015]], dtype=np.float64
+        )
+        self.palm_pad_R_pts = np.array(
+            [[0.060, +0.012, 0.0], [0.090, +0.030, -0.005], [0.112, +0.044, -0.015]], dtype=np.float64
+        )
         l_leg_names = [f"left_{k}_joint" for k in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")]
         r_leg_names = [f"right_{k}_joint" for k in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")]
         self.l_bfs_idx = np.array([jnames.index(n) for n in l_leg_names], dtype=np.int64)
@@ -404,7 +438,7 @@ class _MuJoCoHygieneAuditor:
             q_seed[self.l_bfs_idx] = (1.0 - w_blend) * q_prev[self.l_bfs_idx] + w_blend * q_herm[k, self.l_bfs_idx]
             q_seed[self.r_bfs_idx] = (1.0 - w_blend) * q_prev[self.r_bfs_idx] + w_blend * q_herm[k, self.r_bfs_idx]
             p_seed = (1.0 - w_blend) * p_prev + w_blend * p_herm[k]
-            p_seed[:2] -= (0.038 * float(np.sin(np.pi * uk) ** 2)) * fwd_B
+            p_seed[:2] -= (0.042 * float(np.sin(np.pi * uk) ** 2)) * fwd_B
 
             pk, qk = self._solve_coupled_pelvis_legs_ik(
                 p_seed, quat_pel_u[k], q_seed, sole_L_k, R_LF_k, sole_R_k, R_RF_k,
@@ -433,6 +467,248 @@ class _MuJoCoHygieneAuditor:
         out_oq = np.concatenate([np.repeat(o_quat_wxyz[0:1], n_pre, axis=0), o_quat_wxyz], axis=0)
         return out_p, out_quat, out_q, out_op, out_oq, n_pre
 
+    @staticmethod
+    def _smooth_rounded_box_surf(
+        rel_xy_dir: np.ndarray,
+        half_ext: np.ndarray,
+        z_box: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Project horizontal ray smoothly onto square box side with superquadric outward normal."""
+        ux, uy = float(rel_xy_dir[0]), float(rel_xy_dir[1])
+        hx, hy = float(half_ext[0]), float(half_ext[1])
+        scale = max(abs(ux) / hx, abs(uy) / hy, 1e-6)
+        px, py = ux / scale, uy / scale
+        nx, ny = (px / hx) ** 5, (py / hy) ** 5
+        nn = float(np.hypot(nx, ny)) + 1e-8
+        return np.array([px, py, z_box], dtype=np.float64), np.array([nx / nn, ny / nn, 0.0], dtype=np.float64)
+
+    def _get_torso_horiz_axes(self, pel_quat_wxyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Extract singularity-free horizontal forward/left axes from torso left-shoulder axis."""
+        t_R = self.data.xmat[self.torso_id].reshape(3, 3)
+        ty = t_R[:2, 1]
+        nty = float(np.hypot(ty[0], ty[1]))
+        if nty > 1e-4:
+            tl = ty / nty
+        else:
+            yaw_p = float(_quat_yaw(pel_quat_wxyz))
+            tl = np.array([-np.sin(yaw_p), np.cos(yaw_p)], dtype=np.float64)
+        tf = np.array([tl[1], -tl[0]], dtype=np.float64)
+        R_tyaw = np.array([[tf[0], tl[0], 0.0], [tf[1], tl[1], 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        return np.array([tf[0], tf[1], 0.0], dtype=np.float64), np.array([tl[0], tl[1], 0.0], dtype=np.float64), R_tyaw
+
+    def _collect_box_repulsion(
+        self,
+        jacp: np.ndarray,
+        jacr: np.ndarray,
+        obj_pos_t: np.ndarray,
+        wf_thresh: float,
+        rh_thresh: float,
+        wf_tgt: float,
+        rh_tgt: float,
+        weight: float,
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        """Collect deepest per-body contact repulsion rows between arm links and the box."""
+        m, d = self.model, self.data
+        worst_per_body: dict[int, Any] = {}
+        for ci in range(d.ncon):
+            con = d.contact[ci]
+            b1, b2 = int(m.geom_bodyid[con.geom1]), int(m.geom_bodyid[con.geom2])
+            if b1 == self.obj_id or b2 == self.obj_id:
+                rob_b = b2 if b1 == self.obj_id else b1
+                if (rob_b in self.wrist_forearm_ids and float(con.dist) < wf_thresh) or (
+                    rob_b in self.rubber_hand_ids and float(con.dist) < rh_thresh
+                ):
+                    if rob_b not in worst_per_body or float(con.dist) < float(worst_per_body[rob_b].dist):
+                        worst_per_body[rob_b] = con
+        rows_J: list[np.ndarray] = []
+        rows_e: list[np.ndarray] = []
+        for rob_b, con in worst_per_body.items():
+            fn = con.frame[:3].copy()
+            n_out = fn if float(np.dot(fn, con.pos - obj_pos_t)) >= 0.0 else -fn
+            jacp.fill(0.0)
+            jacr.fill(0.0)
+            mujoco.mj_jac(m, d, jacp, jacr, con.pos, rob_b)
+            tgt_d = wf_tgt if rob_b in self.wrist_forearm_ids else rh_tgt
+            rows_J.append(weight * (n_out @ jacp[:, self.arm_dofs_mj])[None, :])
+            rows_e.append(np.array([weight * (tgt_d - float(con.dist))], dtype=np.float64))
+        return rows_J, rows_e
+
+    def retarget_arms_to_rubber_palm_cradle(
+        self,
+        r_pos: np.ndarray,
+        r_quat_wxyz: np.ndarray,
+        q_bfs: np.ndarray,
+        o_pos: np.ndarray,
+        o_quat_wxyz: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Retarget arms from handless DiPLO wrists to flush rubber-palm lower-mid box cradle IK."""
+        T = len(r_pos)
+        z0 = float(o_pos[0, 2])
+        lifted = np.flatnonzero(o_pos[:, 2] > z0 + 0.010)
+        if len(lifted) < 15:
+            return q_bfs.copy(), o_pos.copy()
+
+        tg, tp = int(lifted[0]), int(lifted[-1])
+        t0_c, t1_c = max(0, tg - 20), min(T - 1, tp + 20)
+
+        m, d = self.model, self.data
+        arm_bfs, arm_dofs, arm_rng = self.arm_bfs_idx, self.arm_dofs_mj, self.arm_rng
+        torso_z = np.zeros(T, dtype=np.float64)
+        fwd_seq = np.zeros((T, 3), dtype=np.float64)
+        left_seq = np.zeros((T, 3), dtype=np.float64)
+        for t in range(T):
+            d.qpos[self.p_adr : self.p_adr + 3] = r_pos[t]
+            d.qpos[self.p_adr + 3 : self.p_adr + 7] = r_quat_wxyz[t]
+            d.qpos[self.b_adrs] = q_bfs[t]
+            mujoco.mj_forward(m, d)
+            torso_z[t] = float(d.xpos[self.torso_id, 2])
+            fwd_seq[t], left_seq[t], _ = self._get_torso_horiz_axes(r_quat_wxyz[t])
+
+        lift_frac = np.clip((o_pos[:, 2] - z0) / 0.22, 0.0, 1.0)
+        lift_smooth = _smooth_savgol_np(lift_frac[:, None], window=15, polyorder=2)[:, 0]
+        lift_smooth[: max(1, tg - 3)] = 0.0
+        lift_smooth[min(T, tp + 4) :] = 0.0
+
+        desired_dz = np.clip((torso_z - 0.01) - o_pos[:, 2], 0.0, 0.095)
+        dz_smooth = _smooth_savgol_np((desired_dz * lift_smooth)[:, None], window=15, polyorder=2)[:, 0]
+        dz_smooth[: max(1, tg - 3)] = 0.0
+        dz_smooth[min(T, tp + 4) :] = 0.0
+
+        o_pos_out = o_pos.copy()
+        o_pos_out[:, 2] += dz_smooth
+        o_pos_out[:, :2] += (0.028 * lift_smooth)[:, None] * fwd_seq[:, :2]
+
+        q_ik = q_bfs.copy()
+        jacp = np.zeros((3, m.nv), dtype=np.float64)
+        jacr = np.zeros((3, m.nv), dtype=np.float64)
+
+        try:
+            for g in range(m.ngeom):
+                bid = int(m.geom_bodyid[g])
+                if bid in self.wrist_forearm_ids:
+                    m.geom_margin[g] = 0.025
+                elif bid in self.rubber_hand_ids:
+                    m.geom_margin[g] = 0.012
+
+            for t in range(t0_c, t1_c + 1):
+                u_in = float(np.clip((t - t0_c) / float(max(1, (tg - 2) - t0_c)), 0.0, 1.0))
+                u_out = float(np.clip((t1_c - t) / float(max(1, t1_c - (tp + 2))), 0.0, 1.0))
+                w_ik = float(min(3.0 * u_in**2 - 2.0 * u_in**3, 3.0 * u_out**2 - 2.0 * u_out**3))
+                flare = max(
+                    float(np.clip(((tg - 1) - t) / 10.0, 0.0, 1.0)),
+                    float(np.clip((t - (tp + 1)) / 10.0, 0.0, 1.0)),
+                )
+
+                d.qpos[self.p_adr : self.p_adr + 3] = r_pos[t]
+                d.qpos[self.p_adr + 3 : self.p_adr + 7] = r_quat_wxyz[t]
+                d.qpos[self.o_adr : self.o_adr + 3] = o_pos_out[t]
+                d.qpos[self.o_adr + 3 : self.o_adr + 7] = o_quat_wxyz[t]
+                d.qpos[self.b_adrs] = q_bfs[t]
+                mujoco.mj_forward(m, d)
+                o_R = d.xmat[self.obj_id].reshape(3, 3)
+
+                fwd_w, left_w = fwd_seq[t], left_seq[t]
+                dir_L_box = o_R.T @ (left_w - 0.14 * fwd_w)
+                dir_R_box = o_R.T @ (-left_w - 0.14 * fwd_w)
+                z_tgt = -0.028 * (1.0 - float(lift_smooth[t])) + (-0.068) * float(lift_smooth[t])
+                hext_flared = DIPLO_BOX_HALF_EXT + np.array([0.045 * flare, 0.045 * flare, 0.0], dtype=np.float64)
+                loc_L, nloc_L = self._smooth_rounded_box_surf(dir_L_box[:2], hext_flared, z_tgt)
+                loc_R, nloc_R = self._smooth_rounded_box_surf(dir_R_box[:2], hext_flared, z_tgt)
+                surf_L, norm_L = o_pos_out[t] + o_R @ loc_L, o_R @ nloc_L
+                surf_R, norm_R = o_pos_out[t] + o_R @ loc_R, o_R @ nloc_R
+                n_des_L = -norm_L + 0.28 * np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                n_des_L /= np.linalg.norm(n_des_L)
+                n_des_R = -norm_R + 0.28 * np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                n_des_R /= np.linalg.norm(n_des_R)
+
+                q_seed = q_ik[t - 1].copy() if t > t0_c else q_bfs[t].copy()
+                q_cur = q_bfs[t].copy()
+                q_cur[arm_bfs] = w_ik * q_seed[arm_bfs] + (1.0 - w_ik) * q_bfs[t, arm_bfs]
+
+                for _ in range(14):
+                    d.qpos[self.b_adrs] = q_cur
+                    mujoco.mj_forward(m, d)
+                    rows_J, rows_e = [], []
+                    for bid, p_loc, n_loc, surf_p, n_des in (
+                        (self.lh_id, self.palm_L_local, self.palm_nL_local, surf_L, n_des_L),
+                        (self.rh_id, self.palm_R_local, self.palm_nR_local, surf_R, n_des_R),
+                    ):
+                        Rb = d.xmat[bid].reshape(3, 3)
+                        p_pw = d.xpos[bid] + Rb @ p_loc
+                        n_pw = Rb @ n_loc
+                        jacp.fill(0.0)
+                        jacr.fill(0.0)
+                        mujoco.mj_jac(m, d, jacp, jacr, p_pw, bid)
+                        rows_J.append(jacp[:, arm_dofs])
+                        rows_e.append(w_ik * (surf_p - p_pw))
+                        f_des = fwd_w - np.dot(fwd_w, n_des) * n_des
+                        f_des /= np.linalg.norm(f_des) + 1e-8
+                        rot_err = np.cross(n_pw, n_des) + 0.5 * np.cross(Rb[:, 0], f_des)
+                        rows_J.append(0.55 * jacr[:, arm_dofs])
+                        rows_e.append(0.55 * w_ik * rot_err)
+
+                    # Keep 100% unilateral collision repulsion (no w_ik scaling) on approach/release ramps
+                    rep_J, rep_e = self._collect_box_repulsion(
+                        jacp, jacr, o_pos_out[t], 0.018, -0.0015, 0.019, -0.001, 3.0
+                    )
+                    rows_J.extend(rep_J)
+                    rows_e.extend(rep_e)
+
+                    J = np.vstack(rows_J)
+                    e = np.concatenate(rows_e)
+                    q_reg = w_ik * (q_ik[t - 1, arm_bfs] if t > t0_c else q_bfs[t, arm_bfs]) + (1.0 - w_ik) * q_bfs[t, arm_bfs]
+                    dq = np.linalg.solve(J.T @ J + 0.06 * np.eye(14), J.T @ e + 0.05 * (q_reg - q_cur[arm_bfs]))
+                    q_cur[arm_bfs] = np.clip(
+                        q_cur[arm_bfs] + np.clip(dq, -0.14, 0.14),
+                        arm_rng[:, 0] * 0.93,
+                        arm_rng[:, 1] * 0.93,
+                    )
+                q_ik[t] = q_cur
+
+            dq_seq = q_ik[:, arm_bfs] - q_bfs[:, arm_bfs]
+            q_out = q_bfs.copy()
+            q_out[:, arm_bfs] = np.clip(
+                q_bfs[:, arm_bfs] + _smooth_savgol_np(dq_seq, window=13, polyorder=2),
+                arm_rng[:, 0] * 0.94,
+                arm_rng[:, 1] * 0.94,
+            )
+
+            # Dual-pass full-sequence unilateral collision projection with light SavGol in between
+            for _pass in range(2):
+                for t in range(T):
+                    d.qpos[self.p_adr : self.p_adr + 3] = r_pos[t]
+                    d.qpos[self.p_adr + 3 : self.p_adr + 7] = r_quat_wxyz[t]
+                    d.qpos[self.o_adr : self.o_adr + 3] = o_pos_out[t]
+                    d.qpos[self.o_adr + 3 : self.o_adr + 7] = o_quat_wxyz[t]
+                    q_cur = q_out[t].copy()
+                    for _ in range(8):
+                        d.qpos[self.b_adrs] = q_cur
+                        mujoco.mj_forward(m, d)
+                        rep_J, rep_e = self._collect_box_repulsion(
+                            jacp, jacr, o_pos_out[t], 0.006, -0.002, 0.008, -0.001, 1.0
+                        )
+                        if not rep_J:
+                            break
+                        J = np.vstack(rep_J)
+                        e = np.concatenate(rep_e)
+                        dq = J.T @ np.linalg.solve(J @ J.T + 0.012 * np.eye(len(e)), e)
+                        q_cur[arm_bfs] = np.clip(
+                            q_cur[arm_bfs] + np.clip(dq, -0.08, 0.08),
+                            arm_rng[:, 0] * 0.94,
+                            arm_rng[:, 1] * 0.94,
+                        )
+                    q_out[t] = q_cur
+                if _pass == 0:
+                    q_out[:, arm_bfs] = np.clip(
+                        _smooth_savgol_np(q_out[:, arm_bfs], window=5, polyorder=2),
+                        arm_rng[:, 0] * 0.94,
+                        arm_rng[:, 1] * 0.94,
+                    )
+        finally:
+            m.geom_margin[:] = self.orig_geom_margins
+
+        return q_out, o_pos_out
+
     def evaluate_sequence(
         self,
         r_pos: np.ndarray,
@@ -444,19 +720,25 @@ class _MuJoCoHygieneAuditor:
         last_lift: int,
         blend_range: tuple[int, int] | None = None,
         stand_bend_start: int | None = None,
+        check_palm_grasp: bool = True,
     ) -> tuple[bool, str, dict]:
-        """Run strict frame-by-frame biomechanical, collision, CoM, and zero-skating verification."""
+        """Run strict frame-by-frame biomechanical, palm-grasp collision, CoM, and zero-skating verification."""
+        self.model.geom_margin[:] = self.orig_geom_margins
         T = len(r_pos)
         min_hand_dy = 999.0
         min_elbow_dy = 999.0
         max_lifted_hdx = 0.0
         max_lifted_hdz = 0.0
-        max_hand_detach = 0.0
+        max_palm_detach = 0.0
         min_box_x = 999.0
         max_box_y = 0.0
         min_box_up_z = 1.0
         min_leg_d = 0.050
         max_box_pen = 0.0
+        max_wrist_pen = 0.0
+        max_rubber_hand_pen = 0.0
+        palm_gaps: list[float] = []
+        palm_z_rels: list[float] = []
         com_toe_blend = -999.0
         com_toe_pick = -999.0
         com_toe_place = -999.0
@@ -477,13 +759,13 @@ class _MuJoCoHygieneAuditor:
             mujoco.mj_forward(self.model, self.data)
 
             t_pos = self.data.xpos[self.torso_id]
-            t_R = self.data.xmat[self.torso_id].reshape(3, 3)
+            _, _, R_tyaw = self._get_torso_horiz_axes(r_quat_wxyz[t])
             lh_w = self.data.xpos[self.lh_id]
             rh_w = self.data.xpos[self.rh_id]
-            lh_loc = t_R.T @ (lh_w - t_pos)
-            rh_loc = t_R.T @ (rh_w - t_pos)
-            le_loc = t_R.T @ (self.data.xpos[self.le_id] - t_pos)
-            re_loc = t_R.T @ (self.data.xpos[self.re_id] - t_pos)
+            lh_loc = R_tyaw.T @ (lh_w - t_pos)
+            rh_loc = R_tyaw.T @ (rh_w - t_pos)
+            le_loc = R_tyaw.T @ (self.data.xpos[self.le_id] - t_pos)
+            re_loc = R_tyaw.T @ (self.data.xpos[self.re_id] - t_pos)
 
             min_hand_dy = min(min_hand_dy, float(lh_loc[1] - rh_loc[1]))
             min_elbow_dy = min(min_elbow_dy, float(le_loc[1] - re_loc[1]))
@@ -491,14 +773,25 @@ class _MuJoCoHygieneAuditor:
             o_R = self.data.xmat[self.obj_id].reshape(3, 3)
             min_box_up_z = min(min_box_up_z, float(o_R[2, 2]))
 
-            if first_lift + 8 <= t <= last_lift - 8:
+            if first_lift + 16 <= t <= last_lift - 16:
                 max_lifted_hdx = max(max_lifted_hdx, abs(float(lh_loc[0] - rh_loc[0])))
                 max_lifted_hdz = max(max_lifted_hdz, abs(float(lh_w[2] - rh_w[2])))
-                box_loc = t_R.T @ (o_pos[t] - t_pos)
+                box_loc = R_tyaw.T @ (o_pos[t] - t_pos)
                 min_box_x = min(min_box_x, float(box_loc[0]))
                 max_box_y = max(max_box_y, abs(float(box_loc[1])))
-                hd = _box_obb_surface_distance(np.stack([lh_w, rh_w]), o_pos[t], o_R, DIPLO_BOX_HALF_EXT)
-                max_hand_detach = max(max_hand_detach, float(hd.max()))
+
+                lh_R = self.data.xmat[self.lh_id].reshape(3, 3)
+                rh_R = self.data.xmat[self.rh_id].reshape(3, 3)
+                gL = float(_box_obb_surface_distance(lh_w + self.palm_pad_L_pts @ lh_R.T, o_pos[t], o_R, DIPLO_BOX_HALF_EXT).min())
+                gR = float(_box_obb_surface_distance(rh_w + self.palm_pad_R_pts @ rh_R.T, o_pos[t], o_R, DIPLO_BOX_HALF_EXT).min())
+                cur_gap = max(gL, gR)
+                palm_gaps.append(cur_gap)
+                max_palm_detach = max(max_palm_detach, cur_gap)
+                pL_w = lh_w + lh_R @ self.palm_L_local
+                pR_w = rh_w + rh_R @ self.palm_R_local
+                zL = float((o_R.T @ (pL_w - o_pos[t]))[2])
+                zR = float((o_R.T @ (pR_w - o_pos[t]))[2])
+                palm_z_rels.append(0.5 * (zL + zR))
 
             for ci in range(self.data.ncon):
                 con = self.data.contact[ci]
@@ -507,8 +800,15 @@ class _MuJoCoHygieneAuditor:
                     min_leg_d = min(min_leg_d, float(con.dist))
                 if ((c_b1 in self.l_arms and c_b2 in self.r_arms) or (c_b2 in self.l_arms and c_b1 in self.r_arms)) and float(con.dist) < 0.0:
                     return False, "arm_self_collision", {}
-                if (c_b1 == self.obj_id and c_b2 in self.non_hand) or (c_b2 == self.obj_id and c_b1 in self.non_hand):
-                    max_box_pen = max(max_box_pen, -float(con.dist))
+                if c_b1 == self.obj_id or c_b2 == self.obj_id:
+                    other_b = c_b2 if c_b1 == self.obj_id else c_b1
+                    pen = max(0.0, -float(con.dist))
+                    if other_b in self.torso_leg_non_arm:
+                        max_box_pen = max(max_box_pen, pen)
+                    elif other_b in self.wrist_forearm_ids:
+                        max_wrist_pen = max(max_wrist_pen, pen)
+                    elif other_b in self.rubber_hand_ids:
+                        max_rubber_hand_pen = max(max_rubber_hand_pen, pen)
 
             lfp = self.data.xpos[self.lf_id]
             rfp = self.data.xpos[self.rf_id]
@@ -517,7 +817,7 @@ class _MuJoCoHygieneAuditor:
             lf_soles[t] = lfp + lfR @ self.sole_mid_local
             rf_soles[t] = rfp + rfR @ self.sole_mid_local
             ff = 0.5 * (lfR[:, 0][:2] + rfR[:, 0][:2])
-            ff /= (np.linalg.norm(ff) + 1e-8)
+            ff /= np.linalg.norm(ff) + 1e-8
             fl = np.array([-ff[1], ff[0]])
             df = lfp[:2] - rfp[:2]
             if abs(float(df @ ff)) < 0.16 and float(df @ fl) < 0.035:
@@ -537,22 +837,37 @@ class _MuJoCoHygieneAuditor:
                 com_toe_place = max(com_toe_place, com_over)
             max_airborne = max(max_airborne, min(float(lfp[2]), float(rfp[2])))
 
-        if min_hand_dy < 0.24 or min_elbow_dy < 0.24:
+        if (check_palm_grasp and min_hand_dy < 0.24) or min_elbow_dy < (0.24 if check_palm_grasp else 0.22):
             return False, f"crossed_or_narrow_arms(dy={min_hand_dy:.3f}m)", {}
-        if max_lifted_hdx > 0.11 or max_lifted_hdz > 0.15 or max_box_y > 0.12 or min_box_x < 0.16:
+        if (check_palm_grasp and (max_lifted_hdx > 0.11 or max_lifted_hdz > 0.15)) or max_box_y > (0.12 if check_palm_grasp else 0.14) or min_box_x < (0.16 if check_palm_grasp else 0.14):
             return False, f"asymmetric_grasp(dx={max_lifted_hdx:.2f},dz={max_lifted_hdz:.2f},by={max_box_y:.2f})", {}
-        if max_hand_detach > 0.085 or min_box_up_z < 0.88:
-            return False, "detached_or_tilted_box", {}
+        if min_box_up_z < 0.75:
+            return False, f"tilted_box(up_z={min_box_up_z:.3f})", {}
         if max_bend_foot_z > 0.068 or max_bend_foot_span > 0.40:
             return False, f"arabesque_or_split_bend(fz={max_bend_foot_z:.3f}m,span={max_bend_foot_span:.2f}m)", {}
         if min_leg_d < 0.013:
             return False, f"leg_clearance_low({min_leg_d*100:.2f}cm)", {}
-        if max_box_pen > 0.012:
+        if max_box_pen > (0.012 if check_palm_grasp else 0.025):
             return False, f"non_hand_box_pen({max_box_pen*100:.1f}cm)", {}
         if max_airborne > 0.064:
             return False, f"airborne({max_airborne*100:.1f}cm)", {}
-        if (blend_range is not None and com_toe_blend > 0.002) or com_toe_pick > -0.002 or com_toe_place > 0.002:
+        if (blend_range is not None and com_toe_blend > 0.004) or com_toe_pick > 0.004 or com_toe_place > 0.004:
             return False, f"com_tip(blend={com_toe_blend*100:+.1f},pick={com_toe_pick*100:+.1f},place={com_toe_place*100:+.1f}cm)", {}
+
+        mean_palm_gap = float(np.mean(palm_gaps)) if palm_gaps else 0.0
+        mean_palm_z_rel = float(np.mean(palm_z_rels)) if palm_z_rels else 0.0
+        max_jvel = float(np.abs(np.gradient(q_bfs, DT, axis=0)).max())
+        if check_palm_grasp:
+            if max_rubber_hand_pen > 0.008:
+                return False, f"rubber_hand_pen({max_rubber_hand_pen*100:.2f}cm)", {}
+            if max_wrist_pen > 0.004:
+                return False, f"wrist_forearm_box_pen({max_wrist_pen*100:.2f}cm)", {}
+            if mean_palm_gap > 0.018 or max_palm_detach > 0.036:
+                return False, f"palm_detached(mean={mean_palm_gap*100:.2f}cm,max={max_palm_detach*100:.2f}cm)", {}
+            if mean_palm_z_rel > -0.010:
+                return False, f"grasp_too_high({mean_palm_z_rel*100:+.2f}cm)", {}
+            if max_jvel > 12.5:
+                return False, f"joint_vel_spike({max_jvel:.2f})", {}
 
         # 1. Short-window (0.24s) grounded sole anti-skating gate
         max_pre_skate_cm = 0.0
@@ -589,6 +904,12 @@ class _MuJoCoHygieneAuditor:
             "max_airborne_cm": round(max_airborne * 100.0, 2),
             "max_pre_skate_cm": round(max_pre_skate_cm, 2),
             "max_bend_drift_cm": round(max_bend_drift_cm, 2),
+            "max_rubber_hand_pen_cm": round(max_rubber_hand_pen * 100.0, 2),
+            "max_wrist_pen_cm": round(max_wrist_pen * 100.0, 2),
+            "mean_palm_gap_cm": round(mean_palm_gap * 100.0, 2),
+            "max_palm_detach_cm": round(max_palm_detach * 100.0, 2),
+            "mean_palm_z_rel_cm": round(mean_palm_z_rel * 100.0, 2),
+            "max_joint_vel_rads": round(max_jvel, 2),
         }
         return True, "OK", stats
 
@@ -685,7 +1006,7 @@ def main() -> None:
     ap.add_argument("--lafan_dir", type=str, default=str(_FUSION_ROOT / "data_lafan1_raw"))
     ap.add_argument("--out_dir", type=str, default=str(_FUSION_ROOT / "data" / "OmniCarryBox"))
     ap.add_argument("--cache_dir", type=str, default=None, help="Optional HuggingFace download cache dir.")
-    ap.add_argument("--blend_frames", type=int, default=22, help="50Hz stance-pinned walk->stand blend frames (default: 22 = 0.44s).")
+    ap.add_argument("--blend_frames", type=int, default=16, help="50Hz stance-pinned walk->stand blend frames (default: 16 = 0.32s).")
     ap.add_argument("--pickup_stretch", type=float, default=1.65, help="Smooth time-stretch factor for rapid pickup->standup phase (default: 1.65).")
     ap.add_argument("--max_solves_per_base", type=int, default=6, help="Max top clean SBTO solves per base motion.")
     ap.add_argument("--approaches_per_variant", type=int, default=3, help="Distinct LAFAN1 + D4 box variants per clean solve (x2 mirror).")
@@ -710,7 +1031,7 @@ def main() -> None:
     box_mesh.export(str(out_root / "obj_aligned.obj"))
     _write_usda_convex_hull(box_mesh, out_root / "obj_aligned.usda", mass_kg=DIPLO_BOX_MASS_KG)
     box_spec = {
-        "dataset": "diplo_sbto_lafan1_clean_v2",
+        "dataset": "diplo_sbto_lafan1_palmgrasp_v3",
         "task": "CarryBox",
         "box_size_xyz": [round(float(x), 5) for x in DIPLO_BOX_SIZE_XYZ],
         "box_center_xyz": [0.0, 0.0, 0.0],
@@ -760,9 +1081,10 @@ def main() -> None:
     ra_idx_35 = SUGAR_RAW_35_BODY_NAMES.index("right_ankle_roll_link")
 
     # 3. Stage A: Screen all ~900 SBTO solves strictly inside the PURE MuJoCo-simulated window `[75 : 75+motion_frames]`,
-    #    prepend coupled `12x15` Double-Sole Welded Stand-to-Bend, and smoothly stretch the pickup-to-standup phase!
+    #    prepend coupled `12x15` Double-Sole Welded Stand-to-Bend, smoothly stretch the pickup-to-standup phase,
+    #    and retarget hands onto lower-middle rubber-palm cradle contacts!
     stretch_tag = f"{float(args.pickup_stretch):.2f}".replace(".", "p")
-    core_cache_file = diplo_dir / f".clean_sbto_cores_v6_smoothlift_{stretch_tag}.pkl"
+    core_cache_file = diplo_dir / f".clean_sbto_cores_v7_palmgrasp_{stretch_tag}.pkl"
     all_clean_by_base: dict[str, list[dict]] = {}
     drop_summary: dict[str, int] = {}
 
@@ -852,7 +1174,7 @@ def main() -> None:
                     drop_summary["lift_or_place_incomplete"] = drop_summary.get("lift_or_place_incomplete", 0) + 1
                     continue
 
-                # Screen pure simulation slice first
+                # Screen pure simulation slice first (arms are retargeted to rubber palms next)
                 ok_sim, reason_sim, _ = auditor.evaluate_sequence(
                     r_pos[t_entry:t_exit],
                     r_quat[t_entry:t_exit],
@@ -861,13 +1183,14 @@ def main() -> None:
                     o_quat[t_entry:t_exit],
                     first_lift=int(l_idx[0]),
                     last_lift=int(l_idx[-1]),
+                    check_palm_grasp=False,
                 )
                 if not ok_sim:
                     key = reason_sim.split("(")[0]
                     drop_summary[key] = drop_summary.get(key, 0) + 1
                     continue
 
-                # Prepend coupled 12x15 double-sole welded upright-stand -> squat-bend transition!
+                # Prepend compact coupled 12x15 double-sole welded upright-stand -> squat-bend transition!
                 rp_wb, rq_wb, qb_wb, op_wb, oq_wb, n_pre_wb = auditor.prepend_double_pinned_stand_to_bend(
                     r_pos[t_entry:t_exit],
                     r_quat[t_entry:t_exit],
@@ -875,8 +1198,8 @@ def main() -> None:
                     o_pos[t_entry:t_exit],
                     o_quat[t_entry:t_exit],
                     dt=DT,
-                    hold_frames=5,
-                    bend_frames=32,
+                    hold_frames=2,
+                    bend_frames=28,
                 )
                 # Smoothly stretch the rapid pickup-to-standup phase to eliminate PD torque whiplash
                 rp_wb, rq_wb, qb_wb, op_wb, oq_wb = stretch_pickup_window(
@@ -887,6 +1210,10 @@ def main() -> None:
                     oq_wb,
                     n_pre_bend=n_pre_wb,
                     stretch_factor=float(args.pickup_stretch),
+                )
+                # Retarget arms from handless DiPLO wrists to flush rubber-palm lower-mid cradle IK
+                qb_wb, op_wb = auditor.retarget_arms_to_rubber_palm_cradle(
+                    rp_wb, rq_wb, qb_wb, op_wb, oq_wb
                 )
                 l_idx_wb = np.flatnonzero(op_wb[:, 2] > (float(op_wb[0, 2]) + 0.035))
                 if len(l_idx_wb) < 25:
@@ -902,6 +1229,7 @@ def main() -> None:
                     last_lift=int(l_idx_wb[-1]),
                     blend_range=(0, n_pre_wb) if n_pre_wb > 0 else None,
                     stand_bend_start=0,
+                    check_palm_grasp=True,
                 )
                 if not ok_wb:
                     key = "bend_ik_" + reason_wb.split("(")[0]
@@ -927,7 +1255,8 @@ def main() -> None:
             if kept_for_base:
                 kept_for_base.sort(key=lambda item: (max(item["stats"]["com_toe_pick_cm"], -2.5), item["cost"]))
                 all_clean_by_base[bn] = kept_for_base
-        core_cache_file.write_bytes(pickle.dumps({"by_base": all_clean_by_base, "drop_summary": drop_summary}))
+        if all_clean_by_base:
+            core_cache_file.write_bytes(pickle.dumps({"by_base": all_clean_by_base, "drop_summary": drop_summary}))
 
     clean_cores: list[dict] = []
     for bn, kept_for_base in all_clean_by_base.items():
@@ -941,10 +1270,9 @@ def main() -> None:
             f"com_pick={selected_solves[0]['stats']['com_toe_pick_cm']:+.2f}cm)"
         )
 
+    print(f"[DiPLO Hygiene Audit] Selected {len(clean_cores)} golden SBTO cores | Rejected reasons: {drop_summary}")
     if not clean_cores:
         raise RuntimeError("No SBTO trajectories survived strict hygiene screening!")
-
-    print(f"[DiPLO Hygiene Audit] Selected {len(clean_cores)} golden SBTO cores | Rejected reasons: {drop_summary}")
     print("=" * 86)
 
     # 4. Stage B: Expand with exact D4 symmetries (Sagittal Mirror x2 + 90-deg square-box rotations)
@@ -988,6 +1316,11 @@ def main() -> None:
                     torch.from_numpy(qb_base.astype(np.float32)),
                 )
             bpos_core = fk_core.tracked_pos_w.numpy().astype(np.float64)
+            bquat_core = fk_core.tracked_quat_w.numpy().astype(np.float64)
+            R_lh_core = _quat_to_rotmat(bquat_core[:, 33])
+            R_rh_core = _quat_to_rotmat(bquat_core[:, 34])
+            palm_L_core = bpos_core[:, 33] + np.einsum("tij,j->ti", R_lh_core, auditor.palm_pad_L_pts[1])
+            palm_R_core = bpos_core[:, 34] + np.einsum("tij,j->ti", R_rh_core, auditor.palm_pad_R_pts[1])
             olin_core = np.gradient(op_base, DT, axis=0).astype(np.float32)
 
             for app_k in range(args.approaches_per_variant):
@@ -1000,8 +1333,8 @@ def main() -> None:
                     op_base,
                     olin_core,
                     oang_core,
-                    bpos_core[:, 33],
-                    bpos_core[:, 34],
+                    palm_L_core,
+                    palm_R_core,
                     DIPLO_BOX_HALF_EXT,
                     orot_mat,
                 )

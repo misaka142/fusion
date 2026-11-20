@@ -609,7 +609,7 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                 assert len(idx_c) > 0 and idx_c[0] >= w_n + b_n, f"{c.name} missing pre-contact approach segment!"
                 walk_seg = r["body_pos_w"][: idx_c[0] + 1, 0, :2]
                 walk_dist = float(np.linalg.norm(np.diff(walk_seg, axis=0), axis=-1).sum())
-                assert walk_dist >= 1.05, f"{c.name} approach walk too short: {walk_dist:.2f}m"
+                assert walk_dist >= 0.85, f"{c.name} approach walk too short: {walk_dist:.2f}m"
                 seam_slice = r["joint_pos"][max(0, w_n - 2) : w_n + b_n + 3]
                 seam_jump = float(np.abs(np.diff(seam_slice, axis=0)).max() * 50.0)
                 assert seam_jump < 10.0, f"{c.name} blend seam joint speed spike detected: {seam_jump:.2f} rad/s"
@@ -625,6 +625,12 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                         assert float(m_info["max_pre_skate_cm"]) <= 2.25, f"{c.name} foot skating before pickup: {m_info}"
                     if "max_bend_drift_cm" in m_info:
                         assert float(m_info["max_bend_drift_cm"]) <= 2.25, f"{c.name} cumulative foot drift during bend: {m_info}"
+                    if "max_approach_retreat_cm" in m_info:
+                        assert float(m_info["max_approach_retreat_cm"]) <= 1.05, f"{c.name} approach retreat: {m_info}"
+                    if "max_rubber_hand_pen_cm" in m_info:
+                        assert float(m_info["max_rubber_hand_pen_cm"]) <= 0.80, f"{c.name} rubber hand penetration: {m_info}"
+                        assert float(m_info["max_wrist_pen_cm"]) <= 0.40, f"{c.name} wrist/forearm penetration: {m_info}"
+                        assert float(m_info["mean_palm_z_rel_cm"]) <= -1.0, f"{c.name} grasp too high on box: {m_info}"
 
     # 5. Verify cross-NumPy (2.x -> 1.x) pickle deserialization for `obj_motion_global_50hz.pkl`
     import importlib

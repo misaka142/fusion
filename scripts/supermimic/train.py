@@ -137,7 +137,13 @@ parser.add_argument(
     "--legs_residual",
     action="store_true",
     default=False,
-    help="Apply reference joint residual bias to leg joints too (default: False for free leg balance).",
+    help="Deprecated compatibility flag (leg reference residual is now enabled by default).",
+)
+parser.add_argument(
+    "--no_legs_residual",
+    action="store_true",
+    default=False,
+    help="Disable reference joint residual bias on leg joints (default: False).",
 )
 parser.add_argument("--no_verify_obs", action="store_true", default=False, help="Skip startup obs alignment assertion.")
 parser.add_argument(
@@ -261,7 +267,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
         policy_lr=args_cli.policy_lr,
         critic_lr=args_cli.critic_lr,
         use_ref_residual=not args_cli.no_ref_residual,
-        legs_use_residual=args_cli.legs_residual,
+        legs_use_residual=not args_cli.no_legs_residual,
         bc_init_coef=args_cli.bc_coef,
         bc_anneal_iters=bc_anneal_iters,
         save_interval=args_cli.save_interval,

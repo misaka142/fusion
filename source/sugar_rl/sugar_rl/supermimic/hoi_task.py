@@ -121,7 +121,7 @@ TASK_PROFILES: dict[str, TaskRewardProfile] = {
         hoi_mode="hands",
         undesired_weight=-1.0,
         undesired_threshold=0.1,
-        num_undesired_bodies=25,
+        num_undesired_bodies=29,
         feet_slide_weight=-0.5,
     ),
     "PickBottle": TaskRewardProfile(
@@ -259,6 +259,12 @@ class SugarHOITask:
         self.ori_term_temp = ori_term_temp
         self.anchor_idx = fk.anchor_tracked_idx  # 7 (`torso_link`)
         self.ee_indices = [SUGAR_TRACKED_BODY_NAMES.index(n) for n in SUGAR_EE_TERMINATION_BODY_NAMES]
+        # Left / right inner rubber-palm contact centers relative to wrist_yaw_link (tracked indices [10, 13])
+        self._palm_local_offset_from_wrist = torch.tensor(
+            [[0.1065, -0.019, 0.0], [0.1065, 0.019, 0.0]],
+            dtype=torch.float32,
+            device=fk.default_joint_pos.device,
+        )
 
     # ------------------------------------------------------------------
     # 1. State packing / unpacking & kinematics
@@ -941,7 +947,7 @@ class SugarHOITask:
         v_rf_xy = torch.sqrt((fk_next.contact_lin_vel_w[:, 3, :2] ** 2).sum(dim=-1) + 1e-8)
         r_feet_slide = self.profile.feet_slide_weight * (v_lf_xy * p_lf_gnd + v_rf_xy * p_rf_gnd)
 
-        # Differentiable `feet_air_time_min_penalty` (default weight=1.5, threshold=0.25s, active after 50 steps)
+        # Differentiable `feet_air_time_min_penalty` (gated by reference foot XY motion so stand/bend never taps feet)
         curr_feet_gnd = torch.stack([p_lf_gnd, p_rf_gnd], dim=-1)  # (B, 2)
         if feet_air_time is not None and self.profile.feet_air_time_weight != 0.0:
             if prev_feet_gnd is None:
@@ -951,7 +957,11 @@ class SugarHOITask:
             air_before = feet_air_time + self.step_dt
             air_pen = (air_before - self.profile.feet_air_time_threshold).clamp_max(0.0) * p_first_contact
             ready_mask = (time_steps > 50).float() if time_steps is not None else 1.0
-            r_feet_air_time = self.profile.feet_air_time_weight * air_pen.sum(dim=-1) * ready_mask
+            ref_feet_vxy = torch.sqrt(
+                (ref_target.body_lin_vel_w[:, [3, 6], :2] ** 2).sum(dim=-1) + 1e-8
+            ).max(dim=-1)[0]
+            walk_gate = ((ref_feet_vxy - 0.04) / 0.05).clamp(0.0, 1.0)
+            r_feet_air_time = self.profile.feet_air_time_weight * air_pen.sum(dim=-1) * ready_mask * walk_gate
             next_feet_air_time = air_before * (1.0 - curr_feet_gnd)
         else:
             r_feet_air_time = torch.zeros_like(c_label)
@@ -1007,9 +1017,22 @@ class SugarHOITask:
             err_fz = ((body_pos_rel_w[:, [3, 6], 2] - fk_next.tracked_pos_w[:, [3, 6], 2]) ** 2).sum(dim=-1)
             unscaled_reward = unscaled_reward + 0.25 * torch.exp(-err_fz / (0.06**2))
             if self.profile.hoi_mode == "hands":
-                # Focused wrist-to-object grasp alignment (indices [10, 13] = left/right wrist_yaw_link)
-                err_wrist_o2b = ((o2b_p[:, [10, 13]] - ref_o2b_p[:, [10, 13]]) ** 2).sum(dim=-1).mean(dim=-1)
-                unscaled_reward = unscaled_reward + 0.5 * c_label * torch.exp(-err_wrist_o2b / (0.08**2))
+                # Focused inner rubber-palm position & orientation alignment in object frame
+                R_ref_wrists = (
+                    ref_target.body_rotmat_w[:, [10, 13]]
+                    if ref_target.body_rotmat_w is not None
+                    else quat_to_rotmat(ref_target.body_quat_w[:, [10, 13]])
+                )
+                palm_off = self._palm_local_offset_from_wrist.unsqueeze(0)
+                palm_w = fk_next.tracked_pos_w[:, [10, 13]] + mat_vec(fk_next.tracked_rotmat_w[:, [10, 13]], palm_off)
+                ref_palm_w = ref_target.body_pos_w[:, [10, 13]] + mat_vec(R_ref_wrists, palm_off)
+                palm_in_obj = mat_t_vec(R_obj_w.unsqueeze(1), palm_w - obj_pos_w.unsqueeze(1))
+                ref_palm_in_obj = mat_t_vec(R_ref_obj_w.unsqueeze(1), ref_palm_w - ref_target.obj_pos_w.unsqueeze(1))
+                err_palm_p = ((palm_in_obj - ref_palm_in_obj) ** 2).sum(dim=-1).mean(dim=-1)
+                err_palm_q = (rotmat_error_magnitude(o2b_R[:, [10, 13]], ref_o2b_R[:, [10, 13]]) ** 2).mean(dim=-1)
+                unscaled_reward = unscaled_reward + c_label * (
+                    0.55 * torch.exp(-err_palm_p / (0.07**2)) + 0.25 * torch.exp(-err_palm_q / (0.35**2))
+                )
         step_reward = unscaled_reward * self.step_dt
 
         # ---- F. Smooth Sigmoid Soft Terminations (5 terms from BaseTerminationsCfg) ----

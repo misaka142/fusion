@@ -743,6 +743,23 @@ def test_8_review_regressions_obs_xi_com_and_rewards() -> None:
     assert float(info_l["rew/feet_air_time"].abs().max().item()) < 1e-5
     # Expected gap: (0.25 - (0.05 + 0.02)) * 1.5 * 0.02 = 0.0054
     assert abs(float((r_long[0] - r_short[0]).item()) - 0.0054) < 1e-4
+
+    # Stationary stand/bend reference feet (zero XY speed) must receive ZERO feet_air_time penalty
+    from sugar_rl.supermimic.hoi_task import RefFrame
+    f_still = RefFrame(
+        joint_pos=f0.joint_pos, joint_vel=f0.joint_vel,
+        body_pos_w=f0.body_pos_w, body_quat_w=f0.body_quat_w,
+        body_lin_vel_w=torch.zeros_like(f0.body_lin_vel_w),
+        body_ang_vel_w=torch.zeros_like(f0.body_ang_vel_w),
+        obj_pos_w=f0.obj_pos_w, obj_quat_w=f0.obj_quat_w,
+        obj_lin_vel_w=f0.obj_lin_vel_w, obj_ang_vel_w=f0.obj_ang_vel_w,
+        contact_label=f0.contact_label,
+    )
+    _, _, info_still = task_push_trk.compute_reward_and_termination(
+        s_perf, s_perf, act, act, ref_cur=f_still, contact_logits=logits_land,
+        feet_air_time=air_short, prev_feet_gnd=prev_swing, time_steps=t_late,
+    )
+    assert float(info_still["rew/feet_air_time"].abs().max().item()) < 1e-6, "Standing feet_air_time gate failed!"
     print("[PASS] Test 8: Per-slice obs assertion, xi/COM kinematics, history padding & PushBox/feet_air_time rewards")
 
 
@@ -1218,24 +1235,30 @@ def test_12_omniretarget_clean_usda_and_bridge_sync() -> None:
             self._term_names = names
             self._term_cfgs = cfgs
 
-    # 1. Verify CarryBox undesired_contacts regex keeps head/torso/elbows/pelvis/legs (25 bodies),
+    # 1. Verify CarryBox undesired_contacts regex penalizes wrist_roll/pitch_link too (29 bodies: 35 - 6 exempt),
     #    matching both RewardManager regex and SugarEnvBridge fallback!
     cb_pats = [
-        r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$)(?!left_wrist_.*_link$)(?!right_wrist_.*_link$).+$"
+        r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_rubber_hand$)(?!right_rubber_hand$)(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
     ]
     rm_cb = _RewMgr(["undesired_contacts"], [_Term(_SCfg(cb_pats))])
     cb_ids = _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=rm_cb)
     assert cb_ids == _resolve_undesired_body_ids(cf_35, "CarryBox", "hands", rew_mgr=None)
-    assert len(cb_ids) == 25, f"Expected 25 penalized bodies (35 - 10 exempt), got {len(cb_ids)}"
+    assert len(cb_ids) == 29, f"Expected 29 penalized bodies (35 - 6 exempt), got {len(cb_ids)}"
     cb_names = {cf_35[i] for i in cb_ids}
-    # Verify head, torso, elbows, pelvis, knees ARE penalized, while palms, wrists, and ankle_roll feet are exempt
-    for must_penalize in ("head_link", "torso_link", "waist_yaw_link", "left_elbow_link", "right_elbow_link", "pelvis", "left_knee_link"):
+    # Verify head, torso, elbows, forearm wrists, pelvis, knees ARE penalized, while palms, wrist_yaw, and feet are exempt
+    for must_penalize in (
+        "head_link", "torso_link", "waist_yaw_link", "left_elbow_link", "right_elbow_link",
+        "left_wrist_roll_link", "right_wrist_pitch_link", "pelvis", "left_knee_link",
+    ):
         assert must_penalize in cb_names, f"{must_penalize} missing from CarryBox undesired_contacts!"
-    for must_exempt in ("left_ankle_roll_link", "right_ankle_roll_link", "left_rubber_hand", "right_rubber_hand", "left_wrist_yaw_link", "right_wrist_roll_link"):
+    for must_exempt in (
+        "left_ankle_roll_link", "right_ankle_roll_link", "left_rubber_hand", "right_rubber_hand",
+        "left_wrist_yaw_link", "right_wrist_yaw_link",
+    ):
         assert must_exempt not in cb_names, f"{must_exempt} should be exempt from CarryBox undesired_contacts!"
 
     p_cb = resolve_task_profile("Sugar-G129dof-CarryBox-Refiner")
-    assert p_cb.undesired_weight == -1.0 and p_cb.undesired_threshold == 0.1 and p_cb.num_undesired_bodies == 25
+    assert p_cb.undesired_weight == -1.0 and p_cb.undesired_threshold == 0.1 and p_cb.num_undesired_bodies == 29
 
     # Verify carry_box_*_env_cfg no longer uses 5-link forearm/wrist contact sensor override
     for rel_cfg in (
@@ -1505,10 +1528,35 @@ def test_13_lafan_walk_stitcher_continuity_and_clearance() -> None:
     clr = _box_obb_surface_distance(
         out["body_pos_w"][: T_w + T_b, [la_i, ra_i], :], obj_pos[0], obj_rot[0], np.array([0.17, 0.17, 0.18])
     ).min()
-    assert clr >= 0.035, f"Approach feet violated box clearance: {clr:.4f}m"
+    assert clr >= 0.045, f"Approach feet violated box clearance: {clr:.4f}m"
     assert out["meta"]["max_blend_min_foot_z_m"] <= 0.058, f"Blend feet airborne: {out['meta']}"
     assert out["meta"]["max_blend_com_margin_m"] <= 0.14, f"Blend COM margin exceeded: {out['meta']}"
-    print(f"[PASS] Test 13: LAFAN1 walk stitcher SE(2) phase blend smooth (pre_walk={out['meta']['pre_walk_path_m']:.2f}m, clr={clr:.3f}m, com={out['meta']['max_blend_com_margin_m']:.3f}m)")
+    assert out["meta"]["max_approach_retreat_cm"] <= 1.0, f"Approach retreated: {out['meta']}"
+
+    # Verify monotonic approach hard gate rejects a walking segment with a backward step
+    pos_back = pos_w.copy()
+    pos_back[-10:, 0] -= 0.06  # 6cm backward step right before stitch
+    seg_back = LafanWalkSegment(
+        source_name="walk_back_bad.csv",
+        start_frame_50hz=0, end_frame_50hz=T_w,
+        pos_w=pos_back, quat_wxyz=quat_w, q_bfs=q_w,
+        qd_bfs_end=qd_w[-1], v_pelvis_end=np.array([-0.15, 0.0, 0.0]), w_pelvis_end=ang_w[-1],
+        local_la_end=seg.local_la_end, local_ra_end=seg.local_ra_end,
+        v_fwd_end=-0.15, walk_disp_m=float(pos_back[-1, 0] - pos_back[0, 0]),
+    )
+    rejected_back = False
+    try:
+        stitch_lafan_walk_to_omni_clip(
+            omni_pos=pos_o, omni_quat_wxyz=quat_o, omni_q_bfs=q_o, omni_bpos=bpos_o35,
+            omni_obj_pos=obj_pos, omni_obj_rot=obj_rot, omni_contact=contact_o,
+            box_half_extents=np.array([0.17, 0.17, 0.18]), segments=[seg_back], usage_counts={},
+            fk_35=fk_35, body_names=body_names_35, ang_vel_fn=_ang_vel_world_from_quats,
+            blend_frames=T_b, dt=dt,
+        )
+    except RuntimeError:
+        rejected_back = True
+    assert rejected_back, "Monotonic approach gate failed to reject 6cm backward retreat segment!"
+    print(f"[PASS] Test 13: LAFAN1 walk stitcher SE(2) phase blend smooth (pre_walk={out['meta']['pre_walk_path_m']:.2f}m, clr={clr:.3f}m, retreat={out['meta']['max_approach_retreat_cm']:.2f}cm)")
 
 
 def test_14_v2_antichatter_delta_rms_leg_mask_and_smooth_lift() -> None:
@@ -1747,6 +1795,8 @@ def test_15_v2_speed_opt_parity_and_graph_break_free() -> None:
         m_c = t_comp.update_policy(iteration=1)
         ret_diff = abs(m_e["policy/imagined_return"] - m_c["policy/imagined_return"])
         assert ret_diff < 1e-4, f"Compiled vs Eager return mismatch: {ret_diff}"
+        assert "policy/res_jerk" in m_e and m_e["policy/res_jerk"] >= 0.0
+        assert abs(m_e["policy/res_jerk"] - m_c["policy/res_jerk"]) < 1e-4
 
         dp_e = torch.cat([p.detach().reshape(-1) for p in t_eager._raw_policy.parameters()]) - p0
         dp_c = torch.cat([p.detach().reshape(-1) for p in t_comp._raw_policy.parameters()]) - p0
@@ -1768,7 +1818,8 @@ def test_15_v2_speed_opt_parity_and_graph_break_free() -> None:
             st.states, st.prev_actions,
             fk0.tracked_pos_w, fk0.tracked_rotmat_w, fk0.tracked_lin_vel_w, fk0.tracked_ang_vel_w,
             fk0.contact_pos_w, fk0.contact_lin_vel_w, fk0.anchor_quat_w, fk0.root_rotmat_w,
-            torch.zeros_like(st.prev_actions), t_eager._one_scalar, st.feet_air_time,
+            torch.zeros_like(st.prev_actions), torch.zeros_like(st.prev_actions),
+            t_eager._one_scalar, t_eager._zero_scalar, st.feet_air_time,
             torch.zeros_like(st.feet_air_time), st.time_steps, st.xi,
             sl.fut_joint_pos[:, 0], sl.fut_joint_vel[:, 0], sl.body_pos_w[:, 0], sl.body_quat_w[:, 0],
             sl.body_rotmat_w[:, 0], sl.body_lin_vel_w[:, 0], sl.body_ang_vel_w[:, 0],
