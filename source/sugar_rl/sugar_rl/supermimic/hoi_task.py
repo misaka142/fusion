@@ -54,8 +54,12 @@ ROBOT_DELTA_DIM = 70   # dp_h(3) + dtheta_local(3) + dq(29) + dv_h(3) + dw_h(3) 
 OBJ_DELTA_DIM = 12     # dobj_p_h(3) + dobj_theta_local(3) + dobj_v_h(3) + dobj_w_h(3)
 DELTA_DIM = ROBOT_DELTA_DIM + OBJ_DELTA_DIM  # 82
 
-WM_STATE_FEAT_DIM = 108  # robot(71) + obj_rel(16) + contact_pts_in_obj(21)
+WM_STATE_FEAT_DIM = 123  # robot(71) + obj_rel(16) + contact_pts_in_obj(21) + anticol_pts_in_obj(15)
 CONTACT_DIM = 5          # [hoi_obj, feet_obj, left_foot_gnd, right_foot_gnd, undesired]
+
+# Indices inside `SUGAR_TRACKED_BODY_NAMES` for key anti-collision links:
+# [7]=torso_link, [9]=left_elbow_link, [10]=left_wrist_yaw_link, [12]=right_elbow_link, [13]=right_wrist_yaw_link
+_WM_ANTICOL_TRACKED_INDICES: tuple[int, ...] = (7, 9, 10, 12, 13)
 
 PRIVILEGED_OBS_DIM = 890
 TRACKER_OBS_DIM = 510
@@ -101,9 +105,9 @@ class TaskRewardProfile:
     undesired_weight: float = -0.1
     undesired_threshold: float = 1.0
     num_undesired_bodies: int = 26       # Overwritten by live ContactSensor body count in SugarEnvBridge
-    feet_slide_weight: float = -0.1
-    feet_air_time_weight: float = 5.0
-    feet_air_time_threshold: float = 0.5
+    feet_slide_weight: float = -0.5
+    feet_air_time_weight: float = 1.5
+    feet_air_time_threshold: float = 0.25
     avoid_feet_obj_weight: float = 0.0
 
 
@@ -114,7 +118,7 @@ TASK_PROFILES: dict[str, TaskRewardProfile] = {
         undesired_weight=-1.0,
         undesired_threshold=0.1,
         num_undesired_bodies=25,
-        feet_slide_weight=-0.1,
+        feet_slide_weight=-0.5,
     ),
     "PickBottle": TaskRewardProfile(
         "PickBottle", hoi_mode="hands", undesired_weight=-0.1, undesired_threshold=1.0, num_undesired_bodies=26
@@ -128,7 +132,7 @@ TASK_PROFILES: dict[str, TaskRewardProfile] = {
         undesired_weight=-0.1,
         undesired_threshold=1.0,
         num_undesired_bodies=26,
-        feet_slide_weight=-0.1,
+        feet_slide_weight=-0.5,
         avoid_feet_obj_weight=1.0,
     ),
     "KickBox": TaskRewardProfile(
@@ -326,7 +330,7 @@ class SugarHOITask:
     # ------------------------------------------------------------------
 
     def state_features(self, s_flat: Tensor, fk_res: FKResult | None = None) -> Tensor:
-        """Extract 108-D SE(2)-invariant robot-object-contact feature vector for `JointWorldModel`."""
+        """Extract 123-D SE(2)-invariant robot-object-contact-anticollision feature vector for `JointWorldModel`."""
         if fk_res is None:
             fk_res = self.run_fk(s_flat)
         (
@@ -360,9 +364,11 @@ class SugarHOITask:
         obj_v_h = torch.einsum("bij,bj->bi", R_h_inv, obj_v)
         obj_w_h = torch.einsum("bij,bj->bi", R_h_inv, obj_w)
 
-        # 7 contact links expressed in object's local coordinate frame (21-D)
-        rel_c_w = fk_res.contact_pos_w - obj_pos.unsqueeze(1)               # (B, 7, 3)
-        rel_c_obj = torch.einsum("bij,bkj->bki", R_obj.transpose(-1, -2), rel_c_w).reshape(
+        # 7 contact links + 5 torso/elbow/wrist anti-collision links expressed in object frame (21 + 15 = 36-D)
+        anticol_pos_w = fk_res.tracked_pos_w[:, _WM_ANTICOL_TRACKED_INDICES]
+        pts_w = torch.cat([fk_res.contact_pos_w, anticol_pos_w], dim=1)     # (B, 12, 3)
+        rel_pts_w = pts_w - obj_pos.unsqueeze(1)
+        rel_pts_obj = torch.einsum("bij,bkj->bki", R_obj.transpose(-1, -2), rel_pts_w).reshape(
             s_flat.shape[0], -1
         )
 
@@ -379,10 +385,44 @@ class SugarHOITask:
                 rot6d_obj,
                 obj_v_h,
                 obj_w_h,
-                rel_c_obj,
+                rel_pts_obj,
             ],
             dim=-1,
         )
+
+    @staticmethod
+    def compute_state_delta(s_prev: Tensor, s_next: Tensor) -> Tensor:
+        """Exact inverse of `apply_delta`: compute 82-D local-frame state delta from `(s_prev, s_next)`."""
+        lead_shape = s_prev.shape[:-1]
+        sp = s_prev.reshape(-1, SDIM)
+        sn = s_next.reshape(-1, SDIM)
+        (
+            p0, q0, j0, v0, w0, jd0,
+            op0, oq0, ov0, ow0,
+        ) = SugarHOITask.unpack_state(sp)
+        (
+            p1, q1, j1, v1, w1, jd1,
+            op1, oq1, ov1, ow1,
+        ) = SugarHOITask.unpack_state(sn)
+
+        R_h_inv = heading_inv_rotmat(q0)
+        dp_h = torch.einsum("bij,bj->bi", R_h_inv, p1 - p0)
+        dtheta = quat_to_axis_angle(quat_mul(quat_conj(q0), q1))
+        dq = j1 - j0
+        dv_h = torch.einsum("bij,bj->bi", R_h_inv, v1 - v0)
+        dw_h = torch.einsum("bij,bj->bi", R_h_inv, w1 - w0)
+        dqd = jd1 - jd0
+
+        dobj_p_h = torch.einsum("bij,bj->bi", R_h_inv, op1 - op0)
+        dobj_theta = quat_to_axis_angle(quat_mul(quat_conj(oq0), oq1))
+        dobj_v_h = torch.einsum("bij,bj->bi", R_h_inv, ov1 - ov0)
+        dobj_w_h = torch.einsum("bij,bj->bi", R_h_inv, ow1 - ow0)
+
+        delta = torch.cat(
+            [dp_h, dtheta, dq, dv_h, dw_h, dqd, dobj_p_h, dobj_theta, dobj_v_h, dobj_w_h],
+            dim=-1,
+        )
+        return delta.reshape(*lead_shape, DELTA_DIM)
 
     @staticmethod
     def apply_delta(s_flat: Tensor, delta: Tensor) -> Tensor:
@@ -444,7 +484,7 @@ class SugarHOITask:
         s_pred: Tensor,
         s_true: Tensor,
         joint_weights: Tensor,
-        vel_loss_scale: float = 0.1,
+        vel_loss_scale: float = 0.5,
         obj_loss_weight: float = 1.5,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Compute local-frame Huber loss between predicted and ground-truth joint states."""
@@ -746,6 +786,7 @@ class SugarHOITask:
         time_steps: Tensor | None = None,
         *,
         ref_next: RefFrame | None = None,
+        imagination_shaping: bool = False,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         """Compute step reward (scaled by `step_dt=0.02`) and smooth termination probability in [0, 1].
 
@@ -864,12 +905,13 @@ class SugarHOITask:
         v_rf_xy = torch.sqrt((fk_next.contact_lin_vel_w[:, 3, :2] ** 2).sum(dim=-1) + 1e-8)
         r_feet_slide = self.profile.feet_slide_weight * (v_lf_xy * p_lf_gnd + v_rf_xy * p_rf_gnd)
 
-        # Differentiable `feet_air_time_min_penalty` (weight=5.0, threshold=0.5s, active after 50 steps)
+        # Differentiable `feet_air_time_min_penalty` (default weight=1.5, threshold=0.25s, active after 50 steps)
         curr_feet_gnd = torch.stack([p_lf_gnd, p_rf_gnd], dim=-1)  # (B, 2)
         if feet_air_time is not None and self.profile.feet_air_time_weight != 0.0:
             if prev_feet_gnd is None:
                 prev_feet_gnd = (feet_air_time <= 1e-4).float()
-            p_first_contact = (1.0 - prev_feet_gnd) * curr_feet_gnd
+            # Detach `prev_feet_gnd` so 1st-order BPTT cannot exploit "stay permanently glued to floor"
+            p_first_contact = (1.0 - prev_feet_gnd.detach()) * curr_feet_gnd
             air_before = feet_air_time + self.step_dt
             air_pen = (air_before - self.profile.feet_air_time_threshold).clamp_max(0.0) * p_first_contact
             ready_mask = (time_steps > 50).float() if time_steps is not None else 1.0
@@ -924,6 +966,14 @@ class SugarHOITask:
             + r_jacc
             + r_jtorque
         )
+        if imagination_shaping:
+            # Fine-grained ankle clearance Z tracking (indices [3, 6] = left/right ankle_roll_link)
+            err_fz = ((body_pos_rel_w[:, [3, 6], 2] - fk_next.tracked_pos_w[:, [3, 6], 2]) ** 2).sum(dim=-1)
+            unscaled_reward = unscaled_reward + 0.25 * torch.exp(-err_fz / (0.06**2))
+            if self.profile.hoi_mode == "hands":
+                # Focused wrist-to-object grasp alignment (indices [10, 13] = left/right wrist_yaw_link)
+                err_wrist_o2b = ((o2b_p[:, [10, 13]] - ref_o2b_p[:, [10, 13]]) ** 2).sum(dim=-1).mean(dim=-1)
+                unscaled_reward = unscaled_reward + 0.5 * c_label * torch.exp(-err_wrist_o2b / (0.08**2))
         step_reward = unscaled_reward * self.step_dt
 
         # ---- F. Smooth Sigmoid Soft Terminations (5 terms from BaseTerminationsCfg) ----

@@ -192,7 +192,7 @@ class HOIReplayBuffer:
 
     @torch.no_grad()
     def sample_imagination_starts(
-        self, batch_size: int, need_history: bool = False
+        self, batch_size: int, need_history: bool = False, frontier_frac: float = 0.0
     ) -> ImaginationStartBatch:
         """Sample valid starting states (plus 5-frame history for Tracker) for 32-step imagination."""
         if self.size < 1:
@@ -200,8 +200,23 @@ class HOIReplayBuffer:
 
         chrono = self._chronological_indices()                  # (S,)
         S = chrono.shape[0]
-        pos_idx = torch.randint(0, S, (batch_size,), device=self.device)
-        env_ids = torch.randint(0, self.num_envs, (batch_size,), device=self.device)
+        if 0.0 < frontier_frac < 1.0 and batch_size >= 4:
+            b_front = max(1, min(batch_size - 1, int(round(batch_size * frontier_frac))))
+            b_uni = batch_size - b_front
+            pos_u = torch.randint(0, S, (b_uni,), device=self.device)
+            env_u = torch.randint(0, self.num_envs, (b_uni,), device=self.device)
+
+            cand_n = max(b_front * 4, 64)
+            cand_pos = torch.randint(0, S, (cand_n,), device=self.device)
+            cand_env = torch.randint(0, self.num_envs, (cand_n,), device=self.device)
+            cand_ts = self.time_steps[chrono[cand_pos], cand_env]
+            _, top_idx = torch.topk(cand_ts, k=b_front)
+
+            pos_idx = torch.cat([pos_u, cand_pos[top_idx]], dim=0)
+            env_ids = torch.cat([env_u, cand_env[top_idx]], dim=0)
+        else:
+            pos_idx = torch.randint(0, S, (batch_size,), device=self.device)
+            env_ids = torch.randint(0, self.num_envs, (batch_size,), device=self.device)
 
         ring_t = chrono[pos_idx]
         states = self.states[ring_t, env_ids]

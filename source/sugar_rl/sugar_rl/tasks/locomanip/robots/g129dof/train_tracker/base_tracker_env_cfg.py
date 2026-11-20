@@ -371,7 +371,7 @@ class BaseRewardsCfg:
     )
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.1,
+        weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"),
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
@@ -379,10 +379,10 @@ class BaseRewardsCfg:
     )
     feet_air_time = RewTerm(
         func=mdp.feet_air_time_min_penalty,
-        weight=5.0,
+        weight=1.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
-            "threshold": 0.5,
+            "threshold": 0.25,
         },
     )
     undesired_contacts : RewTerm = MISSING

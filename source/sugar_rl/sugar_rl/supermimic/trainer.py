@@ -17,6 +17,7 @@ Algorithm per iteration:
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -47,25 +48,33 @@ class SuperMimicTrainCfg:
     collect_det_frac: float = 0.25                   # First 25% envs run deterministic actions (protects init_pool)
 
     # World model settings
-    wm_hidden_dims: tuple[int, ...] = (512, 512, 512)
+    wm_hidden_dims: tuple[int, ...] = (1024, 1024, 1024)
     wm_seq_len: int = 8                              # Autoregressive unroll horizon k for world model training
-    wm_updates_per_iter: int = 8
-    wm_batch_size: int = 1024
+    wm_updates_per_iter: int = 16
+    wm_batch_size: int = 2048
     wm_lr: float = 1e-3
-    wm_contact_loss_weight: float = 0.2
+    wm_contact_loss_weight: float = 0.5
     wm_obj_loss_weight: float = 1.5
     wm_warmup_iters: int = 8                         # Fit WM & Critic (and pure BC if Tracker) before enabling BPTT
 
-    # Policy BPTT settings
+    # Policy BPTT & decoupled exploration settings
     policy_hidden_dims: tuple[int, ...] = (512, 256, 128)
     use_ref_residual: bool = True
+    legs_use_residual: bool = False                  # Legs default to free balance around q_default; waist/arms use q_ref
     init_noise_std: float = 0.20
+    leg_explore_std_init: float = 0.12
+    arm_explore_std_init: float = 0.30
+    explore_std_final_scale: float = 0.25
     imagination_horizon: int = 32                    # H=32 step differentiable imagination rollout
-    policy_updates_per_iter: int = 4
-    policy_batch_size: int = 512
+    policy_updates_per_iter: int = 8
+    policy_batch_size: int = 2048
+    frontier_sample_frac: float = 0.40               # 40% imagination starts prioritize highest reached trajectory steps
+    residual_rate_weight: float = 0.02               # Smoothness penalty on pure network residual (avoids wrist scale spikes)
     policy_lr: float = 3e-4
+    lr_min_scale: float = 0.15                       # Cosine LR decay floor multiplier
     bptt_grad_decay: float = 0.98                    # Mild state Jacobian damping across 32 steps for stability
-    entropy_coef: float = 1e-3
+    grad_value_clip: float = 0.10                    # Per-element BPTT gradient clamp before global norm clip
+    entropy_coef: float = 0.0
     value_clip_range: tuple[float, float] = (-25.0, 15.0)  # Protects long BPTT runs from OOD critic spikes
 
     # Critic TD(lambda) settings
@@ -100,10 +109,13 @@ def _strip_compiled_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
     return {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
 
 
-def _compat_policy_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
-    """Normalize policy checkpoint keys and drop optional `residual_mask` buffer if present."""
+def _compat_policy_state_dict(
+    state_dict: dict[str, Any], policy: SuperMimicPolicy | None = None
+) -> dict[str, Any]:
+    """Normalize policy checkpoint keys while preserving or backfilling `residual_mask`."""
     sd = _strip_compiled_prefix(state_dict)
-    sd.pop("residual_mask", None)
+    if "residual_mask" not in sd and policy is not None and hasattr(policy, "residual_mask"):
+        sd["residual_mask"] = policy.residual_mask.clone()
     return sd
 
 
@@ -116,13 +128,18 @@ def load_supermimic_policy(
         raise ValueError(
             f"Checkpoint '{ckpt_path}' is not a SuperMimic checkpoint (missing 'policy_state_dict')."
         )
+    raw_sd = payload["policy_state_dict"]
+    has_mask = any(k.endswith("residual_mask") for k in raw_sd)
+    legs_res = bool(payload.get("legs_use_residual", not has_mask))
     policy = SuperMimicPolicy(
         obs_dim=int(payload["obs_dim"]),
         action_dim=int(payload.get("action_dim", 29)),
         hidden_dims=tuple(payload.get("hidden_dims", (512, 256, 128))),
         use_ref_residual=bool(payload.get("use_ref_residual", True)),
+        joint_names=payload.get("joint_names"),
+        legs_use_residual=legs_res,
     ).to(device)
-    policy.load_state_dict(_compat_policy_state_dict(payload["policy_state_dict"]), strict=True)
+    policy.load_state_dict(_compat_policy_state_dict(raw_sd, policy), strict=True)
     if "joint_names" in payload and payload["joint_names"] is not None:
         policy.joint_names = list(payload["joint_names"])
     policy.eval()
@@ -199,6 +216,8 @@ class SuperMimicTrainer:
             default_joint_pos=self.fk.default_joint_pos,
             action_scale=self.fk.action_scale,
             use_ref_residual=self.cfg.use_ref_residual,
+            joint_names=self.fk.env_joint_names,
+            legs_use_residual=self.cfg.legs_use_residual,
             init_std=self.cfg.init_noise_std,
         ).to(self.device)
         self._raw_critic = SuperMimicCritic(
@@ -206,6 +225,14 @@ class SuperMimicTrainer:
             hidden_dims=self.cfg.critic_hidden_dims,
             num_heads=self.cfg.critic_heads,
         ).to(self.device)
+
+        explore_vec = [
+            self.cfg.leg_explore_std_init
+            if any(tok in n for tok in ("hip_", "knee_", "ankle_"))
+            else self.cfg.arm_explore_std_init
+            for n in self.fk.env_joint_names
+        ]
+        self._explore_std_base = torch.tensor(explore_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         self.world_model: nn.Module = self._raw_world_model
         self.policy: nn.Module = self._raw_policy
@@ -266,17 +293,41 @@ class SuperMimicTrainer:
         coef = self.cfg.bc_init_coef * (1.0 - progress) + self.cfg.bc_min_coef * progress
         return float(max(self.cfg.bc_min_coef, coef))
 
+    def _iter_progress(self, iteration: int, max_iterations: int) -> float:
+        return min(1.0, max(0.0, float(iteration) / float(max(1, max_iterations - 1))))
+
+    def current_explore_std(self, iteration: int, max_iterations: int) -> Tensor:
+        progress = self._iter_progress(iteration, max_iterations)
+        scale = 1.0 - (1.0 - self.cfg.explore_std_final_scale) * progress
+        return self._explore_std_base * scale
+
+    def _apply_lr_schedule(self, iteration: int, max_iterations: int) -> float:
+        progress = self._iter_progress(iteration, max_iterations)
+        lr_min = self.cfg.lr_min_scale
+        cos_scale = lr_min + 0.5 * (1.0 - lr_min) * (1.0 + math.cos(math.pi * progress))
+        for opt, base_lr in (
+            (self.wm_opt, self.cfg.wm_lr),
+            (self.policy_opt, self.cfg.policy_lr),
+            (self.critic_opt, self.cfg.critic_lr),
+        ):
+            for pg in opt.param_groups:
+                pg["lr"] = base_lr * cos_scale
+        return float(cos_scale)
+
     # ------------------------------------------------------------------
     # Phase 1: Real Environment Rollout Collection
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def collect_rollout(self) -> tuple[Tensor, Tensor, dict[str, float]]:
+    def collect_rollout(
+        self, iteration: int = 0, max_iterations: int = 1
+    ) -> tuple[Tensor, Tensor, dict[str, float]]:
         """Collect `steps_per_env` transitions and compute GAE returns for Critic."""
         T = self.cfg.steps_per_env
         N = self.num_envs
         get_air_fn = getattr(self.bridge, "get_feet_air_time", None)
         lengths = self.bridge.motion_ref.lengths
+        explore_std_cur = self.current_explore_std(iteration, max_iterations)
 
         critic_obs_buf = torch.empty((T, N, PRIVILEGED_OBS_DIM), dtype=torch.float32, device=self.device)
         rewards_buf = torch.empty((T, N), dtype=torch.float32, device=self.device)
@@ -304,12 +355,18 @@ class SuperMimicTrainer:
             self._raw_policy.obs_rms.update(obs_pol)
             v_pred = self.critic(obs_crit, update_rms=True, pessimistic=False)
 
-            # Mixed deterministic + stochastic exploration (protects first 25% init_pool envs)
-            act_stoch, act_det = self._raw_policy.act(obs_pol, deterministic=False, update_rms=False)
-            if self.det_env_count > 0:
-                action = torch.cat([act_det[: self.det_env_count], act_stoch[self.det_env_count :]], dim=0)
+            # Mixed deterministic (first 25% init_pool protectors) + annealed leg/arm exploration
+            act_det = self._raw_policy.forward_mean(obs_pol, update_rms=False)
+            if self.det_env_count < N:
+                noise = torch.randn_like(act_det[self.det_env_count :]) * explore_std_cur
+                act_stoch = act_det[self.det_env_count :] + noise
+                action = (
+                    torch.cat([act_det[: self.det_env_count], act_stoch], dim=0)
+                    if self.det_env_count > 0
+                    else act_stoch
+                )
             else:
-                action = act_stoch
+                action = act_det
 
             _, sim_rew, dones, timeouts, pushed, extras = self.bridge.step(action)
             s_post = self.bridge.get_joint_state()
@@ -377,6 +434,7 @@ class SuperMimicTrainer:
         stats = {
             "collect/sim_step_reward": float(rewards_buf.mean().item()),
             "collect/reset_rate": float(dones_buf.float().mean().item()),
+            "collect/explore_std": float(explore_std_cur.mean().item()),
         }
         n_done = float(proxy_done.item())
         if n_done > 0:
@@ -405,6 +463,10 @@ class SuperMimicTrainer:
             if batch is None:
                 continue
             eff_k = int(batch.actions.shape[1])
+            with torch.no_grad():
+                s_prev_seq = torch.cat([batch.s_init.unsqueeze(1), batch.next_states[:, :-1]], dim=1)
+                true_deltas = self.task.compute_state_delta(s_prev_seq, batch.next_states)
+                self._raw_world_model.delta_rms.update(true_deltas)
             s_cur = batch.s_init
             loss_state_sum = torch.zeros((), dtype=torch.float32, device=self.device)
             loss_contact_sum = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -515,7 +577,9 @@ class SuperMimicTrainer:
         try:
             for _ in range(self.cfg.policy_updates_per_iter):
                 starts = self.replay.sample_imagination_starts(
-                    self.cfg.policy_batch_size, need_history=is_tracker
+                    self.cfg.policy_batch_size,
+                    need_history=is_tracker,
+                    frontier_frac=self.cfg.frontier_sample_frac,
                 )
                 B = starts.states.shape[0]
                 s_cur = starts.states
@@ -538,8 +602,10 @@ class SuperMimicTrainer:
 
                 imagined_return = torch.zeros(B, dtype=torch.float32, device=self.device)
                 bc_loss_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+                res_smooth_sum = torch.zeros((), dtype=torch.float32, device=self.device)
                 discount_weight = torch.ones(B, dtype=torch.float32, device=self.device)
                 step_obj_rew_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+                prev_res: Tensor | None = None
 
                 for tau in range(H):
                     t_cur = t_0 + tau
@@ -556,7 +622,9 @@ class SuperMimicTrainer:
                             s_cur, prev_a, ref_fut_cur, fk_res=fk_cur, xi=xi
                         )
 
-                    a_cur, a_mean = self._raw_policy.act(obs_pol, deterministic=False, update_rms=False)
+                    # Deterministic 32-step imagination rollout (prevents 50Hz white-noise chattering)
+                    a_mean, res_cur = self._raw_policy.forward_mean_and_residual(obs_pol, update_rms=False)
+                    a_cur = a_mean
 
                     # Stage 2 Teacher Distillation in Imagination (SuperMimic Refiner -> SuperMimic Tracker)
                     if self.teacher_policy is not None:
@@ -572,6 +640,13 @@ class SuperMimicTrainer:
 
                     if warmup_only:
                         break
+
+                    if prev_res is None:
+                        prev_res = res_cur.detach()
+                    else:
+                        step_res_rate = ((res_cur - prev_res) ** 2).sum(dim=-1)
+                        res_smooth_sum = res_smooth_sum + (discount_weight.detach() * step_res_rate).mean()
+                        prev_res = res_cur
 
                     # Differentiable 1-step human-object rollout
                     s_next, c_logits = self._raw_world_model.step(
@@ -592,6 +667,7 @@ class SuperMimicTrainer:
                         feet_air_time=feet_air_cur,
                         prev_feet_gnd=prev_feet_gnd,
                         time_steps=t_cur,
+                        imagination_shaping=True,
                     )
                     step_obj_rew_sum = step_obj_rew_sum + r_info["rew/tracking_obj"].mean()
                     feet_air_cur = r_info["next_feet_air_time"]
@@ -636,19 +712,17 @@ class SuperMimicTrainer:
                     imagined_return = imagined_return + discount_weight * v_tail
 
                 bc_term = bc_loss_sum / float(H)
-                entropy = 0.5 * (1.0 + torch.log(2.0 * torch.pi * self._raw_policy.std() ** 2)).sum()
+                res_rate_loss = self.cfg.residual_rate_weight * self.task.step_dt * res_smooth_sum
 
                 if warmup_only:
                     policy_loss = bc_term
                 else:
-                    policy_loss = (
-                        -imagined_return.mean()
-                        + bc_coef * bc_term
-                        - self.cfg.entropy_coef * entropy
-                    )
+                    policy_loss = -imagined_return.mean() + bc_coef * bc_term + res_rate_loss
 
                 self.policy_opt.zero_grad(set_to_none=True)
                 policy_loss.backward()
+                if self.cfg.grad_value_clip > 0.0:
+                    nn.utils.clip_grad_value_(self._raw_policy.parameters(), self.cfg.grad_value_clip)
                 grad_norm = nn.utils.clip_grad_norm_(self._raw_policy.parameters(), self.cfg.max_grad_norm)
                 if torch.isfinite(grad_norm):
                     self.policy_opt.step()
@@ -695,6 +769,7 @@ class SuperMimicTrainer:
             "action_dim": raw_pol.action_dim,
             "hidden_dims": raw_pol.hidden_dims,
             "use_ref_residual": raw_pol.use_ref_residual,
+            "legs_use_residual": raw_pol.legs_use_residual,
             "cfg": asdict(self.cfg),
             "policy_state_dict": _strip_compiled_prefix(raw_pol.state_dict()),
             "critic_state_dict": _strip_compiled_prefix(raw_crit.state_dict()),
@@ -710,8 +785,9 @@ class SuperMimicTrainer:
 
     def load_checkpoint(self, path: str | Path) -> int:
         payload = torch.load(str(path), map_location=self.device, weights_only=False)
-        _unwrap_compiled(self._raw_policy).load_state_dict(
-            _compat_policy_state_dict(payload["policy_state_dict"]), strict=True
+        raw_pol = _unwrap_compiled(self._raw_policy)
+        raw_pol.load_state_dict(
+            _compat_policy_state_dict(payload["policy_state_dict"], raw_pol), strict=True
         )
         _unwrap_compiled(self._raw_critic).load_state_dict(_strip_compiled_prefix(payload["critic_state_dict"]))
         _unwrap_compiled(self._raw_world_model).load_state_dict(
@@ -784,9 +860,12 @@ class SuperMimicTrainer:
                 self.collect_rollout()
 
         for it in range(start_iter, max_iterations):
+            lr_scale = self._apply_lr_schedule(it, max_iterations)
             self._sync()
             t0 = time.perf_counter()
-            critic_obs_flat, returns_flat, c_stats = self.collect_rollout()
+            critic_obs_flat, returns_flat, c_stats = self.collect_rollout(
+                iteration=it, max_iterations=max_iterations
+            )
             self._sync()
             t1 = time.perf_counter()
             wm_stats = self.update_world_model()
@@ -811,6 +890,7 @@ class SuperMimicTrainer:
                 "perf/wm_s": t2 - t1,
                 "perf/critic_s": t3 - t2,
                 "perf/policy_s": t4 - t3,
+                "policy/lr_scale": lr_scale,
             }
             all_metrics = {**c_stats, **wm_stats, **crit_stats, **pol_stats, **perf_stats}
             should_log = (

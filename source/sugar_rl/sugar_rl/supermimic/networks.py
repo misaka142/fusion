@@ -7,10 +7,33 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Sequence
 import torch
 import torch.nn as nn
 from torch import Tensor
+
+_CUDA_BF16_SUPPORTED: bool = bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+
+
+def _autocast_ctx(x: Tensor):
+    """Enable CUDA bfloat16 autocast inside MLP trunks while keeping FK/rotations in fp32."""
+    if x.is_cuda and _CUDA_BF16_SUPPORTED:
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def build_residual_mask(
+    joint_names: Sequence[str] | None,
+    action_dim: int = 29,
+    legs_use_residual: bool = False,
+) -> Tensor:
+    """Build 29-D mask: legs (`hip/knee/ankle`) = 0.0 (free balance), waist/arms = 1.0 (ref-guided)."""
+    if legs_use_residual or joint_names is None:
+        return torch.ones(action_dim, dtype=torch.float32)
+    assert len(joint_names) == action_dim, f"Expected {action_dim} joint names, got {len(joint_names)}"
+    mask = [0.0 if any(tok in n for tok in ("hip_", "knee_", "ankle_")) else 1.0 for n in joint_names]
+    return torch.tensor(mask, dtype=torch.float32)
 
 from .hoi_task import (
     CONTACT_DIM,
@@ -86,7 +109,7 @@ def _build_mlp(
 
 
 class JointWorldModel(nn.Module):
-    """Differentiable joint robot-object world model with auxiliary contact head."""
+    """Differentiable joint robot-object world model with output delta normalization & contact head."""
 
     def __init__(
         self,
@@ -95,12 +118,13 @@ class JointWorldModel(nn.Module):
         xi_dim: int = XI_DIM,
         delta_dim: int = DELTA_DIM,
         contact_dim: int = CONTACT_DIM,
-        hidden_dims: Sequence[int] = (512, 512, 512),
+        hidden_dims: Sequence[int] = (1024, 1024, 1024),
     ) -> None:
         super().__init__()
         self.in_dim = state_feat_dim + action_dim * 2 + xi_dim
         self.feat_rms = RunningMeanStd(state_feat_dim)
         self.xi_rms = RunningMeanStd(xi_dim)
+        self.delta_rms = RunningMeanStd(delta_dim, eps=1e-4)
 
         self.trunk = _build_mlp(self.in_dim, hidden_dims, out_dim=None)
         last_h = hidden_dims[-1]
@@ -115,8 +139,11 @@ class JointWorldModel(nn.Module):
         self._core_fn = self._core_forward
 
     def _core_forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        h = self.trunk(x)
-        return self.delta_head(h), self.contact_head(h)
+        with _autocast_ctx(x):
+            h = self.trunk(x)
+            raw_delta = self.delta_head(h)
+            c_logits = self.contact_head(h)
+        return raw_delta.float(), c_logits.float()
 
     def enable_compile(self, **compile_kwargs) -> None:
         """Compile inner tensor MLP + dual heads without wrapping outer `nn.Module` state_dict keys."""
@@ -137,7 +164,10 @@ class JointWorldModel(nn.Module):
         f_norm = self.feat_rms(state_feat)
         xi_norm = self.xi_rms(xi)
         x = torch.cat([f_norm, raw_action.clamp(-10.0, 10.0), pd_error.clamp(-5.0, 5.0), xi_norm], dim=-1)
-        return self._core_fn(x)
+        raw_delta, contact_logits = self._core_fn(x)
+        delta_std = torch.sqrt(self.delta_rms.var + self.delta_rms.eps)
+        delta = raw_delta * delta_std + self.delta_rms.mean
+        return delta, contact_logits
 
     def step(
         self,
@@ -175,6 +205,8 @@ class SuperMimicPolicy(nn.Module):
         default_joint_pos: Tensor | None = None,
         action_scale: Tensor | None = None,
         use_ref_residual: bool = True,
+        joint_names: Sequence[str] | None = None,
+        legs_use_residual: bool = False,
         init_std: float = 0.20,
         min_std: float = 0.02,
         max_std: float = 1.0,
@@ -185,6 +217,8 @@ class SuperMimicPolicy(nn.Module):
         self.action_dim = action_dim
         self.hidden_dims = tuple(hidden_dims)
         self.use_ref_residual = use_ref_residual
+        self.joint_names = list(joint_names) if joint_names is not None else None
+        self.legs_use_residual = bool(legs_use_residual)
         self.min_std = min_std
         self.max_std = max_std
         self.action_limit = action_limit
@@ -201,10 +235,16 @@ class SuperMimicPolicy(nn.Module):
             action_scale = torch.ones(action_dim, dtype=torch.float32)
         self.register_buffer("default_joint_pos", default_joint_pos.clone().float())
         self.register_buffer("action_scale", action_scale.clone().float())
+        self.register_buffer(
+            "residual_mask",
+            build_residual_mask(joint_names, action_dim=action_dim, legs_use_residual=legs_use_residual),
+        )
         self._core_fn = self._core_forward
 
     def _core_forward(self, obs_n: Tensor) -> Tensor:
-        residual = self.backbone(obs_n)
+        with _autocast_ctx(obs_n):
+            residual = self.backbone(obs_n)
+        residual = residual.float()
         return self.action_limit * torch.tanh(residual / self.action_limit)
 
     def enable_compile(self, **compile_kwargs) -> None:
@@ -219,7 +259,10 @@ class SuperMimicPolicy(nn.Module):
     def std(self) -> Tensor:
         return self.log_std.exp().clamp(self.min_std, self.max_std)
 
-    def forward_mean(self, obs_raw: Tensor, update_rms: bool = False) -> Tensor:
+    def forward_mean_and_residual(
+        self, obs_raw: Tensor, update_rms: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        """Return `(policy_mean_action, bounded_network_residual)`."""
         if update_rms:
             self.obs_rms.update(obs_raw)
         obs_n = self.obs_rms(obs_raw)
@@ -229,8 +272,11 @@ class SuperMimicPolicy(nn.Module):
             # In both PrivilegedCfg and TrackerCfg/Inference, obs_raw[:, 0:29] is current ref_joint_pos!
             q_ref = obs_raw[..., 0 : self.action_dim]
             ref_bias = (q_ref - self.default_joint_pos) / self.action_scale.clamp_min(1e-6)
-            return ref_bias + residual
-        return residual
+            return ref_bias * self.residual_mask + residual, residual
+        return residual, residual
+
+    def forward_mean(self, obs_raw: Tensor, update_rms: bool = False) -> Tensor:
+        return self.forward_mean_and_residual(obs_raw, update_rms=update_rms)[0]
 
     def act(
         self, obs_raw: Tensor, deterministic: bool = False, update_rms: bool = False
@@ -268,7 +314,8 @@ class SuperMimicCritic(nn.Module):
         self._core_fn = self._core_forward
 
     def _core_forward(self, obs_n: Tensor) -> Tensor:
-        preds = [head(obs_n).squeeze(-1) for head in self.heads]
+        with _autocast_ctx(obs_n):
+            preds = [head(obs_n).squeeze(-1).float() for head in self.heads]
         return torch.stack(preds, dim=0)
 
     def enable_compile(self, **compile_kwargs) -> None:

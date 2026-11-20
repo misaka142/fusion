@@ -20,7 +20,13 @@ from .hoi_task import (
     XI_DIM,
     resolve_task_profile,
 )
-from .networks import JointWorldModel, RunningMeanStd, SuperMimicCritic, SuperMimicPolicy
+from .networks import (
+    JointWorldModel,
+    RunningMeanStd,
+    SuperMimicCritic,
+    SuperMimicPolicy,
+    build_residual_mask,
+)
 from .replay import HOIReplayBuffer, ImaginationStartBatch, WMSequenceBatch
 from .trainer import SuperMimicTrainCfg, SuperMimicTrainer, load_supermimic_policy
 from .urdf_kinematics import (
@@ -64,6 +70,7 @@ __all__ = [
     "WM_STATE_FEAT_DIM",
     "XI_DIM",
     "assert_privileged_obs_aligned",
+    "build_residual_mask",
     "load_supermimic_policy",
     "resolve_task_profile",
     "scale_physx_cfg_for_num_envs",

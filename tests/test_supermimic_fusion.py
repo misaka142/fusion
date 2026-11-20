@@ -34,8 +34,10 @@ from sugar_rl.supermimic import (  # noqa: E402
     SuperMimicTrainer,
     TASK_PROFILES,
     TRACKER_OBS_DIM,
+    WM_STATE_FEAT_DIM,
     XI_DIM,
     assert_privileged_obs_aligned,
+    build_residual_mask,
     load_supermimic_policy,
     resolve_task_profile,
 )
@@ -724,11 +726,11 @@ def test_8_review_regressions_obs_xi_com_and_rewards() -> None:
     expected_diff = 0.5 * float(task_push_trk.profile.num_undesired_bodies) * 1.0 * 0.02  # 6 * 1.0 * 0.02 = 0.12
     assert abs(float((r_clean[0] - r_undes[0]).item()) - expected_diff) < 1e-4
 
-    # Feet air time: short swing (0.18s < 0.5s) landing at t=60 (>50) incurs negative penalty; long swing (0.6s) incurs 0
+    # Feet air time: short swing (0.05s -> 0.07s < 0.25s) landing at t=60 (>50) incurs negative penalty; long swing (0.35s) incurs 0
     logits_land = torch.tensor([[10.0, -10.0, 20.0, -20.0, -20.0]], device=DEVICE).expand(4, 5)
     prev_swing = torch.zeros(4, 2, device=DEVICE)
-    air_short = torch.tensor([[0.18, 0.0]], device=DEVICE).expand(4, 2)
-    air_long = torch.tensor([[0.60, 0.0]], device=DEVICE).expand(4, 2)
+    air_short = torch.tensor([[0.05, 0.0]], device=DEVICE).expand(4, 2)
+    air_long = torch.tensor([[0.35, 0.0]], device=DEVICE).expand(4, 2)
     t_late = torch.full((4,), 60, dtype=torch.long, device=DEVICE)
     r_short, _, info_s = task_push_trk.compute_reward_and_termination(
         s_perf, s_perf, act, act, ref_cur=f0, contact_logits=logits_land,
@@ -739,7 +741,8 @@ def test_8_review_regressions_obs_xi_com_and_rewards() -> None:
         feet_air_time=air_long, prev_feet_gnd=prev_swing, time_steps=t_late,
     )
     assert float(info_l["rew/feet_air_time"].abs().max().item()) < 1e-5
-    assert float((r_long[0] - r_short[0]).item()) > 0.02
+    # Expected gap: (0.25 - (0.05 + 0.02)) * 1.5 * 0.02 = 0.0054
+    assert abs(float((r_long[0] - r_short[0]).item()) - 0.0054) < 1e-4
     print("[PASS] Test 8: Per-slice obs assertion, xi/COM kinematics, history padding & PushBox/feet_air_time rewards")
 
 
@@ -1508,6 +1511,134 @@ def test_13_lafan_walk_stitcher_continuity_and_clearance() -> None:
     print(f"[PASS] Test 13: LAFAN1 walk stitcher SE(2) phase blend smooth (pre_walk={out['meta']['pre_walk_path_m']:.2f}m, clr={clr:.3f}m, com={out['meta']['max_blend_com_margin_m']:.3f}m)")
 
 
+def test_14_v2_antichatter_delta_rms_leg_mask_and_smooth_lift() -> None:
+    """Verify v2 fixes: 123-D anti-collision WM features, compute_state_delta/delta_rms roundtrip,
+    decoupled leg-free/arm-ref residual mask (with legacy ckpt compat), frontier replay sampling, and smooth pickup stretch.
+    """
+    import numpy as np
+    from scripts.sugar_rl.convert_diplo_to_sugar import stretch_pickup_window
+
+    torch.manual_seed(14)
+    fk = FastTreeKinematics(device=DEVICE)
+    task = SugarHOITask(fk, "CarryBox")
+
+    # 1. 123-D WM state_features & compute_state_delta <-> apply_delta exact inverse + delta_rms
+    assert WM_STATE_FEAT_DIM == 123
+    B = 8
+    s0 = SugarHOITask.pack_state(
+        root_pos=torch.randn(B, 3, device=DEVICE),
+        root_quat=quat_normalize(torch.randn(B, 4, device=DEVICE)),
+        q=torch.randn(B, 29, device=DEVICE) * 0.2,
+        root_lin_vel=torch.randn(B, 3, device=DEVICE) * 0.3,
+        root_ang_vel=torch.randn(B, 3, device=DEVICE) * 0.3,
+        qd=torch.randn(B, 29, device=DEVICE) * 0.5,
+        obj_pos=torch.randn(B, 3, device=DEVICE),
+        obj_quat=quat_normalize(torch.randn(B, 4, device=DEVICE)),
+        obj_lin_vel=torch.randn(B, 3, device=DEVICE) * 0.2,
+        obj_ang_vel=torch.randn(B, 3, device=DEVICE) * 0.2,
+    )
+    feat = task.state_features(s0)
+    assert feat.shape == (B, 123) and torch.isfinite(feat).all()
+
+    delta_true = torch.randn(B, 82, device=DEVICE) * 0.05
+    s1 = SugarHOITask.apply_delta(s0, delta_true)
+    delta_rec = SugarHOITask.compute_state_delta(s0, s1)
+    assert (delta_true - delta_rec).abs().max().item() < 1e-4, "compute_state_delta failed roundtrip!"
+
+    wm = JointWorldModel(hidden_dims=(128, 128)).to(DEVICE)
+    wm.delta_rms.update(delta_true * 60.0)  # std = 3.0 -> var ~ 9.0 > 1.0
+    assert float(wm.delta_rms.var.max().item()) > 1.5
+
+    # 2. Decoupled leg-free / upper-body-ref residual mask & legacy checkpoint compatibility
+    mask = build_residual_mask(G1_29DOF_SDK_JOINT_NAMES, action_dim=29, legs_use_residual=False).to(DEVICE)
+    assert int((mask == 0.0).sum().item()) == 12 and int((mask == 1.0).sum().item()) == 17
+    pol = SuperMimicPolicy(
+        obs_dim=PRIVILEGED_OBS_DIM,
+        hidden_dims=(64, 64),
+        default_joint_pos=fk.default_joint_pos,
+        action_scale=fk.action_scale,
+        joint_names=G1_29DOF_SDK_JOINT_NAMES,
+        legs_use_residual=False,
+    ).to(DEVICE)
+    with torch.no_grad():
+        for p in pol.backbone.parameters():
+            p.zero_()
+    obs_a = torch.zeros(2, PRIVILEGED_OBS_DIM, device=DEVICE)
+    obs_b = obs_a.clone()
+    obs_b[:, :29] = 0.5  # change q_ref across all 29 joints
+    m_a = pol.forward_mean(obs_a)
+    m_b = pol.forward_mean(obs_b)
+    leg_idx = [i for i, n in enumerate(G1_29DOF_SDK_JOINT_NAMES) if any(k in n for k in ("hip_", "knee_", "ankle_"))]
+    arm_idx = [i for i in range(29) if i not in leg_idx]
+    assert (m_a[:, leg_idx] - m_b[:, leg_idx]).abs().max().item() < 1e-6, "Legs must stay free of q_ref bias!"
+    assert (m_a[:, arm_idx] - m_b[:, arm_idx]).abs().min().item() > 0.1, "Upper body must keep q_ref feed-forward!"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        leg_ckpt = pathlib.Path(tmpdir) / "legacy_no_mask.pt"
+        legacy_sd = {k: v for k, v in pol.state_dict().items() if k != "residual_mask"}
+        torch.save(
+            {
+                "obs_dim": PRIVILEGED_OBS_DIM,
+                "action_dim": 29,
+                "hidden_dims": (64, 64),
+                "use_ref_residual": True,
+                "policy_state_dict": legacy_sd,
+            },
+            leg_ckpt,
+        )
+        loaded_leg = load_supermimic_policy(leg_ckpt, device=DEVICE)
+        assert float(loaded_leg.residual_mask.min().item()) == 1.0
+
+    # 3. Frontier replay sampling shifts imagination starts toward deeper trajectory progress
+    rb = HOIReplayBuffer(capacity=40, num_envs=4, device=DEVICE)
+    s_one = torch.ones(4, SDIM, device=DEVICE)
+    a_one = torch.zeros(4, 29, device=DEVICE)
+    c_one = torch.zeros(4, CONTACT_DIM, device=DEVICE)
+    m_zero = torch.zeros(4, dtype=torch.long, device=DEVICE)
+    ep_vec = torch.arange(4, dtype=torch.int64, device=DEVICE)
+    for t in range(36):
+        rb.add(s_one, a_one, a_one, s_one, c_one, m_zero, torch.full((4,), t, device=DEVICE), ep_vec)
+    uni_mean = rb.sample_imagination_starts(256, frontier_frac=0.0).time_steps.float().mean().item()
+    front_mean = rb.sample_imagination_starts(256, frontier_frac=0.5).time_steps.float().mean().item()
+    assert front_mean > uni_mean + 4.0, f"Frontier sampling did not bias late steps: front={front_mean:.1f} vs uni={uni_mean:.1f}"
+
+    # 4. Smooth pickup window stretch cuts peak lift acceleration by > 2.2x without quaternion discontinuities
+    T_syn = 120
+    t_arr = np.arange(T_syn, dtype=np.float64) * 0.02
+    r_pos = np.zeros((T_syn, 3), dtype=np.float64)
+    r_pos[:, 2] = 0.72
+    r_quat = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (T_syn, 1))
+    q_bfs = np.zeros((T_syn, 29), dtype=np.float64)
+    o_pos = np.tile(np.array([0.35, 0.0, 0.17]), (T_syn, 1))
+    # Rapid S-curve lift over 25 frames (0.50s) from z=0.17 -> 0.75m
+    u_lift = np.clip((np.arange(T_syn) - 35) / 25.0, 0.0, 1.0)
+    o_pos[:, 2] = 0.17 + 0.58 * (3 * u_lift**2 - 2 * u_lift**3)
+    o_quat = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (T_syn, 1))
+
+    acc_before = float(np.abs(np.gradient(np.gradient(o_pos[:, 2], 0.02), 0.02)).max())
+    rp_s, rq_s, qb_s, op_s, oq_s = stretch_pickup_window(r_pos, r_quat, q_bfs, o_pos, o_quat, n_pre_bend=10, stretch_factor=1.65)
+    acc_after = float(np.abs(np.gradient(np.gradient(op_s[:, 2], 0.02), 0.02)).max())
+    assert len(op_s) > T_syn + 15
+    assert acc_after < acc_before / 2.2, f"Pickup stretch failed to reduce accel: before={acc_before:.2f}, after={acc_after:.2f}"
+    assert np.allclose(np.linalg.norm(rq_s, axis=-1), 1.0, atol=1e-6)
+
+    # 5. Verify prev_feet_gnd gradient detach prevents glued-to-floor BPTT exploit
+    mock_m = _MockMotionData(fk, device=DEVICE)
+    ref0 = MotionReferenceAdapter(mock_m).get_frame(torch.zeros(2, dtype=torch.long, device=DEVICE), torch.full((2,), 5, dtype=torch.long, device=DEVICE))
+    s_test = s0[:2].clone().requires_grad_(True)
+    prev_gnd_var = torch.full((2, 2), 0.5, device=DEVICE, requires_grad=True)
+    curr_logits = torch.tensor([[0.0, -10.0, 5.0, 5.0, -10.0]], device=DEVICE).expand(2, 5).clone().requires_grad_(True)
+    r_gnd, _, _ = task.compute_reward_and_termination(
+        s_test, s_test, a_one[:2], a_one[:2], ref_cur=ref0, contact_logits=curr_logits,
+        feet_air_time=torch.full((2, 2), 0.05, device=DEVICE), prev_feet_gnd=prev_gnd_var,
+        time_steps=torch.full((2,), 60, dtype=torch.long, device=DEVICE), imagination_shaping=True,
+    )
+    r_gnd.sum().backward()
+    assert s_test.grad is not None and curr_logits.grad is not None
+    assert prev_gnd_var.grad is None, "prev_feet_gnd gradient was NOT detached in feet_air_time!"
+    print(f"[PASS] Test 14: v2 anti-chatter (123-D WM, delta_rms, leg-free mask, frontier={front_mean:.1f}>{uni_mean:.1f}, acc {acc_before:.1f}->{acc_after:.1f}m/s^2)")
+
+
 if __name__ == "__main__":
     print(f"Running SuperMimic x SUGAR test suite on device: {DEVICE} (PyTorch {torch.__version__})")
     test_1_rotations_and_zero_angle_gradients()
@@ -1523,4 +1654,5 @@ if __name__ == "__main__":
     test_11_fast_fk_depth_vectorization_and_scale_grad()
     test_12_omniretarget_clean_usda_and_bridge_sync()
     test_13_lafan_walk_stitcher_continuity_and_clearance()
-    print("\nALL 13 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")
+    test_14_v2_antichatter_delta_rms_leg_mask_and_smooth_lift()
+    print("\nALL 14 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")

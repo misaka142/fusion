@@ -593,6 +593,92 @@ class _MuJoCoHygieneAuditor:
         return True, "OK", stats
 
 
+def stretch_pickup_window(
+    r_pos: np.ndarray,
+    r_quat_wxyz: np.ndarray,
+    q_bfs: np.ndarray,
+    o_pos: np.ndarray,
+    o_quat_wxyz: np.ndarray,
+    n_pre_bend: int,
+    stretch_factor: float = 1.65,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """C1-smoothly time-stretch only the pickup-to-standup phase to reduce upward inertia overshoot."""
+    if stretch_factor <= 1.0 or len(r_pos) < 40:
+        return r_pos, r_quat_wxyz, q_bfs, o_pos, o_quat_wxyz
+
+    T = len(r_pos)
+    z0 = float(o_pos[0, 2])
+    z_top = float(np.percentile(o_pos[:, 2], 90))
+    lifted = np.flatnonzero(o_pos[:, 2] > z0 + 0.012)
+    if len(lifted) < 10 or (z_top - z0) < 0.10:
+        return r_pos, r_quat_wxyz, q_bfs, o_pos, o_quat_wxyz
+
+    t_grasp = int(lifted[0])
+    reach_top = np.flatnonzero(o_pos[t_grasp:, 2] >= z0 + 0.92 * (z_top - z0))
+    t_top = t_grasp + (int(reach_top[0]) if len(reach_top) > 0 else 28)
+
+    w0 = max(int(n_pre_bend), t_grasp - 8)
+    w1 = min(T - 20, t_top + 14)
+    if w1 <= w0 + 10:
+        return r_pos, r_quat_wxyz, q_bfs, o_pos, o_quat_wxyz
+
+    u_src = np.arange(T, dtype=np.float64)
+    dilation = np.ones(T, dtype=np.float64)
+    win_u = np.linspace(0.0, 1.0, w1 - w0 + 1)
+    taper = (np.sin(np.pi * np.clip(win_u / 0.22, 0.0, 0.5)) ** 2) * (
+        np.sin(np.pi * np.clip((1.0 - win_u) / 0.22, 0.0, 0.5)) ** 2
+    )
+    dilation[w0 : w1 + 1] = 1.0 + (stretch_factor - 1.0) * taper
+
+    tau_cum = np.concatenate([[0.0], np.cumsum(0.5 * (dilation[:-1] + dilation[1:]))])
+    T_new = int(round(tau_cum[-1])) + 1
+    tau_grid = np.linspace(0.0, tau_cum[-1], T_new)
+    src_times = np.interp(tau_grid, tau_cum, u_src)
+
+    idx0 = np.clip(np.floor(src_times).astype(np.int64), 0, T - 2)
+    alpha = (src_times - idx0)[:, None]
+
+    def _interp_cubic(arr: np.ndarray) -> np.ndarray:
+        im1 = np.clip(idx0 - 1, 0, T - 1)
+        i1 = idx0 + 1
+        i2 = np.clip(idx0 + 2, 0, T - 1)
+        p0, p1, p2, p3 = arr[im1], arr[idx0], arr[i1], arr[i2]
+        t2 = alpha * alpha
+        t3 = t2 * alpha
+        return 0.5 * (
+            (2.0 * p1)
+            + (-p0 + p2) * alpha
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+        )
+
+    def _interp_slerp(q_arr: np.ndarray) -> np.ndarray:
+        qa = q_arr[idx0].copy()
+        qb = q_arr[idx0 + 1].copy()
+        dot = np.sum(qa * qb, axis=-1, keepdims=True)
+        qb = np.where(dot < 0.0, -qb, qb)
+        dot_c = np.clip(np.abs(dot), 0.0, 1.0)
+        theta = np.arccos(dot_c)
+        sin_t = np.sin(theta)
+        safe_sin = np.where(sin_t > 1e-6, sin_t, 1.0)
+        w_a = np.where(sin_t > 1e-6, np.sin((1.0 - alpha) * theta) / safe_sin, 1.0 - alpha)
+        w_b = np.where(sin_t > 1e-6, np.sin(alpha * theta) / safe_sin, alpha)
+        out = w_a * qa + w_b * qb
+        out /= np.clip(np.linalg.norm(out, axis=-1, keepdims=True), 1e-12, None)
+        for i in range(1, len(out)):
+            if np.dot(out[i], out[i - 1]) < 0.0:
+                out[i] = -out[i]
+        return out
+
+    return (
+        _interp_cubic(r_pos),
+        _interp_slerp(r_quat_wxyz),
+        _interp_cubic(q_bfs),
+        _interp_cubic(o_pos),
+        _interp_slerp(o_quat_wxyz),
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--diplo_dir", type=str, default=str(_FUSION_ROOT / "data_diplo_raw"))
@@ -600,6 +686,7 @@ def main() -> None:
     ap.add_argument("--out_dir", type=str, default=str(_FUSION_ROOT / "data" / "OmniCarryBox"))
     ap.add_argument("--cache_dir", type=str, default=None, help="Optional HuggingFace download cache dir.")
     ap.add_argument("--blend_frames", type=int, default=22, help="50Hz stance-pinned walk->stand blend frames (default: 22 = 0.44s).")
+    ap.add_argument("--pickup_stretch", type=float, default=1.65, help="Smooth time-stretch factor for rapid pickup->standup phase (default: 1.65).")
     ap.add_argument("--max_solves_per_base", type=int, default=6, help="Max top clean SBTO solves per base motion.")
     ap.add_argument("--approaches_per_variant", type=int, default=3, help="Distinct LAFAN1 + D4 box variants per clean solve (x2 mirror).")
     args = ap.parse_args()
@@ -623,11 +710,12 @@ def main() -> None:
     box_mesh.export(str(out_root / "obj_aligned.obj"))
     _write_usda_convex_hull(box_mesh, out_root / "obj_aligned.usda", mass_kg=DIPLO_BOX_MASS_KG)
     box_spec = {
-        "dataset": "diplo_sbto_lafan1_clean",
+        "dataset": "diplo_sbto_lafan1_clean_v2",
         "task": "CarryBox",
         "box_size_xyz": [round(float(x), 5) for x in DIPLO_BOX_SIZE_XYZ],
         "box_center_xyz": [0.0, 0.0, 0.0],
         "mass_kg": DIPLO_BOX_MASS_KG,
+        "pickup_stretch": float(args.pickup_stretch),
         "hull_vertices": int(len(box_mesh.vertices)),
         "hull_faces": int(len(box_mesh.faces)),
         "mesh_file": "obj_aligned.obj",
@@ -672,8 +760,9 @@ def main() -> None:
     ra_idx_35 = SUGAR_RAW_35_BODY_NAMES.index("right_ankle_roll_link")
 
     # 3. Stage A: Screen all ~900 SBTO solves strictly inside the PURE MuJoCo-simulated window `[75 : 75+motion_frames]`,
-    #    then prepend the coupled `12x15` Double-Sole Welded Stand-to-Bend transition (`0.00 cm` sole slip)!
-    core_cache_file = diplo_dir / ".clean_sbto_cores_v5_puresim.pkl"
+    #    prepend coupled `12x15` Double-Sole Welded Stand-to-Bend, and smoothly stretch the pickup-to-standup phase!
+    stretch_tag = f"{float(args.pickup_stretch):.2f}".replace(".", "p")
+    core_cache_file = diplo_dir / f".clean_sbto_cores_v6_smoothlift_{stretch_tag}.pkl"
     all_clean_by_base: dict[str, list[dict]] = {}
     drop_summary: dict[str, int] = {}
 
@@ -789,14 +878,28 @@ def main() -> None:
                     hold_frames=5,
                     bend_frames=32,
                 )
+                # Smoothly stretch the rapid pickup-to-standup phase to eliminate PD torque whiplash
+                rp_wb, rq_wb, qb_wb, op_wb, oq_wb = stretch_pickup_window(
+                    rp_wb,
+                    rq_wb,
+                    qb_wb,
+                    op_wb,
+                    oq_wb,
+                    n_pre_bend=n_pre_wb,
+                    stretch_factor=float(args.pickup_stretch),
+                )
+                l_idx_wb = np.flatnonzero(op_wb[:, 2] > (float(op_wb[0, 2]) + 0.035))
+                if len(l_idx_wb) < 25:
+                    drop_summary["lift_or_place_incomplete"] = drop_summary.get("lift_or_place_incomplete", 0) + 1
+                    continue
                 ok_wb, reason_wb, stats_wb = auditor.evaluate_sequence(
                     rp_wb,
                     rq_wb,
                     qb_wb,
                     op_wb,
                     oq_wb,
-                    first_lift=int(l_idx[0]) + n_pre_wb,
-                    last_lift=int(l_idx[-1]) + n_pre_wb,
+                    first_lift=int(l_idx_wb[0]),
+                    last_lift=int(l_idx_wb[-1]),
                     blend_range=(0, n_pre_wb) if n_pre_wb > 0 else None,
                     stand_bend_start=0,
                 )

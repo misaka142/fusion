@@ -117,7 +117,7 @@
       <div class="subbox" style="margin-top:14px;font-size:12.5px;">
         <strong>源码与验证边界声明（面试必知）：</strong>
         全身交互任务环境（<code>sugar_rl/tasks</code>）与高层扩散生成器（<code>sugar_il</code>）来自 <strong>SUGAR 官方开源仓库</strong>；
-        因 SuperMimic 官方代码尚未开源，<code>sugar_rl/supermimic</code> 为依据论文算法原理自行重构的<strong>非官方融合实现</strong>。本地已完成 15 项自动化单元与 MuJoCo 跨引擎测试验证，完整 5001 轮长训练需在 Google Colab GPU 上执行验证。
+        因 SuperMimic 官方代码尚未开源，<code>sugar_rl/supermimic</code> 为依据论文算法原理自行重构的<strong>非官方融合实现</strong>。本地已完成 20 项（14 项核心单元与回归测试 + 6 项 MuJoCo 跨引擎测试）自动化验证，完整 5001 轮长训练需在 Google Colab GPU 上执行验证。
       </div>
 
       <nav class="btn-group" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);" id="main-tabs">
@@ -472,10 +472,10 @@
     }
 
     const REPO_MODULES = [
-      { title: '① 核心创新包 supermimic/', sub: 'source/sugar_rl/sugar_rl/supermimic/', files: ['rotations.py：零角安全梯度四元数与行优先 6D 旋转', 'urdf_kinematics.py：纯 PyTorch 29-DoF 可微正向运动学与质心速度递推', 'hoi_task.py：84维状态、108维SE(2)特征、890/510维观测、22项奖励+5项软终止', 'networks.py + replay.py + env_bridge.py + trainer.py：世界模型、自包含Actor、双头Critic与32步BPTT训练主循环'] },
+      { title: '① 核心创新包 supermimic/', sub: 'source/sugar_rl/sugar_rl/supermimic/', files: ['rotations.py：零角安全梯度四元数与行优先 6D 旋转', 'urdf_kinematics.py：纯 PyTorch 29-DoF 可微正向运动学与质心速度递推', 'hoi_task.py：84维状态、123维SE(2)防碰撞特征、890/510维观测、22项奖励+5项软终止', 'networks.py + replay.py + env_bridge.py + trainer.py：世界模型（含delta_rms）、残差掩码Actor、双头Critic与确定性32步BPTT训练主循环'] },
       { title: '② 仿真环境层 tasks/', sub: 'source/sugar_rl/sugar_rl/tasks/', files: ['mdp/commands.py：参考轨迹加载、自适应初始状态池 init_pool、Rollout 采集与 Generator 调用', 'robots/g129dof/：6 个任务在 Refiner / Tracker / Inference 三种模式下的环境配置'] },
       { title: '③ 扩散大脑包 sugar_il/', sub: 'source/sugar_il/sugar_il/', files: ['generator_state_encoder.py：物体(9D)+指令(36D)+目标(9D)编码为 256D Token', 'generator.py：匈牙利最优传输噪声匹配训练 12层 Transformer + DDIM 16步去噪', 'sugar_il_wrapper.py：10Hz 8步路点 → 50Hz 36帧线性插值外壳'] },
-      { title: '④ 本地跨引擎 scripts/sim2sim/', sub: 'scripts/sim2sim/ & tests/', files: ['scene_builder.py：动态生成全6任务对齐的 MuJoCo XML（CAD惯量、转子armature、橡胶手碰撞）', 'policy_runner.py：10Hz+50Hz+500Hz多频闭环控制 + 鼠标实时拖拽绿色目标点', 'tests/：10项核心单元测试 + 5项 MuJoCo Sim2Sim 端到端测试'] }
+      { title: '④ 本地跨引擎 scripts/sim2sim/', sub: 'scripts/sim2sim/ & tests/', files: ['scene_builder.py：动态生成全6任务对齐的 MuJoCo XML（CAD惯量、转子armature、橡胶手碰撞）', 'policy_runner.py：10Hz+50Hz+500Hz多频闭环控制 + 鼠标实时拖拽绿色目标点', 'tests/：14项核心单元测试 + 6项 MuJoCo Sim2Sim 端到端测试'] }
     ];
     let curRepoIdx = 0;
     function renderRepoSection() {
@@ -655,11 +655,12 @@
         ]
       },
       {
-        name: '108维 SE(2) 航向不变世界模型特征', total: 108,
+        name: '123维 SE(2) 航向不变世界模型特征', total: 123,
         slices: [
           { name: 'robot_se2_feat', range: '0:71', dim: 71, color: 'c1', frame: '消除水平(x,y)与Yaw', desc: '离地高度(1)+去偏航6D倾角(6)+关节角(29)+航向系线/角速度(6)+关节角速度(29)。' },
           { name: 'obj_heading_feat', range: '71:87', dim: 16, color: 'c3', frame: '机器人航向系', desc: '物体航向系坐标(3)+高度差(1)+航向系6D朝向(6)+航向系线/角速度(6)。' },
-          { name: 'contact_in_obj', range: '87:108', dim: 21, color: 'c4', frame: '物体自身局部系 (7×3)', desc: '左右橡胶手、脚踝、髋与骨盆共 7 个部位在物体局部系下的三维坐标，直接暴露接触距离！' }
+          { name: 'contact_in_obj', range: '87:108', dim: 21, color: 'c4', frame: '物体自身局部系 (7×3)', desc: '左右橡胶手、脚踝、髋与骨盆共 7 个部位在物体局部系下的三维坐标，直接暴露接触距离！' },
+          { name: 'anticol_in_obj', range: '108:123', dim: 15, color: 'c2', frame: '物体自身局部系 (5×3)', desc: 'torso_link、左右 elbow_link 与左右 wrist_yaw_link 共 5 个防碰撞连杆在物体局部系下的三维坐标，防止俯身前倾撞飞箱子！' }
         ]
       }
     ];
@@ -762,7 +763,7 @@
     const QA_ITEMS = [
       { q: 'Q1：为什么要把原版 SUGAR 里的 PPO/BCPPO 换成 SuperMimic（世界模型 BPTT）？', loc: 'trainer.py / hoi_task.py', a: 'PPO 把物理和奖励当黑盒做零阶随机试错，样本利用率低；SuperMimic 在可微 JointWorldModel + 纯 PyTorch 正向运动学 FK 上连续展开 32 步 BPTT，直接获得一阶解析物理梯度 ∂R/∂a。' },
       { q: 'Q2：32 步长时域 BPTT 怎么防止梯度爆炸和模型漏洞欺骗（Model Exploitation）？', loc: 'rotations.py / networks.py / trainer.py', a: '五层防护：k=8自回归训世界模型、atan2+零点泰勒展开防NaN、0.98状态雅可比衰减、5项Sigmoid软终止连乘、以及仅在真实数据上训练的双头悲观截断 Critic min(V1,V2)∈[-25,15]。' },
-      { q: 'Q3：为什么世界模型输入是 108 维 SE(2) 特征，输出增量是 82 维而非 84 维？', loc: 'hoi_task.py', a: '消除绝对 (x,y) 和 Yaw 实现平面平移旋转不变性，并拼入 7 个接触部位在物体局部系的 21 维坐标；两个单位四元数改用 3 维轴角增量（84-2=82维）右乘积分以严格保持模长为 1。' },
+      { q: 'Q3：为什么世界模型输入是 123 维 SE(2) 特征，输出增量是 82 维而非 84 维？', loc: 'hoi_task.py', a: '消除绝对 (x,y) 和 Yaw 实现平面平移旋转不变性，并拼入 7 个接触部位与 5 个躯干/前臂防碰撞连杆在物体局部系的 21+15=36 维坐标；两个单位四元数改用 3 维轴角增量（84-2=82维）右乘积分以严格保持模长为 1。' },
       { q: 'Q4：没有碰撞检测器时，想象里的接触奖励、脚打滑和腾空时间怎么可微计算？', loc: 'networks.py & hoi_task.py', a: '通过世界模型并联的 5 维 contact_head 预测 sigmoid 接触概率，将离散接触奖励改写为期望奖励，落地瞬间平滑近似为 (1-p_prev)*p_curr。' },
       { q: 'Q5：GPU 环形缓冲区为什么要拆开存 ep_ids 和 valid_transitions？', loc: 'replay.py', a: '外力推搡 push 打断受控物理连续性（不能训世界模型，由 valid_transitions 拦截），但未重置回合（Tracker 仍需跨 push 按 ep_ids 回溯真实 5 帧传感器历史）。' },
       { q: 'Q6：为什么想象步奖励拿 s_next 对照 ref[t_cur] 而不是 ref[t_cur+1]？', loc: 'hoi_task.py', a: '严格匹配 IsaacLab step() 内部顺序：物理步进后先算终止与奖励，最后 command_manager 才将 time_steps 加 1，避免 20ms 相位滞后。' },

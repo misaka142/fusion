@@ -111,15 +111,15 @@ parser.add_argument(
     "--teacher_ckpt", type=str, default=None, help="Path to Stage 1 SuperMimic Refiner `.pt` checkpoint."
 )
 
-# SuperMimic algorithm hyperparameters (v1 baseline defaults)
+# SuperMimic algorithm hyperparameters (v2 anti-chatter & high-UTD defaults)
 parser.add_argument("--horizon", type=int, default=32, help="Differentiable imagination rollout horizon H.")
 parser.add_argument("--wm_seq_len", type=int, default=8, help="Autoregressive world-model training sequence length k.")
-parser.add_argument("--wm_updates", type=int, default=8, help="World model gradient updates per iteration.")
-parser.add_argument("--policy_updates", type=int, default=4, help="Policy BPTT updates per iteration.")
-parser.add_argument("--wm_batch_size", type=int, default=1024, help="Minibatch size for world-model updates.")
-parser.add_argument("--policy_batch_size", type=int, default=512, help="Batch size of 32-step imagination rollouts.")
+parser.add_argument("--wm_updates", type=int, default=16, help="World model gradient updates per iteration.")
+parser.add_argument("--policy_updates", type=int, default=8, help="Policy BPTT updates per iteration.")
+parser.add_argument("--wm_batch_size", type=int, default=2048, help="Minibatch size for world-model updates.")
+parser.add_argument("--policy_batch_size", type=int, default=2048, help="Batch size of 32-step imagination rollouts.")
 parser.add_argument("--replay_capacity", type=int, default=256, help="Ring replay buffer steps per environment.")
-parser.add_argument("--wm_hidden", type=str, default="512,512,512", help="World model hidden widths.")
+parser.add_argument("--wm_hidden", type=str, default="1024,1024,1024", help="World model hidden widths.")
 parser.add_argument("--policy_hidden", type=str, default="512,256,128", help="Policy hidden widths.")
 parser.add_argument("--wm_lr", type=float, default=1e-3, help="World model learning rate.")
 parser.add_argument("--policy_lr", type=float, default=3e-4, help="Policy BPTT learning rate.")
@@ -133,6 +133,12 @@ parser.add_argument(
 )
 parser.add_argument("--save_interval", type=int, default=500, help="Checkpoint save interval (iterations).")
 parser.add_argument("--no_ref_residual", action="store_true", default=False, help="Disable reference joint residual bias.")
+parser.add_argument(
+    "--legs_residual",
+    action="store_true",
+    default=False,
+    help="Apply reference joint residual bias to leg joints too (default: False for free leg balance).",
+)
 parser.add_argument("--no_verify_obs", action="store_true", default=False, help="Skip startup obs alignment assertion.")
 parser.add_argument(
     "--obs_verify_atol",
@@ -249,6 +255,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
         policy_lr=args_cli.policy_lr,
         critic_lr=args_cli.critic_lr,
         use_ref_residual=not args_cli.no_ref_residual,
+        legs_use_residual=args_cli.legs_residual,
         bc_init_coef=args_cli.bc_coef,
         bc_anneal_iters=bc_anneal_iters,
         save_interval=args_cli.save_interval,

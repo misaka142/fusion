@@ -14,7 +14,7 @@
    - **SuperMimic 算法包（非官方自研重构实现）**：**SuperMimic 原论文官方代码尚未开源**。本项目中的核心算法目录 `source/sugar_rl/sugar_rl/supermimic/` 是依据 SuperMimic 论文原理（可微世界模型 + 多步想象展开 BPTT + 集成 Critic 价值引导）结合全身人-物交互（HOI）场景自行编写的**非官方融合实现**。
    - **MuJoCo Sim-to-Sim 模块（本地零依赖部署实现）**：`scripts/sim2sim/` 是为脱离重型 Isaac Sim 依赖、在本地电脑直接验证与交互而构建的跨物理引擎部署工具。
 2. **当前验证状态**：
-   - **已在本地实际运行验证通过的部分**：`tests/test_supermimic_fusion.py`（10 项纯 PyTorch GPU/CPU 核心数学、运动学、观测对齐、32 步 BPTT 梯度与断点续训单元测试）与 `tests/test_mujoco_sim2sim.py`（5 项全 6 任务 MuJoCo 场景编译、双格式权重加载、`1e-7` 级观测同构对齐、500Hz 隐式 PD 站立稳定与闭环录屏端到端测试）。
+   - **已在本地实际运行验证通过的部分**：`tests/test_supermimic_fusion.py`（14 项纯 PyTorch GPU/CPU 核心数学、运动学、观测对齐、32 步 BPTT 梯度、防抖残差掩码、前沿采样、起升平滑与断点续训单元测试）与 `tests/test_mujoco_sim2sim.py`（6 项全 6 任务 MuJoCo 场景编译、双格式权重加载、`1e-7` 级观测同构对齐、500Hz 隐式 PD 站立稳定、闭环录屏及 `OmniCarryBox` 质心/防滑移校验端到端测试）。
    - **需在云端 GPU 实际跑通验证的部分**：完整的 5001 轮 Isaac Sim 5.1.0 长周期强化学习训练与 1001 轮扩散生成器训练需通过 `SuperMimic_SUGAR_Repro.ipynb` 在 Google Colab GPU 上执行验证；在拿到云端完整训练收敛的权重前，不宣称某组超参已完成最终任务指标收敛。
 
 ---
@@ -80,7 +80,7 @@ flowchart TD
 | **CoM** | Center of Mass（质心） | 一根连杆重量的中心点。注意：连杆的**关节转轴原点**通常和它的**质心**不重合！所以当连杆转动时，质心线速度等于原点速度加上旋转甩动的速度：$v_{\text{com}} = v_{\text{origin}} + \omega \times r_{\text{com}}$。 | [urdf_kinematics.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/urdf_kinematics.py#L629-L668) 专门做了原点与质心速度的双向转换，确保与 IsaacLab 2.x 严丝合缝。 |
 | **Quaternion (`wxyz`)** | 四元数 | 用 4 个数字 $(w, x, y, z)$（满足 $w^2+x^2+y^2+z^2=1$）表示三维旋转，不会像欧拉角（俯仰/横滚/偏航）那样在 90 度卡死（万向节死锁）。**极其注意顺序**：有的库是 `xyzw`，而 IsaacLab、MuJoCo 和本项目统一严格使用 **`wxyz`**（实部 $w$ 在第 0 位，无旋转是 `[1, 0, 0, 0]`）！ | [rotations.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/rotations.py) 所有函数均严格遵循 `wxyz` 规范，且自动把 $w<0$ 翻转到正半球保证连续性（因为 $q$ 和 $-q$ 代表同一个三维旋转）。 |
 | **6D Rotation** | 6 维连续旋转表示 | 神经网络直接预测四元数容易不连续。把 $3\times 3$ 旋转矩阵取前两列拼成 6 个数喂给神经网络，数学上证明它是完全连续无奇异点的！ | **超级细节**：世界模型内部 `rot6d_col` 按列优先展平；而 SUGAR 官方观测 `sugar_rot6d_from_mat` 直接把 `(3,2)` 切片按行展平成 `[R00, R01, R10, R11, R20, R21]`，本项目精确区分了这两者！ |
-| **`SE(2)` 不变性** | 平面刚体变换不变性 | 机器人在房间东边面朝北搬箱子，和走到房间西边面朝东搬同一个箱子，它肌肉受力的物理规律是**一模一样**的！去掉世界绝对水平坐标 $(x, y)$ 和绝对水平朝向角（Yaw，绕垂直 Z 轴转角），只保留高度 $z$ 和相对于当前面朝方向（Heading Frame）的特征，就叫 `SE(2)` 不变性。 | [hoi_task.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/hoi_task.py#L328-L385) 的 `state_features()` 把 84 维世界状态转成 108 维 `SE(2)` 不变特征，让世界模型学一遍就通杀所有位置和朝向！ |
+| **`SE(2)` 不变性** | 平面刚体变换不变性 | 机器人在房间东边面朝北搬箱子，和走到房间西边面朝东搬同一个箱子，它肌肉受力的物理规律是**一模一样**的！去掉世界绝对水平坐标 $(x, y)$ 和绝对水平朝向角（Yaw，绕垂直 Z 轴转角），只保留高度 $z$ 和相对于当前面朝方向（Heading Frame）的特征，就叫 `SE(2)` 不变性。 | [hoi_task.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/hoi_task.py) 的 `state_features()` 把 84 维世界状态转成 123 维 `SE(2)` 防碰撞不变特征，让世界模型学一遍就通杀所有位置和朝向！ |
 | **PD 控制器** | Proportional-Derivative Controller（比例-微分控制器） | 机器人的“底层电子肌肉”。策略网络不直接输出力矩，而是输出期望关节角 $q_{\text{target}}$。底层控制器按公式 $\tau = K_p (q_{\text{target}} - q) - K_d \dot{q}$ 计算电机力矩。$K_p$（刚度）像弹簧拉力，$K_d$（阻尼）像液压缓冲器防止震荡。 | 策略每 0.02s（50Hz）给一次 $q_{\text{target}}$，底层物理引擎每 0.002s（500Hz）连算 **10 次（`decimation=10`）** 隐式 PD 力矩。 |
 | **BFS vs DFS 关节序** | 广度优先 vs 深度优先关节排列顺序 | 同样是 29 个关节，排成一排数组时顺序不同！IsaacLab 按**广度优先（BFS，一层层排：左髋俯仰、右髋俯仰、腰偏航……）**；而 Unitree 官方 SDK 和 MuJoCo 按**深度优先（DFS，一条腿排完再排另一条腿：左腿6个→右腿6个→腰3个→左臂7个→右臂7个）**。如果顺序搞混，左膝盖的指令就会发给右肩膀，机器人当场抽搐解体！ | [scene_builder.py](file:///D:/robot/rework/fusion/scripts/sim2sim/scene_builder.py#L39-L61) 与 [policy_runner.py](file:///D:/robot/rework/fusion/scripts/sim2sim/policy_runner.py#L388-L395) 建立了精确的名字双向映射表 `bfs_to_pol_idx`。 |
 
@@ -136,7 +136,7 @@ D:\robot\rework\fusion\
 │   │       ├── supermimic/               # ★ 本项目最核心的算法心脏（7个纯PyTorch可微文件）★
 │   │       │   ├── rotations.py          # 零角梯度安全的四元数、轴角、6D旋转与坐标系变换
 │   │       │   ├── urdf_kinematics.py    # 无MuJoCo依赖的G1 29自由度可微正向运动学与PD执行器参数
-│   │       │   ├── hoi_task.py           # 84维状态、108维SE(2)特征、890/510维观测构建、22项奖励与软终止
+│   │       │   ├── hoi_task.py           # 84维状态、123维SE(2)防碰撞特征、890/510维观测构建、22项奖励与软终止
 │   │       │   ├── networks.py           # JointWorldModel、自包含 SuperMimicPolicy、双头 SuperMimicCritic
 │   │       │   ├── replay.py             # GPU驻留环形缓冲区（分离 ep_id 与 valid_transitions 掩码）
 │   │       │   ├── env_bridge.py         # IsaacLab 桥接器（预缓存参考动作、拦截外力push、启动18项切片硬断言）
@@ -157,8 +157,8 @@ D:\robot\rework\fusion\
 │           └── wrapper/sugar_il_wrapper.py # GeneratorWrapper：供 Stage 6 和 Sim2Sim 调用的 50Hz<->10Hz 插值推理外壳
 │
 └── tests/                                # 【板块三：本地自动化回归测试套件】
-    ├── test_supermimic_fusion.py         # 10 项核心算法、运动学、观测切片、32步BPTT与断点续训测试
-    └── test_mujoco_sim2sim.py            # 5 项全 6 任务 MuJoCo Sim-to-Sim 场景编译、观测同构与闭环控制测试
+    ├── test_supermimic_fusion.py         # 14 项核心算法、运动学、观测切片、32步BPTT、v2去抖与断点续训测试
+    └── test_mujoco_sim2sim.py            # 6 项全 6 任务 MuJoCo Sim-to-Sim 场景编译、观测同构、闭环控制与数据集校验测试
 ```
 
 ---
@@ -286,11 +286,12 @@ D:\robot\rework\fusion\
 | `81:84` | 3 | `obj_ang_vel` | 交互物体世界角速度 |
 | **合计** | **84** | `SDIM = 71 + 13` | 完整描述任意时刻“人 + 物”的全部刚体动力学状态 |
 
-#### 表 2：108 维 `SE(2)` 航向不变世界模型输入特征 `state_features`
-把 84 维状态喂给世界模型前，`state_features()`（第 328-385 行）用骨盆水平朝向逆矩阵 $R_{\text{yaw}}^{-1}$ 消除了绝对水平坐标 $(x,y)$ 和绝对水平朝向角，变成 **108 维纯局部几何特征**：
+#### 表 2：123 维 `SE(2)` 航向不变世界模型输入特征 `state_features`
+把 84 维状态喂给世界模型前，`state_features()` 用骨盆水平朝向逆矩阵 $R_{\text{yaw}}^{-1}$ 消除了绝对水平坐标 $(x,y)$ 和绝对水平朝向角，变成 **123 维纯局部几何特征**：
 - **机器人自身特征（71 维）**：骨盆离地高度 `z_root(1)` + 去偏航后的骨盆 6D 倾角 `rot6d_root(6)` + 关节角 `q(29)` + 航向系线速度 `v_h(3)` + 航向系角速度 `w_h(3)` + 关节角速度 `qd(29)`。
 - **物体相对特征（16 维）**：物体相对骨盆水平投影点的航向系坐标 `obj_pos_h(3)`（注：第 3 维保留了物体离地绝对高度 $z_{\text{obj}}$，方便判断物体是否落地！）+ 物体与骨盆高度差 `obj_rel_z(1)` + 航向系物体 6D 朝向 `rot6d_obj(6)` + 航向系物体线速度 `obj_v_h(3)` + 角速度 `obj_w_h(3)`。
-- **人-物接触几何特征（21 维，点睛之笔！）**：通过 FK 算出机器人 **7 个潜在接触部位**（左右橡胶手、左右脚踝、左右髋、骨盆轮廓）在**物体自身局部坐标系**下的三维坐标 $R_{\text{obj}}^T (p_{\text{contact}} - p_{\text{obj}})$（$7 \times 3 = 21$ 维）！这让世界模型一眼就能看出“手掌是不是已经贴到箱子侧面了”！
+- **人-物接触几何特征（21 维）**：通过 FK 算出机器人 **7 个潜在接触部位**（左右橡胶手、左右脚踝、左右髋、骨盆轮廓）在**物体自身局部坐标系**下的三维坐标 $R_{\text{obj}}^T (p_{\text{contact}} - p_{\text{obj}})$（$7 \times 3 = 21$ 维），让世界模型一眼看出“手掌是不是已经贴到箱子侧面了”。
+- **躯干/前臂防碰撞几何特征（15 维，v2 新增）**：额外拼入 **`torso_link`、左右 `elbow_link` 与左右 `wrist_yaw_link` 共 5 个防碰撞连杆**在物体局部系下的三维坐标（$5 \times 3 = 15$ 维），防止策略俯身弯腰时胸部或肘腕擦撞箱体导致弹飞。
 
 #### 表 3：890 维特权观测 `PrivilegedCfg`（Stage 1 Refiner Actor & 全阶段 Critic / Teacher 共用）
 共 **18 个拼接项**（启动时 `SugarEnvBridge` 会逐项对比我们手写的解析观测与 IsaacLab 仿真器算出的观测，最大误差超过 `0.005` 直接报错停止，绝不允许静默错位！）：
@@ -325,14 +326,13 @@ D:\robot\rework\fusion\
 
 ### 4.4 [networks.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/networks.py) —— 三大神经网络的设计巧思
 1. **`JointWorldModel`（人-物联合世界模型）**：
-   - 输入维度：`108 (SE2状态特征) + 29 (原始动作) + 29 (当前PD位置误差 q_sp - q_cur) + 37 (环境物理参数 ξ) = 203 维`。把 **PD 位置误差** 直接喂给网络非常关键，因为关节当前受多大的弹簧拉力直接正比于 `q_sp - q_cur`！
-   - 主干：3 层 `512` 维 MLP（正交初始化 + `LayerNorm` + `SiLU` 激活函数，`SiLU` 二阶处处平滑可导，比 `ReLU` 更适合 BPTT）。
+   - 输入维度：`123 (SE2防碰撞特征) + 29 (原始动作) + 29 (当前PD位置误差 q_sp - q_cur) + 37 (环境物理参数 ξ) = 218 维`。把 **PD 位置误差** 直接喂给网络非常关键，因为关节当前受多大的弹簧拉力直接正比于 `q_sp - q_cur`！
+   - 主干与精度：3 层 `1024` 维 MLP（正交初始化 + `LayerNorm` + `SiLU` 激活函数，`SiLU` 二阶处处平滑可导，比 `ReLU` 更适合 BPTT；CUDA 下前向启用 `bfloat16` 混合精度加速），并内置 `delta_rms` 统计量将 82 维增量各维度标准化后再积分，平衡角速度（`~20 rad/s^2` 级）与位置增量（毫米级）的梯度尺度。
    - 双输出头：
-     - `delta_head`（初始化增益极小 `0.01`，保证训练初期预测增量接近 0，状态平稳不乱飞）：输出 **82 维**局部状态增量（机器人 70 维 + 物体 12 维，旋转增量用 3 维轴角表示，再通过 `apply_delta` 积分为单位四元数，天然满足四元数模长为 1 的流形约束！）。
+     - `delta_head`（初始化增益极小 `0.01`，保证训练初期预测增量接近 0，状态平稳不乱飞）：输出 **82 维**归一化局部状态增量，经 `delta_rms` 反归一化后得到机器人 70 维 + 物体 12 维物理增量（旋转增量用 3 维轴角表示，再通过 `apply_delta` 积分为单位四元数，天然满足四元数模长为 1 的流形约束！）。
      - `contact_head`：输出 **5 维**接触概率 Logits `[人-物主交互接触, 脚踢到物体, 左脚踩地, 右脚踩地, 非期望身体部位碰撞比例]`，在想象展开时替代真实的力传感器来计算接触奖励、脚底打滑惩罚和腾空时间奖励！
-2. **`SuperMimicPolicy`（自包含残差策略网络）**：
-   - **参考关节残差偏置（`use_ref_residual=True`，第 228-232 行）**：仔细观察表 3（890维）和表 4（510维）你会发现一个惊人的巧合——**无论是 Stage 1 还是 Stage 3，观测向量的前 29 维 `obs_raw[:, 0:29]` 永远都是当前时刻的目标参考关节角 $q_{\text{ref}}$！**
-     于是策略网络并不需要从零开始猜关节该摆什么角度，而是直接算出精确的前馈偏置 `ref_bias = (q_ref - q_default) / action_scale`，让 MLP 只负责预测抵消重力、惯性和接触力所需的**残差修正量 `residual`**（并用 `8.0 * tanh(residual / 8.0)` 平滑限幅）！这让策略在第 0 轮就能大致摆出参考动作的架势，收敛速度飞跃！
+2. **`SuperMimicPolicy`（上下肢残差掩码解耦 + 自包含策略网络）**：
+   - **参考关节残差偏置与 `residual_mask` 解耦（v2 关键抗抖机制）**：无论是 Stage 1 还是 Stage 3，观测向量的前 29 维 `obs_raw[:, 0:29]` 都是当前时刻的目标参考关节角 $q_{\text{ref}}$。v2 新增了 `build_residual_mask()` 固定掩码：将**双腿 12 个自由度掩码设为 `0.0`**（不硬套参考轨迹角度，改为相对 `default_joint_pos` 自由动态平衡以吸收上半身抱箱重心的冲击），将**腰+双臂 17 个自由度掩码设为 `1.0`**（继续保留精确前馈 `ref_bias = (q_ref - q_default) / action_scale` 抓握箱子）；MLP 预测的残差 `residual` 用 `8.0 * tanh(residual / 8.0)` 平滑限幅（并可通过 `forward_mean_and_residual()` 在 32 步 BPTT 中专门提取网络自身残差分量进行时间二阶差分平滑正则）。
    - **自包含部署（Self-Contained Checkpoint）**：观测均值方差归一化器 `obs_rms`、`default_joint_pos` 和 `action_scale` 全部通过 `register_buffer` 存在网络自己的 `state_dict` 里。推理时加载一个 `.pt` 文件，调 `policy.act_inference(obs)` 就能直接跑，不需要额外带任何归一化配置文件。
 3. **`SuperMimicCritic`（双头悲观集成价值网络）**：
    - 在基于世界模型的强化学习里，有一个著名的顽疾叫 **Model Exploitation（模型漏洞欺骗）**：策略在 32 步想象里可能会故意把状态推到一个没见过的奇怪区域（OOD），那里 Critic 瞎猜了一个极高的虚假分数，导致策略学崩。
@@ -373,31 +373,30 @@ D:\robot\rework\fusion\
    - 循环 `t = 0, 1, ..., 23`（每帧代表物理世界推进 `0.02s`，24 帧共采集 $24 \times 2048 = 49,152$ 条真实交互样本）：
      - **帧前拍照**：读取当前 84 维真实人-物状态 `s_pre`、上一步动作 `prev_act`、动作编号 `m_id`、当前帧号 `t_step`、双脚腾空时间 `feet_air`。
      - **在线统计更新**：拿当前 510 维 `obs_pol` 更新策略的均值方差 `obs_rms`；拿 890 维 `obs_crit` 更新 Critic 的 `obs_rms` 并算出当前状态估分 `v_pred`。
-     - **混合出招**：前 512 个环境出确定性动作 `act_det`，后 1536 个环境出带高斯噪声的探索动作 `act_stoch`。
+     - **混合出招**：前 25% 环境（`collect_det_frac = 0.25`）出确定性动作 `act_det`，后 75% 环境出带上下肢分组退火噪声（下肢初值 `0.12`、上肢初值 `0.30`，余弦退火至 `0.25x`）的探索动作 `act_stoch`。
      - **物理步进**：调 `bridge.step(action)`，IsaacLab 内部跑物理子步，返回真实奖励 `sim_rew`、重置标志 `dones`、自然完结标志 `timeouts`、被踹标志 `pushed`。
      - **帧后入库**：读取新状态 `s_post` 和力传感器测出的 5 维接触真值 `contacts`，标记 `valid_trans = ~(dones | pushed)`，整批写入 GPU 环形缓冲区 `HOIReplayBuffer`！凡是 `dones=True` 的环境，给它分配一个新的唯一回合号 `env_ep_ids`。
    - **24 帧采完后**：从 `t=23` 倒推回 `t=0` 跑一遍 GAE，算出这 49,152 个状态的目标价值 `returns_flat`。
 
-2. **【Phase 2：训练世界模型（8 次梯度更新）】`update_world_model()`**
-   - 每次从环形缓冲区随机抽取 $B=1024$ 段**中间绝无重置或外力推搡**的连续 $k=8$ 帧真实片段 `(s_init, actions[0..7], next_states[0..7], contacts[0..7], xi)`。
+2. **【Phase 2：训练世界模型（16 次梯度更新）】`update_world_model()`**
+   - 每次从环形缓冲区随机抽取 $B=2048$ 段**中间绝无重置或外力推搡**的连续 $k=8$ 帧真实片段 `(s_init, actions[0..7], next_states[0..7], contacts[0..7], xi)`，并用真实 `delta_true` 在线更新 `delta_rms` 统计量。
    - **自回归推演（Autoregressive Unroll）**：只在 `t=0` 用真实起点 `s_init`；算出预测状态 $\hat{s}_1$ 后，**下一步 `t=1` 必须拿自己刚才预测的 $\hat{s}_1$（而不是真值 $s_1$）接着往后算 $\hat{s}_2 \dots \hat{s}_8$**！这强迫世界模型学会抵抗多步累积误差！
-   - 计算航向局部系下的关节加权 Huber 状态损失（物体误差权重 $\times 1.5$）+ 5 维接触二元交叉熵（BCE），反向传播更新 `JointWorldModel`。
+   - 计算航向局部系下的关节加权 Huber 状态损失（速度损失系数 `vel_loss_scale=0.5`、物体误差权重 $\times 1.5$）+ 5 维接触二元交叉熵（BCE，权重 `0.5`），反向传播更新 `JointWorldModel`。
 
 3. **【Phase 3：训练双头 Critic（4 轮 × 4 个 Minibatch = 16 次更新）】`update_critic()`**
    - 把 Phase 1 攒下的 49,152 条 `(890维特权观测, 真实GAE目标回报)` 打乱切片，用 Smooth L1 损失同时训练 Critic 的 2 个独立价值头。注意：**Critic 全程只在真实物理仿真器的数据上训练**，因此它的价值判断完全不受世界模型误差污染！
 
-4. **【Phase 4：训练策略网络（4 次 32 步想象展开 BPTT）】`update_policy()`**
+4. **【Phase 4：训练策略网络（8 次确定性 32 步想象展开 BPTT）】`update_policy()`**
    - 先把 `JointWorldModel` 和 `SuperMimicCritic` 的参数梯度锁死（`_freeze_params(..., True)`，只让梯度流过它们，不改它们的权重）。
-   - 从环形缓冲区抽取 $B=512$ 个真实历史起点 `s_0`，并顺着 `ep_ids` 回溯拼好初始的 5 帧本体感知历史队列 `hist_cur`。
+   - 从环形缓冲区抽取 $B=2048$ 个真实历史起点 `s_0`（其中 `frontier_frac=0.40` 按高进度前沿优先加权抽样，攻克抱箱起身过渡期覆盖瓶颈），并顺着 `ep_ids` 回溯拼好初始的 5 帧本体感知历史队列 `hist_cur`。
    - **脑内逐帧推演 `tau = 0, 1, ..., 31`（共 0.64 秒未来时光）**：
      - **Step A**：对当前想象状态 `s_cur` 跑可微正向运动学 `run_fk(s_cur)`，拿到全身 14 个刚体和躯干锚点的坐标。
-     - **Step B**：取出 `t_cur = t_0 + tau` 的参考动作帧，拼出 510 维带均匀分布模拟噪声的 Tracker 观测 `obs_pol`，喂给 `SuperMimicPolicy` 采样出重参数化可微动作 `a_cur = mean + std * eps`。
-     - **Step C（师生蒸馏）**：用同一个想象状态 `s_cur` 拼出无噪的 890 维特权观测喂给冻结的 Stage 1 `teacher_policy`，算出 `step_bc = (a_mean - a_teacher)^2` 累加到蒸馏损失。
+     - **Step B**：取出 `t_cur = t_0 + tau` 的参考动作帧，拼出 510 维 Tracker 观测 `obs_pol`（Refiner 为 890 维特权观测），调用 `policy.forward_mean_and_residual(obs_pol)` 进行**确定性动作展开**（关闭逐帧白噪声重参数化，同时提取网络自身残差 `res_cur` 累加二阶时间差分平滑惩罚 `residual_rate_weight=0.02`）。
+     - **Step C（师生蒸馏）**：Stage 3 下用同一个想象状态 `s_cur` 拼出无噪的 890 维特权观测喂给冻结的 Stage 1 `teacher_policy`，算出 `step_bc = (a_mean - a_teacher)^2` 累加到蒸馏损失。
      - **Step D（世界模型跨步）**：调 `world_model.step(s_cur, a_cur, xi)`，预测出 0.02s 后的想象新状态 `s_next` 和接触概率 `c_logits`。
-     - **Step E（解析算分与存活率）**：对 `s_next` 跑 FK，对照 `ref_cur` 解析算出 22 项人-物交互奖励 `r_step` 和 Sigmoid 软终止概率 `p_term`，按折扣权重累加进 `imagined_return`，并把存活折扣更新为 `discount_weight *= 0.99 * (1 - p_term)`。
+     - **Step E（解析算分与存活率）**：对 `s_next` 跑 FK，对照 `ref_cur` 解析算出 22 项人-物交互奖励 `r_step`（想象步开启 `imagination_shaping=True` 轻量踝部抬脚与手掌贴近引导）和 Sigmoid 软终止概率 `p_term`，按折扣权重累加进 `imagined_return`，并把存活折扣更新为 `discount_weight *= 0.99 * (1 - p_term)`。
      - **Step F（可微滚动历史）**：把新状态的角速度、相对关节角、重力投影和刚执行的动作 `a_cur` 塞进 5 帧历史队列右侧、挤掉最老的一帧（`advance_tracker_history`），经过 `0.98` 雅可比衰减后进入 `tau + 1`！
-   - **32 步走完（尾部自举）**：用第 32 步的状态拼出 890 维观测喂给冻结的双头 Critic，取悲观最小值并截断到 `[-25, 15]`，乘上剩余存活权重加进总回报：`imagined_return += discount_weight * v_tail`。
-   - **一锤定音反向传播**：最大化想象总回报 + 最小化退火 BC 损失 + 保持探索熵，调 `policy_loss.backward()`！梯度顺着 32 步时间链条一路穿过 FK、世界模型和滚动历史，精准更新 `SuperMimicPolicy`！
+   - **32 步走完（尾部自举与渐变更新）**：用第 32 步的状态拼出 890 维观测喂给冻结的双头 Critic，取悲观最小值并截断到 `[-25, 15]`，乘上剩余存活权重加进总回报：`imagined_return += discount_weight * v_tail`；策略网络梯度结合 `clip_grad_value_(0.10)` 与 `clip_grad_norm_(0.5)` 后执行余弦退火优化器更新。
 
 ---
 
@@ -442,21 +441,21 @@ sequenceDiagram
 
 > **环境安全说明**：以下命令直接调用本机已配好的 `DRL_env` Python 解释器只读运行测试，**不会修改或覆盖任何现有包版本**。请依次串行运行下方两个测试（避免在笔记本 4GB 显存 GPU 上并行抢占 CUDA 显存）。
 
-#### （1）运行 10 项 SuperMimic × SUGAR 核心算法与断点续训回归测试
+#### （1）运行 14 项 SuperMimic × SUGAR 核心算法与断点续训回归测试
 ```powershell
 & "D:\anaconda\envs\DRL_env\python.exe" "D:\robot\rework\fusion\tests\test_supermimic_fusion.py"
 ```
-- **命令作用**：在不依赖 Isaac Sim 的前提下，使用本地 GPU（或 CPU）测试四元数零角安全梯度、URDF/MJCF 正向运动学与质心速度递推、890 维特权观测 18 项切片对齐断言、6 大任务奖励与软终止、世界模型 `SE(2)` 不变性、环形缓冲区 `done/push` 隔离、32 步人-物耦合 BPTT 梯度传导以及 Colab 中断自动续训逻辑。
+- **命令作用**：在不依赖 Isaac Sim 的前提下，使用本地 GPU（或 CPU）测试四元数零角安全梯度、URDF/MJCF 正向运动学与质心速度递推、890 维特权观测 18 项切片对齐断言、6 大任务奖励与软终止、123 维世界模型 `SE(2)` 不变性、`delta_rms` 归一化、下肢残差掩码解耦、环形缓冲区 `done/push` 隔离与前沿采样、32 步人-物耦合 BPTT 梯度传导、起升平滑拉伸以及 Colab 中断自动续训逻辑。
 - **关键参数含义**：直接运行测试脚本，内部自动检测 `cuda` 并构造临时测试目录，运行完毕自动清理。
-- **预期结果**：依次打印 `[PASS] Test 1` 至 `[PASS] Test 10`，末尾输出 `ALL 10 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!`。
+- **预期结果**：依次打印 `[PASS] Test 1` 至 `[PASS] Test 14`，末尾输出 `ALL 14 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!`。
 
-#### （2）运行 5 项本地 MuJoCo Sim-to-Sim 跨引擎端到端验证测试
+#### （2）运行 6 项本地 MuJoCo Sim-to-Sim 跨引擎端到端验证测试
 ```powershell
 & "D:\anaconda\envs\DRL_env\python.exe" "D:\robot\rework\fusion\tests\test_mujoco_sim2sim.py"
 ```
-- **命令作用**：验证全部 6 个任务的 MuJoCo XML 场景编译、SuperMimic 与官方 `demo_ckpts` 双格式权重加载、`MuJoCoSim2SimRunner` 与 `SugarHOITask` 的 510 维观测同构精度、500Hz 隐式 PD 站立稳定性以及 `autonomous` 闭环 MP4 视频导出。
-- **关键参数含义**：无需外部数据集或真实训练权重，脚本内置闭环踝关节平衡合成策略完成端到端检验。
-- **预期结果**：依次通过 `[Test 1]` 至 `[Test 5]`，末尾输出 `ALL 5 MUJOCO SIM-TO-SIM END-TO-END TESTS PASSED SUCCESSFULLY!`。
+- **命令作用**：验证全部 6 个任务的 MuJoCo XML 场景编译、SuperMimic 与官方 `demo_ckpts` 双格式权重加载、`MuJoCoSim2SimRunner` 与 `SugarHOITask` 的 510 维观测同构精度、500Hz 隐式 PD 站立稳定性、`autonomous` 闭环 MP4 视频导出以及本地 `data/OmniCarryBox` 轨迹的 MuJoCo 质心/防滑移校验。
+- **关键参数含义**：无需真实训练权重即可完成前 5 项测试；第 6 项自动对 `data/OmniCarryBox` 样本执行 MuJoCo 物理质量检验。
+- **预期结果**：依次通过 `[Test 1]` 至 `[Test 6]`，末尾输出 `ALL 6 MUJOCO SIM-TO-SIM END-TO-END TESTS PASSED SUCCESSFULLY!`。
 
 #### （3）拿到云端训练权重后，在本地 Windows 启动 3D 交互式 Sim-to-Sim
 ```powershell
@@ -517,9 +516,9 @@ bash train_fusion.sh CarryBox colab_verify 301 512 256 101
 > **技术栈**：PyTorch, Isaac Lab (PhysX), MuJoCo, Model-Based RL (BPTT), Diffusion Policy (DDIM / Transformer)
 > **项目简介**：针对 Unitree G1（29-DoF）全身人-物交互（搬箱、推箱、捡/扶水瓶、坐椅等 6 类任务）中无模型 PPO 样本效率低、接触梯度缺失的问题，在 SUGAR 解耦式三级框架基础上重构实现可微联合世界模型训练器，并打通零依赖本地 MuJoCo Sim-to-Sim 多频闭环验证管线。
 > **核心工作**：
-> 1. **人-物耦合可微世界模型与正向运动学构建**：手写纯 PyTorch 向量化 29-DoF 树状正向运动学（FK）与零角泰勒安全四元数算子；设计包含 7 接触点物体局部坐标与 37 维物理域随机化上下文的 108 维 `SE(2)` 航向不变特征，通过 8 步自回归残差状态积分与辅助接触头联合建模人-物接触动力学。
-> 2. **双阶段 32 步想象展开 BPTT 与动态退火师生蒸馏**：使用冻结世界模型下的 32 步解析奖励 BPTT、5 项 Sigmoid 平滑软终止、0.98 状态雅可比衰减及双头悲观截断 Critic 尾部自举替换原版 Stage 1 PPO；在 Stage 2（510 维盲观测 + 5 帧可微滚动历史）中融合世界模型策略梯度与冻结 Refiner 教师的动态退火行为克隆蒸馏，兼容 10Hz Transformer 扩散指令生成器。
-> 3. **工程可靠性与 MuJoCo 跨引擎 Sim-to-Sim 对齐**：实现 GPU 驻留环形回放缓冲（解耦回合 ID 与推搡/重置连续掩码）及启动时 890 维特权观测 18 项切片级对齐硬断言；构建 10Hz 规划 + 50Hz 跟踪 + 500Hz 隐式 PD 的本地 MuJoCo 部署器，解决 BFS↔SDK 关节双射、转子惯量与局部系观测同构（对齐误差 `< 1e-6`）问题，通过 15 项自动化单元与集成测试验证。
+> 1. **人-物耦合可微世界模型与正向运动学构建**：手写纯 PyTorch 向量化 29-DoF 树状正向运动学（FK）与零角泰勒安全四元数算子；设计包含 7 接触点与 5 个躯干/前臂防碰撞连杆物体局部坐标（共 36 维）及 37 维物理域随机化上下文的 123 维 `SE(2)` 航向不变特征（配合 `delta_rms` 输出标准化），通过 8 步自回归残差状态积分与辅助接触头联合建模人-物接触动力学。
+> 2. **双阶段确定性 32 步想象展开 BPTT 与动态退火师生蒸馏**：使用冻结世界模型下的确定性 32 步解析奖励 BPTT、上下肢 `residual_mask` 解耦控制、5 项 Sigmoid 平滑软终止、0.98 状态雅可比衰减及双头悲观截断 Critic 尾部自举替换原版 Stage 1 PPO；在 Stage 2（510 维盲观测 + 5 帧可微滚动历史）中融合世界模型策略梯度与冻结 Refiner 教师的动态退火行为克隆蒸馏，兼容 10Hz Transformer 扩散指令生成器。
+> 3. **工程可靠性与 MuJoCo 跨引擎 Sim-to-Sim 对齐**：实现 GPU 驻留环形回放缓冲（解耦回合 ID 与推搡/重置连续掩码，并支持 `frontier_frac` 前沿优先级采样）及启动时 890 维特权观测 18 项切片级对齐硬断言；构建 10Hz 规划 + 50Hz 跟踪 + 500Hz 隐式 PD 的本地 MuJoCo 部署器，解决 BFS↔SDK 关节双射、转子惯量与局部系观测同构（对齐误差 `< 1e-6`）问题，通过 20 项（14+6）自动化单元与集成测试验证。
 
 ---
 
@@ -540,10 +539,10 @@ bash train_fusion.sh CarryBox colab_verify 301 512 256 101
   4. **Sigmoid 软终止截断**：把 5 个硬死亡阈值变成平滑存活概率连乘，一旦想象状态偏离合理范围，后续奖励权重平滑归零，阻止策略在崩坏轨迹上继续优化；
   5. **双头悲观 Critic + 价值截断**：Critic 只在真实仿真器 GAE 回报上训练（零模型偏差），且想象尾部自举取两个头的最小值 `min(V1, V2)` 并硬截断在 `[-25, 15]`，防止 OOD 区域虚假高分误导策略。
 
-#### Q3：为什么世界模型的输入不做成简单的 84 维世界坐标，非要转成 108 维 `SE(2)` 特征？而且为什么预测增量是 82 维而不是 84 维？
+#### Q3：为什么世界模型的输入不做成简单的 84 维世界坐标，非要转成 123 维 `SE(2)` 特征？而且为什么预测增量是 82 维而不是 84 维？
 - **考察点**：几何先验与流形约束（对应 `hoi_task.py`）。
 - **满分回答**：
-  第一，物理规律具有水平平移和绕重力轴旋转对称性（`SE(2)` 不变性）。如果直接喂世界坐标 $(x, y)$ 和绝对 Yaw 角，机器人在 `(0,0)` 朝北学会了搬箱子，走到 `(3,2)` 朝西世界模型就不认识了。用骨盆水平朝向逆矩阵 $R_{\text{yaw}}^{-1}$ 投影后，无论机器人在哪、朝哪，相同的局部动作输入完全相同。同时我们额外拼入了由 FK 算出的 **7 个接触部位在物体局部坐标系下的 21 维坐标**，显式提供了接触几何距离先验。
+  第一，物理规律具有水平平移和绕重力轴旋转对称性（`SE(2)` 不变性）。如果直接喂世界坐标 $(x, y)$ 和绝对 Yaw 角，机器人在 `(0,0)` 朝北学会了搬箱子，走到 `(3,2)` 朝西世界模型就不认识了。用骨盆水平朝向逆矩阵 $R_{\text{yaw}}^{-1}$ 投影后，无论机器人在哪、朝哪，相同的局部动作输入完全相同。同时我们额外拼入了由 FK 算出的 **7 个接触部位在物体局部坐标系下的 21 维坐标**，再加上 **`torso_link`、左右 `elbow_link` 与左右 `wrist_yaw_link` 共 5 个防碰撞连杆的 15 维坐标**，显式提供了接触距离与身体防碰先验（`71 + 16 + 21 + 15 = 123` 维）。
   第二，84 维状态里有两个单位四元数（骨盆 4 维 + 物体 4 维），四元数有模长为 1 的约束，自由度其实只有 3。如果直接让线性层加减 4 维向量会破坏正交性；所以我们预测 **3 维局部轴角增量**（机器人少 1 维 + 物体少 1 维 → `84 - 2 = 82` 维），再通过指数映射 `axis_angle_to_quat` 右乘原四元数积分，天然落在 $SO(3)$ 旋转群流形上。
 
 #### Q4：世界模型里没有物理引擎的碰撞检测器，那 32 步想象里的接触奖励、脚底打滑惩罚和腾空时间奖励是怎么算出来的？
@@ -610,4 +609,4 @@ bash train_fusion.sh CarryBox colab_verify 301 512 256 101
 1. **第一遍（建立全局感，约 30 分钟）**：对照本文 **第 0 章 ~ 第 3 章**，打开 [train_fusion.sh](file:///D:/robot/rework/fusion/train_fusion.sh)，顺着脚本的 5 个 `echo` 阶段看命令行参数是怎么把前一个阶段的输出目录喂给下一个阶段的输入目录的。
 2. **第二遍（动手跑通本地测试，约 30 分钟）**：在 Windows PowerShell 运行第 6.1 节的两个测试脚本 `test_supermimic_fusion.py` 和 `test_mujoco_sim2sim.py`。打开这两个测试文件，看每一个 `test_*` 函数造了什么假数据、断言了什么性质——**读单元测试是理解复杂算法代码最快、最直观的捷径**！
 3. **第三遍（逐行啃透核心四件套，约 2 小时）**：按顺序精读：
-   `urdf_kinematics.py` → `hoi_task.py` → `networks.py` → `trainer.py` → `scripts/sim2sim/policy_runner.py`。每读完一个文件，合上代码自己口述一遍第 7.2 节对应的面试题，当你能不看文档讲出“84维状态、108维SE(2)特征、890维vs510维观测、32步BPTT软终止、BFS与SDK关节置换”时，这个项目就已经真正长在你自己的脑子里了！
+   `urdf_kinematics.py` → `hoi_task.py` → `networks.py` → `trainer.py` → `scripts/sim2sim/policy_runner.py`。每读完一个文件，合上代码自己口述一遍第 7.2 节对应的面试题，当你能不看文档讲出“84维状态、123维SE(2)防碰撞特征、890维vs510维观测、32步确定性BPTT软终止、BFS与SDK关节置换”时，这个项目就已经真正长在你自己的脑子里了！
