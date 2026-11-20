@@ -146,7 +146,13 @@ parser.add_argument(
     default=5e-3,
     help="Max allowed per-dimension absolute difference in startup 890-D privileged obs check.",
 )
-parser.add_argument("--compile", action="store_true", default=False, help="Enable torch.compile on networks.")
+parser.add_argument("--compile", action="store_true", default=False, help="Enable whole-step torch.compile fusion.")
+parser.add_argument(
+    "--compile_mode",
+    type=str,
+    default="default",
+    help="torch.compile inductor mode ('default' is safe with IsaacLab; 'reduce-overhead' enables CUDA Graphs).",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -260,6 +266,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
         bc_anneal_iters=bc_anneal_iters,
         save_interval=args_cli.save_interval,
         compile_models=args_cli.compile,
+        compile_mode=args_cli.compile_mode,
     )
 
     bridge = SugarEnvBridge(

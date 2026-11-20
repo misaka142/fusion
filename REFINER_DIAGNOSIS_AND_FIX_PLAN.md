@@ -33,6 +33,8 @@
    - `feet_air_time` 调为 `threshold=0.25, weight=1.5`，`feet_slide` 增强为 `-0.5`；`prev_feet_gnd` 执行 `.detach()` 切断贴地免罚梯度作弊；在想象 `update_policy` 阶段启用 `imagination_shaping=True` 强化脚踝抬高与双腕抓取局部位置引导。
 5. **破除第 276 步断墙与提升吞吐（[replay.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/replay.py), [commands.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/tasks/locomanip/mdp/commands.py), [train.py](file:///D:/robot/rework/fusion/scripts/supermimic/train.py)）**：
    - `HOIReplayBuffer.sample_imagination_starts` 新增 `frontier_frac=0.40` 前沿优先采样；`pool_warmup_steps` 缩至 `200*24`、`update_interval` 缩至 `24*20`；默认超参升级为 `wm_updates=16, wm_batch_size=2048, policy_updates=8, policy_batch_size=2048`。
+6. **纯等价算子融合与整步零断点加速（`v2-speed-opt` 分支，[rotations.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/rotations.py), [urdf_kinematics.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/urdf_kinematics.py), [env_bridge.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/env_bridge.py), [trainer.py](file:///D:/robot/rework/fusion/source/sugar_rl/sugar_rl/supermimic/trainer.py)）**：
+   - 保持所有模型尺寸与 `sm_v2_diplo_lafan` 权重格式 100% 不变：在 `hoi_task` 与 `FastTreeKinematics` 内部用 `mat_mul`/`mat_t_vec` 广播乘加与 `rotmat_error_magnitude` 直接基于 3×3 旋转矩阵计算观测与奖励（`with_quat=False` 跳过 13/14 刚体 `rotmat_to_quat`）、在 `MotionReferenceAdapter` 中预缓存 `o2b_pos_ref`/`o2b_rotmat_ref`/`anc_pg_z_ref` 并支持整窗一次性 `get_imagination_slice`、缓存 `HOIReplayBuffer` 窗口索引、`AdamW` 在 CUDA 上启用 `fused=True`；同时在 `SuperMimicTrainer` 抽离 0 Graph-Break 的 `_img_step_core` 与 `_wm_window_loss_core`，支持在 Colab Linux 下通过 `--compile --compile_mode default` 开启全步 Triton 算子融合。
 
 ---
 

@@ -1639,6 +1639,149 @@ def test_14_v2_antichatter_delta_rms_leg_mask_and_smooth_lift() -> None:
     print(f"[PASS] Test 14: v2 anti-chatter (123-D WM, delta_rms, leg-free mask, frontier={front_mean:.1f}>{uni_mean:.1f}, acc {acc_before:.1f}->{acc_after:.1f}m/s^2)")
 
 
+def test_15_v2_speed_opt_parity_and_graph_break_free() -> None:
+    import copy
+    from sugar_rl.supermimic.hoi_task import RefFrame
+
+    torch.manual_seed(15)
+    fk = FastTreeKinematics(device=DEVICE)
+    task = SugarHOITask(fk, "CarryBox")
+    mock_m = _MockMotionData(fk, device=DEVICE)
+    ref_adapter = MotionReferenceAdapter(mock_m)
+
+    # 1. Verify fast matrix FK (`with_quat=False`) + precomputed `o2b` / `anc_pg_z` match full quat path (< 1e-5)
+    B = 8
+    m_ids = torch.arange(B, device=DEVICE) % mock_m.num_motion
+    t_steps = torch.full((B,), 10, dtype=torch.long, device=DEVICE)
+    ref_cached = ref_adapter.get_frame(m_ids, t_steps)
+    ref_uncached = RefFrame(
+        joint_pos=ref_cached.joint_pos,
+        joint_vel=ref_cached.joint_vel,
+        body_pos_w=ref_cached.body_pos_w,
+        body_quat_w=ref_cached.body_quat_w,
+        body_lin_vel_w=ref_cached.body_lin_vel_w,
+        body_ang_vel_w=ref_cached.body_ang_vel_w,
+        obj_pos_w=ref_cached.obj_pos_w,
+        obj_quat_w=ref_cached.obj_quat_w,
+        obj_lin_vel_w=ref_cached.obj_lin_vel_w,
+        obj_ang_vel_w=ref_cached.obj_ang_vel_w,
+        contact_label=ref_cached.contact_label,
+    )
+    ref_fut = ref_adapter.get_future_window(m_ids, t_steps)
+    s_t = SugarHOITask.pack_state(
+        root_pos=ref_cached.body_pos_w[:, 0] + 0.02 * torch.randn(B, 3, device=DEVICE),
+        root_quat=ref_cached.body_quat_w[:, 0],
+        q=ref_cached.joint_pos + 0.05 * torch.randn(B, 29, device=DEVICE),
+        root_lin_vel=ref_cached.body_lin_vel_w[:, 0],
+        root_ang_vel=ref_cached.body_ang_vel_w[:, 0],
+        qd=ref_cached.joint_vel,
+        obj_pos=ref_cached.obj_pos_w + 0.01 * torch.randn(B, 3, device=DEVICE),
+        obj_quat=ref_cached.obj_quat_w,
+        obj_lin_vel=ref_cached.obj_lin_vel_w,
+        obj_ang_vel=ref_cached.obj_ang_vel_w,
+    )
+    prev_a = torch.randn(B, 29, device=DEVICE) * 0.1
+    xi = torch.zeros(B, XI_DIM, device=DEVICE)
+    xi[:, :5] = 1.0
+
+    fk_fast = task.run_fk(s_t, with_quat=False)
+    fk_full = task.run_fk(s_t, with_quat=True)
+    assert fk_fast.tracked_quat_w is None and fk_full.tracked_quat_w is not None
+    assert (fk_fast.anchor_quat_w - fk_full.anchor_quat_w).abs().max().item() < 1e-6
+
+    obs_priv_fast = task.build_privileged_obs(s_t, prev_a, ref_fut, fk_res=fk_fast, xi=xi)
+    obs_priv_full = task.build_privileged_obs(s_t, prev_a, ref_fut, fk_res=fk_full, xi=xi)
+    assert (obs_priv_fast - obs_priv_full).abs().max().item() < 1e-5
+
+    hist = task.init_tracker_history_from_states(
+        s_t.unsqueeze(1).expand(B, 5, SDIM), prev_a.unsqueeze(1).expand(B, 5, 29), xi=xi
+    )
+    cmd36 = ref_cached.tracker_command_36()
+    obs_trk_fast = task.build_tracker_obs(s_t, cmd36, hist, fk_res=fk_fast, add_noise=False)
+    obs_trk_full = task.build_tracker_obs(s_t, cmd36, hist, fk_res=fk_full, add_noise=False)
+    assert (obs_trk_fast - obs_trk_full).abs().max().item() < 1e-5
+
+    rew_c, term_c, _ = task.compute_reward_and_termination(
+        s_t, s_t, prev_a, prev_a, ref_cur=ref_cached, fk_next=fk_fast, xi=xi, imagination_shaping=True
+    )
+    rew_u, term_u, _ = task.compute_reward_and_termination(
+        s_t, s_t, prev_a, prev_a, ref_cur=ref_uncached, fk_next=fk_full, xi=xi, imagination_shaping=True
+    )
+    assert (rew_c - rew_u).abs().max().item() < 1e-5 and (term_c - term_u).abs().max().item() < 1e-5
+
+    # 2. Verify whole-step `aot_eager` compile parity (return & parameter gradients) + zero Dynamo graph breaks
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir)
+        b_eager = _SyntheticSugarBridge(stage="refiner", num_envs=8, device=DEVICE)
+        b_comp = _SyntheticSugarBridge(stage="refiner", num_envs=8, device=DEVICE)
+        cfg_e = SuperMimicTrainCfg(
+            steps_per_env=6, replay_capacity=24, wm_seq_len=4, wm_updates_per_iter=2,
+            wm_batch_size=8, wm_warmup_iters=0, imagination_horizon=6,
+            policy_updates_per_iter=1, policy_batch_size=8, frontier_sample_frac=0.0,
+            enable_tensorboard=False, compile_models=False,
+        )
+        cfg_c = copy.deepcopy(cfg_e)
+        cfg_c.compile_models = True
+        cfg_c.compile_backend = "aot_eager"
+
+        t_eager = SuperMimicTrainer(b_eager, tmp / "eager", cfg_e)
+        t_comp = SuperMimicTrainer(b_comp, tmp / "comp", cfg_c)
+        t_comp._raw_policy.load_state_dict(t_eager._raw_policy.state_dict())
+        t_comp._raw_world_model.load_state_dict(t_eager._raw_world_model.state_dict())
+        t_comp._raw_critic.load_state_dict(t_eager._raw_critic.state_dict())
+
+        torch.manual_seed(99)
+        t_eager.collect_rollout()
+        torch.manual_seed(99)
+        t_comp.collect_rollout()
+
+        # Also verify ReplayBuffer WM valid-pairs cache hits cleanly & invalidates on add()
+        _ = t_eager.replay.sample_wm_sequences(8, seq_len=4)
+        assert t_eager.replay._wm_cache_valid and t_eager.replay._cached_valid_pairs is not None
+
+        # Compare identical policy update metrics & resulting parameter delta cosine > 0.9999
+        p0 = torch.cat([p.detach().reshape(-1) for p in t_eager._raw_policy.parameters()])
+        torch.manual_seed(1234)
+        m_e = t_eager.update_policy(iteration=1)
+        torch.manual_seed(1234)
+        m_c = t_comp.update_policy(iteration=1)
+        ret_diff = abs(m_e["policy/imagined_return"] - m_c["policy/imagined_return"])
+        assert ret_diff < 1e-4, f"Compiled vs Eager return mismatch: {ret_diff}"
+
+        dp_e = torch.cat([p.detach().reshape(-1) for p in t_eager._raw_policy.parameters()]) - p0
+        dp_c = torch.cat([p.detach().reshape(-1) for p in t_comp._raw_policy.parameters()]) - p0
+        step_cos = nn.functional.cosine_similarity(dp_e, dp_c, dim=0).item()
+        # With CUDA bfloat16 autocast active in MLPs, AOTAutograd op ordering differs by ~5e-4; >0.998 confirms tight parity
+        assert step_cos > 0.998, f"Compiled vs Eager policy step cosine {step_cos} < 0.998"
+
+        # Verify 0 Dynamo graph breaks in `_wm_window_loss_core` & `_img_step_core`
+        wm_b = t_eager.replay.sample_wm_sequences(8, seq_len=4)
+        exp_wm = torch._dynamo.explain(t_eager._wm_window_loss_core)(
+            wm_b.s_init, wm_b.actions, wm_b.next_states, wm_b.contacts, wm_b.xi
+        )
+        assert exp_wm.graph_break_count == 0, f"WM Dynamo breaks: {exp_wm.break_reasons}"
+
+        st = t_eager.replay.sample_imagination_starts(8, need_history=False)
+        sl = b_eager.motion_ref.get_imagination_slice(st.motion_ids, st.time_steps, 4, need_ref_cur=True)
+        fk0 = t_eager.task.run_fk(st.states, with_quat=False)
+        exp_step = torch._dynamo.explain(t_eager._img_step_core)(
+            st.states, st.prev_actions,
+            fk0.tracked_pos_w, fk0.tracked_rotmat_w, fk0.tracked_lin_vel_w, fk0.tracked_ang_vel_w,
+            fk0.contact_pos_w, fk0.contact_lin_vel_w, fk0.anchor_quat_w, fk0.root_rotmat_w,
+            torch.zeros_like(st.prev_actions), t_eager._one_scalar, st.feet_air_time,
+            torch.zeros_like(st.feet_air_time), st.time_steps, st.xi,
+            sl.fut_joint_pos[:, 0], sl.fut_joint_vel[:, 0], sl.body_pos_w[:, 0], sl.body_quat_w[:, 0],
+            sl.body_rotmat_w[:, 0], sl.body_lin_vel_w[:, 0], sl.body_ang_vel_w[:, 0],
+            sl.fut_obj_pos_w[:, 0], sl.fut_obj_quat_w[:, 0], sl.fut_obj_lin_vel_w[:, 0], sl.fut_obj_ang_vel_w[:, 0],
+            sl.contact_label[:, 0], sl.o2b_pos_ref[:, 0], sl.o2b_rotmat_ref[:, 0], sl.anc_pg_z_ref[:, 0],
+            sl.fut_joint_pos[:, :8], sl.fut_joint_vel[:, :8], sl.fut_anchor_pos_w[:, :8], sl.fut_anchor_quat_w[:, :8],
+            sl.fut_obj_pos_w[:, :8], sl.fut_obj_quat_w[:, :8], sl.fut_obj_lin_vel_w[:, :8], sl.fut_obj_ang_vel_w[:, :8],
+        )
+        assert exp_step.graph_break_count == 0, f"img_step Dynamo breaks: {exp_step.break_reasons}"
+
+    print(f"[PASS] Test 15: v2-speed-opt parity & compile (ret_diff={ret_diff:.2e}, step_cos={step_cos:.6f}, 0 graph breaks)")
+
+
 if __name__ == "__main__":
     print(f"Running SuperMimic x SUGAR test suite on device: {DEVICE} (PyTorch {torch.__version__})")
     test_1_rotations_and_zero_angle_gradients()
@@ -1655,4 +1798,5 @@ if __name__ == "__main__":
     test_12_omniretarget_clean_usda_and_bridge_sync()
     test_13_lafan_walk_stitcher_continuity_and_clearance()
     test_14_v2_antichatter_delta_rms_leg_mask_and_smooth_lift()
-    print("\nALL 14 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")
+    test_15_v2_speed_opt_parity_and_graph_break_free()
+    print("\nALL 15 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!")

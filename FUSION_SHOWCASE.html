@@ -117,7 +117,7 @@
       <div class="subbox" style="margin-top:14px;font-size:12.5px;">
         <strong>源码与验证边界声明（面试必知）：</strong>
         全身交互任务环境（<code>sugar_rl/tasks</code>）与高层扩散生成器（<code>sugar_il</code>）来自 <strong>SUGAR 官方开源仓库</strong>；
-        因 SuperMimic 官方代码尚未开源，<code>sugar_rl/supermimic</code> 为依据论文算法原理自行重构的<strong>非官方融合实现</strong>。本地已完成 20 项（14 项核心单元与回归测试 + 6 项 MuJoCo 跨引擎测试）自动化验证，完整 5001 轮长训练需在 Google Colab GPU 上执行验证。
+        因 SuperMimic 官方代码尚未开源，<code>sugar_rl/supermimic</code> 为依据论文算法原理自行重构的<strong>非官方融合实现</strong>。本地已完成 21 项（15 项核心单元与回归测试 + 6 项 MuJoCo 跨引擎测试）自动化验证，完整 5001 轮长训练需在 Google Colab GPU 上执行验证。
       </div>
 
       <nav class="btn-group" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);" id="main-tabs">
@@ -475,7 +475,7 @@
       { title: '① 核心创新包 supermimic/', sub: 'source/sugar_rl/sugar_rl/supermimic/', files: ['rotations.py：零角安全梯度四元数与行优先 6D 旋转', 'urdf_kinematics.py：纯 PyTorch 29-DoF 可微正向运动学与质心速度递推', 'hoi_task.py：84维状态、123维SE(2)防碰撞特征、890/510维观测、22项奖励+5项软终止', 'networks.py + replay.py + env_bridge.py + trainer.py：世界模型（含delta_rms）、残差掩码Actor、双头Critic与确定性32步BPTT训练主循环'] },
       { title: '② 仿真环境层 tasks/', sub: 'source/sugar_rl/sugar_rl/tasks/', files: ['mdp/commands.py：参考轨迹加载、自适应初始状态池 init_pool、Rollout 采集与 Generator 调用', 'robots/g129dof/：6 个任务在 Refiner / Tracker / Inference 三种模式下的环境配置'] },
       { title: '③ 扩散大脑包 sugar_il/', sub: 'source/sugar_il/sugar_il/', files: ['generator_state_encoder.py：物体(9D)+指令(36D)+目标(9D)编码为 256D Token', 'generator.py：匈牙利最优传输噪声匹配训练 12层 Transformer + DDIM 16步去噪', 'sugar_il_wrapper.py：10Hz 8步路点 → 50Hz 36帧线性插值外壳'] },
-      { title: '④ 本地跨引擎 scripts/sim2sim/', sub: 'scripts/sim2sim/ & tests/', files: ['scene_builder.py：动态生成全6任务对齐的 MuJoCo XML（CAD惯量、转子armature、橡胶手碰撞）', 'policy_runner.py：10Hz+50Hz+500Hz多频闭环控制 + 鼠标实时拖拽绿色目标点', 'tests/：14项核心单元测试 + 6项 MuJoCo Sim2Sim 端到端测试'] }
+      { title: '④ 本地跨引擎 scripts/sim2sim/', sub: 'scripts/sim2sim/ & tests/', files: ['scene_builder.py：动态生成全6任务对齐的 MuJoCo XML（CAD惯量、转子armature、橡胶手碰撞）', 'policy_runner.py：10Hz+50Hz+500Hz多频闭环控制 + 鼠标实时拖拽绿色目标点', 'tests/：15项核心单元测试 + 6项 MuJoCo Sim2Sim 端到端测试'] }
     ];
     let curRepoIdx = 0;
     function renderRepoSection() {

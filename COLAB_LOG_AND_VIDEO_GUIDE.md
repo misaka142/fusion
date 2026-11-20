@@ -308,7 +308,7 @@ cd /content/fusion || exit 1
 # ==================== 换模型生成视频时，修改以下配置区 ====================
 TASK_NAME="CarryBox"          # 1. 任务名: CarryBox | PushBox | KickBox | PickBottle | StandBottle | SitChair
 STAGE_MODE="refiner"          # 2. 阶段模式: refiner (Stage 1) | tracker (Stage 3) | inference (Stage 6 闭环)
-CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v2_diplo_lafan_full/logs/refiner/model_latest.pt"  # 3. 策略 .pt 权重路径（也可指定 model_200.pt / model_400.pt / model_1400.pt）
+CKPT_PATH="/content/fusion/outputs/CarryBox_sm_v2_diplo_lafan_full/logs/refiner/model_400.pt"  # 3. 策略 .pt 权重路径（也可指定 model_200.pt / model_400.pt / model_1400.pt）
 GEN_CKPT=""                   # 4. 扩散生成器 .ckpt 路径（仅 STAGE_MODE="inference" 必填，其余保持 ""）
 MOTION_DIR="data/OmniCarryBox" # 5. 参考轨迹目录（OmniRetarget 推荐用 data/OmniCarryBox；tracker 模式也可指向 .../rl_dataset）
 

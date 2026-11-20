@@ -3,7 +3,7 @@
 > **[重要源码来源与未开源缺失声明]**
 > 1. **SuperMimic 官方源码缺失声明**：**SuperMimic 原论文官方代码尚未开源（官方源码缺失）**。本工程中的 `sugar_rl.supermimic` 包（依据论文方法结合参考目录设计重构）属于**非官方融合实现，并非原论文作者发布的官方源码**。
 > 2. **SUGAR 官方源码基础**：本工程的全身人-物交互仿真任务（`sugar_rl/tasks`）、URDF/MJCF 资产与高层扩散策略生成器（`sugar_il`）来自已核实的 **SUGAR** 官方开源代码。
-> 3. **验证边界声明**：本融合工程已通过本地 PyTorch CUDA 14 项核心单元测试与 6 项 MuJoCo Sim-to-Sim 端到端测试；完整 Isaac Sim 5.1.0 长周期强化学习训练需按工作流在 **Google Colab GPU** 中完成验证，未在云端实际跑通收敛前不宣称已完成长周期任务收敛。
+> 3. **验证边界声明**：本融合工程已通过本地 PyTorch CUDA 15 项核心单元测试与 6 项 MuJoCo Sim-to-Sim 端到端测试；完整 Isaac Sim 5.1.0 长周期强化学习训练需按工作流在 **Google Colab GPU** 中完成验证，未在云端实际跑通收敛前不宣称已完成长周期任务收敛。
 
 本项目将 **SuperMimic**（基于可微学习世界模型的 32 步想象展开策略梯度 BPTT + 双头悲观 Critic 引导）移植至 **SUGAR**（*Synthesize Whole-Body Loco-Manipulation via Decoupled Tracking and Generation*）全身人-物交互框架中，**同时替换原版 SUGAR 中的 Stage 1 `Refiner`（原 RSL-RL PPO）与 Stage 2 `Tracker`（原 RSL-RL BCPPO）**，并与原版 Rollout 数据转换管线及 Stage 3 扩散策略 `Generator`（`sugar_il`）保持 **100% 接口与数据格式兼容**。
 
@@ -15,9 +15,9 @@
 
 ```text
 [本地 Windows PowerShell]
-   编写/调试代码、生成平滑参考轨迹 data/OmniCarryBox、运行 14+6 项本地单元测试与 Sim2Sim 校验
+   编写/调试代码、生成平滑参考轨迹 data/OmniCarryBox、运行 15+6 项本地单元测试与 Sim2Sim 校验
    │
-   ▼  git push origin v1-lafan-omni
+   ▼  git push origin v2-speed-opt
 [GitHub 远程仓库]
    │
    ▼  在 Google Colab 打开 SuperMimic_SUGAR_Repro.ipynb
@@ -44,6 +44,7 @@
 - **上下肢残差掩码解耦 + 确定性 BPTT 去抖**：`SuperMimicPolicy` 的 `residual_mask` 将双腿 12 关节设为 `0.0`（相对 `default_joint_pos` 自由动态平衡）、腰+臂 17 关节设为 `1.0`（保留 `q_ref` 前馈残差）；32 步 BPTT 内部采用确定性动作展开 + 纯网络残差平滑正则 + `clip_grad_value_(0.10)`，真实采样端使用上下肢分组退火探索噪声与余弦学习率衰减。
 - **前沿边界采样与 DiPLO 起升平滑降速**：`HOIReplayBuffer` 支持 `frontier_frac=0.40` 前沿优先采样（突破抱箱前死亡进度壁垒）；`convert_diplo_to_sugar.py` 通过 `stretch_pickup_window` 对抱箱起升段做 `1.65x` `C1` 平滑时间拉伸并通过 MuJoCo 双足零滑移/防碰撞门禁，降低软 PD 刚度下的直立过冲惯性力。
 - **物理随机化严格保持原版**：`BaseEventCfg` 与 `carry_box_*_env_cfg.py` 中的摩擦系数、物体质量与 `push_robot` / `push_object` 扰动严格沿用原版 SUGAR 配置。
+- **整步零断点编译与矩阵化算子加速（`v2-speed-opt`）**：将 32 步想象推演单步 `_img_step_core` 与世界模型多步损失 `_wm_window_loss_core` 抽离为 0 Graph-Break 纯张量路径（支持 `--compile --compile_mode default` 整步 Triton 融合）；旋转与 `FastTreeKinematics` 改用广播乘加直接输出并消费旋转矩阵、预缓存 `MotionReferenceAdapter` 静态 `o2b` 与重投影重力 Z、启用 `AdamW(fused=True)` 并缓存 `HOIReplayBuffer` 窗口索引，**权重维度与 `v1-lafan-omni` 的 `sm_v2_diplo_lafan` 完全互通**。
 
 ### 2.2 核心模块目录结构
 
@@ -56,7 +57,7 @@ fusion/
 ├── train_fusion.sh                        # Linux/Colab Bash 5 阶段串联训练脚本
 ├── inference_fusion.sh                    # Stage 6 闭环推理录屏脚本
 ├── tests/
-│   ├── test_supermimic_fusion.py          # 14 项纯 PyTorch GPU/CPU 核心与回归测试套件
+│   ├── test_supermimic_fusion.py          # 15 项纯 PyTorch GPU/CPU 核心与回归测试套件
 │   └── test_mujoco_sim2sim.py             # 6 项全任务 MuJoCo Sim-to-Sim 端到端测试套件
 ├── scripts/
 │   ├── supermimic/
@@ -80,14 +81,14 @@ fusion/
 
 ### 3.1 本地单元测试与数据集准备（Windows 本地 PowerShell）
 
-#### （1）运行 14 项 SuperMimic 核心算法回归测试（无需 Isaac Sim）
+#### （1）运行 15 项 SuperMimic 核心算法回归测试（无需 Isaac Sim）
 
 ```powershell
 & "D:\anaconda\envs\DRL_env\python.exe" "D:\robot\rework\fusion\tests\test_supermimic_fusion.py"
 ```
-- **作用**：在本地 GPU/CPU 上验证四元数零角梯度、11 层深度向量化 URDF FK 与 `scale_grad` 等价性、890/510 维观测与奖励、123 维 `SE(2)` 不变性、`compute_state_delta`/`delta_rms` 往返一致、上下肢残差掩码、前沿边界采样、`OmniCarryBox` 凸包校验与起升平滑拉伸等全部 14 项测试。
+- **作用**：在本地 GPU/CPU 上验证四元数零角梯度、11 层深度向量化 URDF FK 与 `scale_grad` 等价性、890/510 维观测与奖励、123 维 `SE(2)` 不变性、`compute_state_delta`/`delta_rms` 往返一致、上下肢残差掩码、前沿边界采样、`OmniCarryBox` 凸包校验、起升平滑拉伸，以及矩阵化 FK/整步编译等价性与零 Dynamo Graph Break。
 - **参数含义**：直接执行测试入口脚本（自动优先选择 `cuda`）。
-- **预期结果**：依次打印 `[PASS] Test 1` 至 `[PASS] Test 14`，末尾输出 `ALL 14 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!`。
+- **预期结果**：依次打印 `[PASS] Test 1` 至 `[PASS] Test 15`，末尾输出 `ALL 15 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!`。
 
 #### （2）运行 6 项 MuJoCo Sim-to-Sim 端到端测试
 
@@ -126,6 +127,8 @@ cd /content/fusion
     --log_dir outputs/CarryBox_sm_v2_diplo_lafan_full/logs/refiner \
     --max_iterations 5001 \
     --motion_folder data/OmniCarryBox \
+    --compile \
+    --compile_mode default \
     --auto_resume \
     --headless
 ```

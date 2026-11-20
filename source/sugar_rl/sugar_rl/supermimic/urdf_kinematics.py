@@ -27,6 +27,8 @@ from torch import Tensor
 
 from .rotations import (
     axis_unit_angle_to_rotmat,
+    mat_mul,
+    mat_vec,
     quat_from_euler_xyz,
     quat_normalize,
     quat_to_rotmat,
@@ -377,20 +379,21 @@ def parse_mjcf_tree(xml_path: str | Path) -> list[tuple]:
 class FKResult:
     """World-frame poses and velocities of tracked bodies and contact links."""
 
-    tracked_pos_w: Tensor       # (B, 14, 3)
-    tracked_rotmat_w: Tensor    # (B, 14, 3, 3)
-    tracked_quat_w: Tensor      # (B, 14, 4)
-    tracked_lin_vel_w: Tensor   # (B, 14, 3)
-    tracked_ang_vel_w: Tensor   # (B, 14, 3)
+    tracked_pos_w: Tensor             # (B, 14, 3)
+    tracked_rotmat_w: Tensor          # (B, 14, 3, 3)
+    tracked_quat_w: Tensor | None     # (B, 14, 4) or None when `with_quat=False`
+    tracked_lin_vel_w: Tensor         # (B, 14, 3)
+    tracked_ang_vel_w: Tensor         # (B, 14, 3)
 
-    contact_pos_w: Tensor       # (B, 7, 3)  in SUGAR_CONTACT_BODY_NAMES order
-    contact_lin_vel_w: Tensor   # (B, 7, 3)
+    contact_pos_w: Tensor             # (B, 7, 3)  in SUGAR_CONTACT_BODY_NAMES order
+    contact_lin_vel_w: Tensor         # (B, 7, 3)
 
-    anchor_pos_w: Tensor        # (B, 3)     torso_link world pos
-    anchor_quat_w: Tensor       # (B, 4)     torso_link world quat
-    anchor_rotmat_w: Tensor     # (B, 3, 3)  torso_link world rotmat
-    anchor_lin_vel_w: Tensor    # (B, 3)
-    anchor_ang_vel_w: Tensor    # (B, 3)
+    anchor_pos_w: Tensor              # (B, 3)     torso_link world pos
+    anchor_quat_w: Tensor             # (B, 4)     torso_link world quat
+    anchor_rotmat_w: Tensor           # (B, 3, 3)  torso_link world rotmat
+    anchor_lin_vel_w: Tensor          # (B, 3)
+    anchor_ang_vel_w: Tensor          # (B, 3)
+    root_rotmat_w: Tensor | None = None  # (B, 3, 3) pelvis world rotmat (reused to skip redundant quat_to_rotmat)
 
     def scale_grad(self, alpha: float, anchor_idx: int = 7) -> "FKResult":
         """Same values, gradients scaled by `alpha`, preserving `anchor_*` slice strides on `tracked_*`."""
@@ -399,11 +402,25 @@ class FKResult:
         b = 1.0 - alpha
         t_pos = self.tracked_pos_w * alpha + self.tracked_pos_w.detach() * b
         t_mat = self.tracked_rotmat_w * alpha + self.tracked_rotmat_w.detach() * b
-        t_quat = self.tracked_quat_w * alpha + self.tracked_quat_w.detach() * b
+        t_quat = (
+            self.tracked_quat_w * alpha + self.tracked_quat_w.detach() * b
+            if self.tracked_quat_w is not None
+            else None
+        )
         t_v = self.tracked_lin_vel_w * alpha + self.tracked_lin_vel_w.detach() * b
         t_w = self.tracked_ang_vel_w * alpha + self.tracked_ang_vel_w.detach() * b
         c_pos = self.contact_pos_w * alpha + self.contact_pos_w.detach() * b
         c_v = self.contact_lin_vel_w * alpha + self.contact_lin_vel_w.detach() * b
+        a_quat = (
+            t_quat[:, anchor_idx]
+            if t_quat is not None
+            else self.anchor_quat_w * alpha + self.anchor_quat_w.detach() * b
+        )
+        r_mat = (
+            self.root_rotmat_w * alpha + self.root_rotmat_w.detach() * b
+            if self.root_rotmat_w is not None
+            else None
+        )
         return FKResult(
             tracked_pos_w=t_pos,
             tracked_rotmat_w=t_mat,
@@ -413,10 +430,11 @@ class FKResult:
             contact_pos_w=c_pos,
             contact_lin_vel_w=c_v,
             anchor_pos_w=t_pos[:, anchor_idx],
-            anchor_quat_w=t_quat[:, anchor_idx],
+            anchor_quat_w=a_quat,
             anchor_rotmat_w=t_mat[:, anchor_idx],
             anchor_lin_vel_w=t_v[:, anchor_idx],
             anchor_ang_vel_w=t_w[:, anchor_idx],
+            root_rotmat_w=r_mat,
         )
 
 
@@ -668,6 +686,7 @@ class FastTreeKinematics(nn.Module):
         root_ang_vel_w: Tensor | None = None,
         qd_env: Tensor | None = None,
         ang_vel_in_world: bool = True,
+        with_quat: bool = True,
     ) -> FKResult:
         """Compute differentiable world-frame poses and velocities for all tracked & contact bodies.
 
@@ -680,6 +699,8 @@ class FastTreeKinematics(nn.Module):
                 else in pelvis local frame (defaults to zeros).
             qd_env: (B, 29) joint velocities in `self.env_joint_names` order (defaults to zeros).
             ang_vel_in_world: True for IsaacLab states (`root_ang_vel_w`), False if local body frame.
+            with_quat: Compute full 14-body `tracked_quat_w`; set False inside compiled BPTT
+                to skip 13 unnecessary `rotmat_to_quat` branches (only `anchor_quat_w` is computed).
         """
         B = root_pos_w.shape[0]
         if root_lin_vel_w is None:
@@ -690,7 +711,7 @@ class FastTreeKinematics(nn.Module):
             qd_env = torch.zeros_like(q_env)
 
         R_root = quat_to_rotmat(root_quat_w)
-        w_root = root_ang_vel_w if ang_vel_in_world else torch.einsum("bij,bj->bi", R_root, root_ang_vel_w)
+        w_root = root_ang_vel_w if ang_vel_in_world else mat_vec(R_root, root_ang_vel_w)
 
         # Vectorized joint rotation matrices for all 29 active joints + 1 fixed-joint identity sentinel slot
         q_active = q_env[:, self.active_env_joint_idx]     # (B, 29)
@@ -700,7 +721,7 @@ class FastTreeKinematics(nn.Module):
         qd_slots = F.pad(qd_active, (0, 1))                                            # (B, 30), last slot = 0
 
         # Depth 0: pelvis root, converting COM velocity (`root_lin_vel_w` in IsaacLab 2.x) to link-origin velocity
-        root_com_w = torch.einsum("bij,j->bi", R_root, self.link_com_pos_b[0])
+        root_com_w = mat_vec(R_root, self.link_com_pos_b[0].unsqueeze(0))
         v0 = root_lin_vel_w - torch.cross(w_root, root_com_w, dim=-1)
 
         pos_prev = root_pos_w.unsqueeze(1)   # (B, 1, 3)
@@ -725,11 +746,11 @@ class FastTreeKinematics(nn.Module):
             v_p = v_prev[:, p_loc]           # (B, K, 3)
             w_p = w_prev[:, p_loc]           # (B, K, 3)
 
-            offset_w = torch.matmul(R_p, r_pos_d.unsqueeze(-1)).squeeze(-1)   # (B, K, 3)
+            offset_w = mat_vec(R_p, r_pos_d.unsqueeze(0))          # (B, K, 3)
             pos_d = pos_p + offset_w
-            R_base = torch.matmul(R_p, r_rot_d)                               # (B, K, 3, 3)
-            R_d = torch.matmul(R_base, R_slots[:, slot_d])                    # (B, K, 3, 3)
-            axis_w = torch.matmul(R_base, axis_d.unsqueeze(-1)).squeeze(-1)   # (B, K, 3)
+            R_base = mat_mul(R_p, r_rot_d.unsqueeze(0))            # (B, K, 3, 3)
+            R_d = mat_mul(R_base, R_slots[:, slot_d])              # (B, K, 3, 3)
+            axis_w = mat_vec(R_base, axis_d.unsqueeze(0))          # (B, K, 3)
             w_d = w_p + qd_slots[:, slot_d].unsqueeze(-1) * axis_w
             v_d = v_p + torch.cross(w_p, offset_w, dim=-1)
 
@@ -747,13 +768,12 @@ class FastTreeKinematics(nn.Module):
 
         # Convert link-origin linear velocities back to per-link COM velocities matching `robot.data.body_lin_vel_w`
         com_bfs = self.link_com_pos_b[self._bfs_order]
-        bfs_com_w = torch.matmul(bfs_mat, com_bfs.unsqueeze(-1)).squeeze(-1)
+        bfs_com_w = mat_vec(bfs_mat, com_bfs.unsqueeze(0))
         bfs_v = bfs_v_orig + torch.cross(bfs_w, bfs_com_w, dim=-1)
 
         t_idx = self._tracked_bfs_indices
         tracked_pos = bfs_pos[:, t_idx]
         tracked_mat = bfs_mat[:, t_idx]
-        tracked_quat = rotmat_to_quat(tracked_mat)
         tracked_v = bfs_v[:, t_idx]
         tracked_w = bfs_w[:, t_idx]
 
@@ -762,6 +782,13 @@ class FastTreeKinematics(nn.Module):
         contact_v = bfs_v[:, c_idx]
 
         a_idx = self.anchor_tracked_idx
+        if with_quat:
+            tracked_quat: Tensor | None = rotmat_to_quat(tracked_mat)
+            anchor_quat = tracked_quat[:, a_idx]
+        else:
+            tracked_quat = None
+            anchor_quat = rotmat_to_quat(tracked_mat[:, a_idx])
+
         return FKResult(
             tracked_pos_w=tracked_pos,
             tracked_rotmat_w=tracked_mat,
@@ -771,10 +798,11 @@ class FastTreeKinematics(nn.Module):
             contact_pos_w=contact_pos,
             contact_lin_vel_w=contact_v,
             anchor_pos_w=tracked_pos[:, a_idx],
-            anchor_quat_w=tracked_quat[:, a_idx],
+            anchor_quat_w=anchor_quat,
             anchor_rotmat_w=tracked_mat[:, a_idx],
             anchor_lin_vel_w=tracked_v[:, a_idx],
             anchor_ang_vel_w=tracked_w[:, a_idx],
+            root_rotmat_w=R_root,
         )
 
     @torch.no_grad()

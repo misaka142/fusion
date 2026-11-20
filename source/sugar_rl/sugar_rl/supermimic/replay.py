@@ -82,6 +82,12 @@ class HOIReplayBuffer:
 
         self.ptr: int = 0
         self.size: int = 0
+        self._wm_cache_valid: bool = False
+        self._cached_wm_seq_len: int = -1
+        self._cached_wm_size: int = -1
+        self._cached_wm_ptr: int = -1
+        self._cached_eff_k: int = 0
+        self._cached_valid_pairs: Tensor | None = None
 
     def set_env_xi(self, xi: Tensor) -> None:
         self.env_xi.copy_(xi.to(self.device))
@@ -123,6 +129,7 @@ class HOIReplayBuffer:
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+        self._wm_cache_valid = False
 
     def _chronological_indices(self) -> Tensor:
         """Return time indices ordered from oldest to newest of length `self.size`."""
@@ -141,28 +148,46 @@ class HOIReplayBuffer:
             return None
 
         chrono = self._chronological_indices()                  # (S,)
-        ep_chrono = self.ep_ids[chrono]                         # (S, N)
-        vt_chrono = self.valid_transitions[chrono]              # (S, N)
+        cache_hit = (
+            self._wm_cache_valid
+            and self._cached_wm_seq_len == seq_len
+            and self._cached_wm_size == self.size
+            and self._cached_wm_ptr == self.ptr
+            and self._cached_valid_pairs is not None
+        )
+        if cache_hit:
+            valid_pairs = self._cached_valid_pairs
+            eff_k = self._cached_eff_k
+        else:
+            ep_chrono = self.ep_ids[chrono]                     # (S, N)
+            vt_chrono = self.valid_transitions[chrono]          # (S, N)
 
-        max_k = min(seq_len, self.size)
-        valid_pairs: Tensor | None = None
-        eff_k = max_k
+            max_k = min(seq_len, self.size)
+            valid_pairs: Tensor | None = None
+            eff_k = max_k
 
-        for cand_k in range(max_k, 0, -1):
-            num_starts = self.size - cand_k + 1
-            ep_first = ep_chrono[:num_starts]
-            valid = (ep_first >= 0) & vt_chrono[:num_starts]
-            for offset in range(1, cand_k):
-                valid = (
-                    valid
-                    & vt_chrono[offset : offset + num_starts]
-                    & (ep_chrono[offset : offset + num_starts] == ep_first)
-                )
-            pairs = valid.nonzero(as_tuple=False)
-            if pairs.shape[0] > 0:
-                valid_pairs = pairs
-                eff_k = cand_k
-                break
+            for cand_k in range(max_k, 0, -1):
+                num_starts = self.size - cand_k + 1
+                ep_first = ep_chrono[:num_starts]
+                valid = (ep_first >= 0) & vt_chrono[:num_starts]
+                for offset in range(1, cand_k):
+                    valid = (
+                        valid
+                        & vt_chrono[offset : offset + num_starts]
+                        & (ep_chrono[offset : offset + num_starts] == ep_first)
+                    )
+                pairs = valid.nonzero(as_tuple=False)
+                if pairs.shape[0] > 0:
+                    valid_pairs = pairs
+                    eff_k = cand_k
+                    break
+
+            self._wm_cache_valid = True
+            self._cached_wm_seq_len = seq_len
+            self._cached_wm_size = self.size
+            self._cached_wm_ptr = self.ptr
+            self._cached_eff_k = eff_k
+            self._cached_valid_pairs = valid_pairs
 
         if valid_pairs is None or valid_pairs.shape[0] == 0:
             return None

@@ -66,6 +66,8 @@ run_isaac_stage "${OUT_DIR}/logs/refiner/model_${LAST_ITER}.pt" \
     --log_dir "${OUT_DIR}/logs/refiner" \
     --max_iterations "${RL_ITERS}" \
     --motion_folder "${MOTION_DIR}" \
+    --compile \
+    --compile_mode default \
     --auto_resume \
     --headless
 
@@ -100,6 +102,8 @@ run_isaac_stage "${OUT_DIR}/logs/tracker/model_${LAST_ITER}.pt" \
     --teacher_motion_folder "${MOTION_DIR}" \
     --log_dir "${OUT_DIR}/logs/tracker" \
     --max_iterations "${RL_ITERS}" \
+    --compile \
+    --compile_mode default \
     --auto_resume \
     --headless
 

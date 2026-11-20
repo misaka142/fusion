@@ -10,6 +10,31 @@ import torch
 from torch import Tensor
 
 
+def mat_mul(A: Tensor, B: Tensor) -> Tensor:
+    """Broadcast 3x3 matrix product `A @ B` (compiler-friendly; avoids batched small-`bmm` launches)."""
+    return (A.unsqueeze(-1) * B.unsqueeze(-3)).sum(-2)
+
+
+def mat_t_mul(A: Tensor, B: Tensor) -> Tensor:
+    """Broadcast 3x3 transpose matrix product `A^T @ B`."""
+    return (A.unsqueeze(-1) * B.unsqueeze(-2)).sum(-3)
+
+
+def mat_mul_t(A: Tensor, B: Tensor) -> Tensor:
+    """Broadcast 3x3 matrix-transpose product `A @ B^T`."""
+    return (A.unsqueeze(-2) * B.unsqueeze(-3)).sum(-1)
+
+
+def mat_vec(R: Tensor, v: Tensor) -> Tensor:
+    """Broadcast 3x3 matrix-vector product `R @ v`."""
+    return (R * v.unsqueeze(-2)).sum(-1)
+
+
+def mat_t_vec(R: Tensor, v: Tensor) -> Tensor:
+    """Broadcast 3x3 transpose matrix-vector product `R^T @ v`."""
+    return (R * v.unsqueeze(-1)).sum(-2)
+
+
 def quat_normalize(q: Tensor, eps: float = 1e-12) -> Tensor:
     """Normalize quaternion in wxyz format."""
     return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
@@ -236,6 +261,17 @@ def quat_error_magnitude(q1: Tensor, q2: Tensor) -> Tensor:
     w_abs = dq[..., 0].abs().clamp_max(1.0)
     xyz_norm = torch.sqrt((dq[..., 1:] * dq[..., 1:]).sum(dim=-1) + 1e-12)
     return 2.0 * torch.atan2(xyz_norm, w_abs)
+
+
+def rotmat_error_magnitude(R1: Tensor, R2: Tensor) -> Tensor:
+    """Differentiable geodesic angle error in radians [0, pi] directly from 3x3 rotation matrices."""
+    dR = mat_t_mul(R2, R1)
+    sx = dR[..., 2, 1] - dR[..., 1, 2]
+    sy = dR[..., 0, 2] - dR[..., 2, 0]
+    sz = dR[..., 1, 0] - dR[..., 0, 1]
+    skew_norm = torch.sqrt(sx * sx + sy * sy + sz * sz + 1e-12)
+    tr_m1 = dR[..., 0, 0] + dR[..., 1, 1] + dR[..., 2, 2] - 1.0
+    return torch.atan2(skew_norm, tr_m1)
 
 
 def yaw_from_quat(q: Tensor) -> Tensor:

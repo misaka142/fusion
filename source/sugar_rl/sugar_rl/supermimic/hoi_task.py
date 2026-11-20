@@ -21,17 +21,21 @@ from .rotations import (
     axis_angle_to_quat,
     heading_inv_rotmat,
     heading_rotmat,
-    quat_apply,
+    mat_mul,
+    mat_t_mul,
+    mat_t_vec,
+    mat_vec,
     quat_apply_inverse,
     quat_conj,
-    quat_error_magnitude,
     quat_mul,
     quat_normalize,
     quat_to_axis_angle,
     quat_to_rotmat,
     rot6d_col,
+    rotmat_error_magnitude,
     subtract_frame_transforms,
     sugar_anchor_vel_rotmat,
+    sugar_rot6d_from_mat,
     sugar_rot6d_from_quat,
     yaw_quat,
 )
@@ -184,6 +188,10 @@ class RefFrame:
     obj_lin_vel_w: Tensor     # (B, 3)
     obj_ang_vel_w: Tensor     # (B, 3)
     contact_label: Tensor     # (B,) or (B, 1) float in {0.0, 1.0}
+    body_rotmat_w: Tensor | None = None    # (B, 14, 3, 3) optional precomputed rotation matrices
+    o2b_pos_ref: Tensor | None = None      # (B, 14, 3) optional precomputed obj pos in each tracked body frame
+    o2b_rotmat_ref: Tensor | None = None   # (B, 14, 3, 3) optional precomputed R_body^T @ R_obj
+    anc_pg_z_ref: Tensor | None = None     # (B,) optional precomputed projected gravity Z in ref anchor frame
 
     def tracker_command_36(self) -> Tensor:
         """Build 36-D single-frame Tracker reference command `[q_ref(29), v_b(3), w_b(3), contact(1)]`."""
@@ -310,9 +318,18 @@ class SugarHOITask:
             obj_ang_vel,
         )
 
-    def run_fk(self, s_flat: Tensor) -> FKResult:
+    def run_fk(self, s_flat: Tensor, with_quat: bool = True) -> FKResult:
         root_pos, root_quat, q, root_v, root_w, qd, _, _, _, _ = self.unpack_state(s_flat)
-        return self.fk(root_pos, root_quat, q, root_v, root_w, qd, ang_vel_in_world=True)
+        return self.fk(
+            root_pos,
+            root_quat,
+            q,
+            root_v,
+            root_w,
+            qd,
+            ang_vel_in_world=True,
+            with_quat=with_quat,
+        )
 
     def effective_default_joint_pos(self, xi: Tensor | None = None) -> Tensor:
         """Return nominal default joint positions plus optional per-env calibration offset `xi[..., 5:34]`."""
@@ -332,7 +349,7 @@ class SugarHOITask:
     def state_features(self, s_flat: Tensor, fk_res: FKResult | None = None) -> Tensor:
         """Extract 123-D SE(2)-invariant robot-object-contact-anticollision feature vector for `JointWorldModel`."""
         if fk_res is None:
-            fk_res = self.run_fk(s_flat)
+            fk_res = self.run_fk(s_flat, with_quat=False)
         (
             root_pos,
             root_quat,
@@ -347,30 +364,28 @@ class SugarHOITask:
         ) = self.unpack_state(s_flat)
 
         R_h_inv = heading_inv_rotmat(root_quat)         # (B, 3, 3)
-        R_root = quat_to_rotmat(root_quat)              # (B, 3, 3)
+        R_root = fk_res.root_rotmat_w if fk_res.root_rotmat_w is not None else quat_to_rotmat(root_quat)
         R_obj = quat_to_rotmat(obj_quat)                # (B, 3, 3)
 
         # Robot features (71-D)
         z_root = root_pos[:, 2:3]
-        rot6d_root = rot6d_col(torch.bmm(R_h_inv, R_root))
-        v_h = torch.einsum("bij,bj->bi", R_h_inv, root_v)
-        w_h = torch.einsum("bij,bj->bi", R_h_inv, root_w)
+        rot6d_root = rot6d_col(mat_mul(R_h_inv, R_root))
+        v_h = mat_vec(R_h_inv, root_v)
+        w_h = mat_vec(R_h_inv, root_w)
 
         # Object features in robot heading frame + ground height (16-D)
         root_xy0 = torch.cat([root_pos[:, :2], torch.zeros_like(z_root)], dim=-1)
-        obj_pos_h = torch.einsum("bij,bj->bi", R_h_inv, obj_pos - root_xy0)
+        obj_pos_h = mat_vec(R_h_inv, obj_pos - root_xy0)
         obj_rel_z = obj_pos[:, 2:3] - z_root
-        rot6d_obj = rot6d_col(torch.bmm(R_h_inv, R_obj))
-        obj_v_h = torch.einsum("bij,bj->bi", R_h_inv, obj_v)
-        obj_w_h = torch.einsum("bij,bj->bi", R_h_inv, obj_w)
+        rot6d_obj = rot6d_col(mat_mul(R_h_inv, R_obj))
+        obj_v_h = mat_vec(R_h_inv, obj_v)
+        obj_w_h = mat_vec(R_h_inv, obj_w)
 
         # 7 contact links + 5 torso/elbow/wrist anti-collision links expressed in object frame (21 + 15 = 36-D)
         anticol_pos_w = fk_res.tracked_pos_w[:, _WM_ANTICOL_TRACKED_INDICES]
         pts_w = torch.cat([fk_res.contact_pos_w, anticol_pos_w], dim=1)     # (B, 12, 3)
         rel_pts_w = pts_w - obj_pos.unsqueeze(1)
-        rel_pts_obj = torch.einsum("bij,bkj->bki", R_obj.transpose(-1, -2), rel_pts_w).reshape(
-            s_flat.shape[0], -1
-        )
+        rel_pts_obj = mat_t_vec(R_obj.unsqueeze(1), rel_pts_w).reshape(s_flat.shape[0], -1)
 
         return torch.cat(
             [
@@ -406,17 +421,17 @@ class SugarHOITask:
         ) = SugarHOITask.unpack_state(sn)
 
         R_h_inv = heading_inv_rotmat(q0)
-        dp_h = torch.einsum("bij,bj->bi", R_h_inv, p1 - p0)
+        dp_h = mat_vec(R_h_inv, p1 - p0)
         dtheta = quat_to_axis_angle(quat_mul(quat_conj(q0), q1))
         dq = j1 - j0
-        dv_h = torch.einsum("bij,bj->bi", R_h_inv, v1 - v0)
-        dw_h = torch.einsum("bij,bj->bi", R_h_inv, w1 - w0)
+        dv_h = mat_vec(R_h_inv, v1 - v0)
+        dw_h = mat_vec(R_h_inv, w1 - w0)
         dqd = jd1 - jd0
 
-        dobj_p_h = torch.einsum("bij,bj->bi", R_h_inv, op1 - op0)
+        dobj_p_h = mat_vec(R_h_inv, op1 - op0)
         dobj_theta = quat_to_axis_angle(quat_mul(quat_conj(oq0), oq1))
-        dobj_v_h = torch.einsum("bij,bj->bi", R_h_inv, ov1 - ov0)
-        dobj_w_h = torch.einsum("bij,bj->bi", R_h_inv, ow1 - ow0)
+        dobj_v_h = mat_vec(R_h_inv, ov1 - ov0)
+        dobj_w_h = mat_vec(R_h_inv, ow1 - ow0)
 
         delta = torch.cat(
             [dp_h, dtheta, dq, dv_h, dw_h, dqd, dobj_p_h, dobj_theta, dobj_v_h, dobj_w_h],
@@ -454,17 +469,17 @@ class SugarHOITask:
         dobj_v_h = delta[..., 76:79]
         dobj_w_h = delta[..., 79:82]
 
-        next_root_pos = root_pos + torch.einsum("bij,bj->bi", R_h, dp_h)
+        next_root_pos = root_pos + mat_vec(R_h, dp_h)
         next_root_quat = quat_normalize(quat_mul(root_quat, axis_angle_to_quat(dtheta)))
         next_q = q + dq
-        next_root_v = root_v + torch.einsum("bij,bj->bi", R_h, dv_h)
-        next_root_w = root_w + torch.einsum("bij,bj->bi", R_h, dw_h)
+        next_root_v = root_v + mat_vec(R_h, dv_h)
+        next_root_w = root_w + mat_vec(R_h, dw_h)
         next_qd = qd + dqd
 
-        next_obj_pos = obj_pos + torch.einsum("bij,bj->bi", R_h, dobj_p_h)
+        next_obj_pos = obj_pos + mat_vec(R_h, dobj_p_h)
         next_obj_quat = quat_normalize(quat_mul(obj_quat, axis_angle_to_quat(dobj_theta)))
-        next_obj_v = obj_v + torch.einsum("bij,bj->bi", R_h, dobj_v_h)
-        next_obj_w = obj_w + torch.einsum("bij,bj->bi", R_h, dobj_w_h)
+        next_obj_v = obj_v + mat_vec(R_h, dobj_v_h)
+        next_obj_w = obj_w + mat_vec(R_h, dobj_w_h)
 
         return SugarHOITask.pack_state(
             next_root_pos,
@@ -502,18 +517,18 @@ class SugarHOITask:
         jw_sqrt = torch.sqrt(jw)
 
         # Robot position & geodesic axis-angle error
-        err_p = torch.einsum("bij,bj->bi", R_h_inv, p_hat - p_gt)
+        err_p = mat_vec(R_h_inv, p_hat - p_gt)
         err_rot = quat_to_axis_angle(quat_mul(quat_conj(q_gt_rot), q_hat_rot))
         err_j = (j_hat - j_gt) * jw_sqrt
-        err_v = torch.einsum("bij,bj->bi", R_h_inv, v_hat - v_gt) * vel_loss_scale
-        err_w = torch.einsum("bij,bj->bi", R_h_inv, w_hat - w_gt) * vel_loss_scale
+        err_v = mat_vec(R_h_inv, v_hat - v_gt) * vel_loss_scale
+        err_w = mat_vec(R_h_inv, w_hat - w_gt) * vel_loss_scale
         err_jd = (jd_hat - jd_gt) * jw_sqrt * vel_loss_scale
 
         # Object position, rotation & velocity errors
-        err_op = torch.einsum("bij,bj->bi", R_h_inv, op_hat - op_gt)
+        err_op = mat_vec(R_h_inv, op_hat - op_gt)
         err_orot = quat_to_axis_angle(quat_mul(quat_conj(oq_gt), oq_hat))
-        err_ov = torch.einsum("bij,bj->bi", R_h_inv, ov_hat - ov_gt) * vel_loss_scale
-        err_ow = torch.einsum("bij,bj->bi", R_h_inv, ow_hat - ow_gt) * vel_loss_scale
+        err_ov = mat_vec(R_h_inv, ov_hat - ov_gt) * vel_loss_scale
+        err_ow = mat_vec(R_h_inv, ow_hat - ow_gt) * vel_loss_scale
 
         rob_vec = torch.cat([err_p, err_rot, err_j, err_v, err_w, err_jd], dim=-1)
         obj_vec = torch.cat([err_op, err_orot, err_ov, err_ow], dim=-1)
@@ -547,7 +562,7 @@ class SugarHOITask:
         Matches every single term and reshape layout in `sugar_rl/tasks/locomanip/mdp/observations.py`.
         """
         if fk_res is None:
-            fk_res = self.run_fk(s_flat)
+            fk_res = self.run_fk(s_flat, with_quat=False)
         (
             _,
             root_quat,
@@ -563,10 +578,10 @@ class SugarHOITask:
 
         B = s_flat.shape[0]
         K = ref_future.joint_pos.shape[1]  # 8
-        nb = len(SUGAR_TRACKED_BODY_NAMES)  # 14
 
-        anchor_pos_w = fk_res.anchor_pos_w     # (B, 3)
-        anchor_quat_w = fk_res.anchor_quat_w   # (B, 4)
+        anchor_pos_w = fk_res.anchor_pos_w        # (B, 3)
+        anchor_quat_w = fk_res.anchor_quat_w      # (B, 4)
+        anchor_rotmat_w = fk_res.anchor_rotmat_w  # (B, 3, 3)
 
         # 1. joint_pos_vel_future: (B, 8, 58) -> (B, 464)
         joint_pos_vel_fut = torch.cat([ref_future.joint_pos, ref_future.joint_vel], dim=-1).reshape(B, -1)
@@ -597,33 +612,30 @@ class SugarHOITask:
 
         # 6 & 7. ref_obj_lin_vel_b_future (24) & ref_obj_ang_vel_b_future (24)
         R_anc_vel = sugar_anchor_vel_rotmat(anchor_quat_w)  # (B, 3, 3)
-        ref_obj_v_fut = torch.einsum("bij,bkj->bki", R_anc_vel, ref_future.obj_lin_vel_w).reshape(B, -1)
-        ref_obj_w_fut = torch.einsum("bij,bkj->bki", R_anc_vel, ref_future.obj_ang_vel_w).reshape(B, -1)
+        ref_obj_v_fut = mat_vec(R_anc_vel.unsqueeze(1), ref_future.obj_lin_vel_w).reshape(B, -1)
+        ref_obj_w_fut = mat_vec(R_anc_vel.unsqueeze(1), ref_future.obj_ang_vel_w).reshape(B, -1)
 
-        # 8 & 9. robot_body_pos_b (42) & robot_body_ori_b (84)
-        anc_p_body = anchor_pos_w.unsqueeze(1).expand(-1, nb, -1)
-        anc_q_body = anchor_quat_w.unsqueeze(1).expand(-1, nb, -1)
-        body_pos_b, body_quat_b = subtract_frame_transforms(
-            anc_p_body, anc_q_body, fk_res.tracked_pos_w, fk_res.tracked_quat_w
-        )
+        # 8 & 9. robot_body_pos_b (42) & robot_body_ori_b (84) directly from FK rotation matrices
+        body_pos_b = mat_t_vec(anchor_rotmat_w.unsqueeze(1), fk_res.tracked_pos_w - anchor_pos_w.unsqueeze(1))
+        body_rot_b = mat_t_mul(anchor_rotmat_w.unsqueeze(1), fk_res.tracked_rotmat_w)
         obs_body_pos = body_pos_b.reshape(B, -1)
-        obs_body_ori = sugar_rot6d_from_quat(body_quat_b).reshape(B, -1)
+        obs_body_ori = sugar_rot6d_from_mat(body_rot_b).reshape(B, -1)
 
         # 10 & 11. base_lin_vel (3) & base_ang_vel (3) in pelvis frame
-        base_lin_vel = quat_apply_inverse(root_quat, root_v)
-        base_ang_vel = quat_apply_inverse(root_quat, root_w)
+        R_root = fk_res.root_rotmat_w if fk_res.root_rotmat_w is not None else quat_to_rotmat(root_quat)
+        base_lin_vel = mat_t_vec(R_root, root_v)
+        base_ang_vel = mat_t_vec(R_root, root_w)
 
         # 12, 13, 14. joint_pos_rel (29), joint_vel_rel (29), last_action (29)
         joint_pos_rel = q - self.effective_default_joint_pos(xi)
         joint_vel_rel = qd
 
         # 15, 16, 17, 18. current object pose & velocity in anchor frame
-        cur_obj_pos_b, cur_obj_quat_b = subtract_frame_transforms(
-            anchor_pos_w, anchor_quat_w, obj_pos_w, obj_quat_w
-        )
-        cur_obj_ori_b = sugar_rot6d_from_quat(cur_obj_quat_b)
-        cur_obj_v_b = torch.einsum("bij,bj->bi", R_anc_vel, obj_v_w)
-        cur_obj_w_b = torch.einsum("bij,bj->bi", R_anc_vel, obj_w_w)
+        R_obj_w = quat_to_rotmat(obj_quat_w)
+        cur_obj_pos_b = mat_t_vec(anchor_rotmat_w, obj_pos_w - anchor_pos_w)
+        cur_obj_ori_b = sugar_rot6d_from_mat(mat_t_mul(anchor_rotmat_w, R_obj_w))
+        cur_obj_v_b = mat_vec(R_anc_vel, obj_v_w)
+        cur_obj_w_b = mat_vec(R_anc_vel, obj_w_w)
 
         return torch.cat(
             [
@@ -654,11 +666,11 @@ class SugarHOITask:
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Compute current-step proprioceptive terms for `TrackerHistoryState`."""
         _, root_quat, q, _, root_w, qd, _, _, _, _ = self.unpack_state(s_flat)
-        base_ang_vel = quat_apply_inverse(root_quat, root_w)
+        R_root = quat_to_rotmat(root_quat)
+        base_ang_vel = mat_t_vec(R_root, root_w)
         joint_pos_rel = q - self.effective_default_joint_pos(xi)
         joint_vel_rel = qd
-        grav_w = s_flat.new_tensor([0.0, 0.0, -1.0]).expand(s_flat.shape[0], 3)
-        proj_grav = quat_apply_inverse(root_quat, grav_w)
+        proj_grav = -R_root[:, 2, :]
         return base_ang_vel, joint_pos_rel, joint_vel_rel, last_action, proj_grav
 
     def init_tracker_history_from_states(
@@ -706,15 +718,13 @@ class SugarHOITask:
     ) -> Tensor:
         """Construct 510-D `TrackerCfg` observation vector matching SUGAR Tracker & Inference."""
         if fk_res is None:
-            fk_res = self.run_fk(s_flat)
+            fk_res = self.run_fk(s_flat, with_quat=False)
         B = s_flat.shape[0]
         obj_pos_w = s_flat[..., 71:74]
         obj_quat_w = quat_normalize(s_flat[..., 74:78])
 
-        cur_obj_pos_b, cur_obj_quat_b = subtract_frame_transforms(
-            fk_res.anchor_pos_w, fk_res.anchor_quat_w, obj_pos_w, obj_quat_w
-        )
-        cur_obj_ori_b = sugar_rot6d_from_quat(cur_obj_quat_b)
+        cur_obj_pos_b = mat_t_vec(fk_res.anchor_rotmat_w, obj_pos_w - fk_res.anchor_pos_w)
+        cur_obj_ori_b = sugar_rot6d_from_mat(mat_t_mul(fk_res.anchor_rotmat_w, quat_to_rotmat(obj_quat_w)))
 
         cmd = ref_cmd_36
         b_ang = hist.base_ang_vel.reshape(B, -1)
@@ -749,6 +759,26 @@ class SugarHOITask:
     # 4. Differentiable SUGAR Rewards & Soft Terminations
     # ------------------------------------------------------------------
 
+    def _compute_relative_ref_bodies_mat(
+        self, fk_res: FKResult, ref: RefFrame
+    ) -> tuple[Tensor, Tensor]:
+        """Fast rotation-matrix version of `_compute_relative_ref_bodies` (`body_pos_rel_w`, `body_rotmat_rel_w`)."""
+        nb = len(SUGAR_TRACKED_BODY_NAMES)
+        ref_anc_pos = ref.body_pos_w[:, self.anchor_idx]      # (B, 3)
+        ref_anc_quat = ref.body_quat_w[:, self.anchor_idx]    # (B, 4)
+
+        rob_anc_pos = fk_res.anchor_pos_w                     # (B, 3)
+        rob_anc_quat = fk_res.anchor_quat_w                   # (B, 4)
+
+        delta_pos_w = torch.cat([rob_anc_pos[:, :2], ref_anc_pos[:, 2:3]], dim=-1).unsqueeze(1).expand(-1, nb, -1)
+        delta_ori_single = yaw_quat(quat_mul(rob_anc_quat, quat_conj(ref_anc_quat)))
+        R_delta = quat_to_rotmat(delta_ori_single).unsqueeze(1)
+        R_ref_b = ref.body_rotmat_w if ref.body_rotmat_w is not None else quat_to_rotmat(ref.body_quat_w)
+
+        body_rotmat_rel_w = mat_mul(R_delta, R_ref_b)
+        body_pos_rel_w = delta_pos_w + mat_vec(R_delta, ref.body_pos_w - ref_anc_pos.unsqueeze(1))
+        return body_pos_rel_w, body_rotmat_rel_w
+
     def _compute_relative_ref_bodies(
         self, fk_res: FKResult, ref: RefFrame
     ) -> tuple[Tensor, Tensor]:
@@ -763,12 +793,11 @@ class SugarHOITask:
         # delta_pos_w: robot (x, y) + reference anchor z
         delta_pos_w = torch.cat([rob_anc_pos[:, :2], ref_anc_pos[:, 2:3]], dim=-1).unsqueeze(1).expand(-1, nb, -1)
         delta_ori_single = yaw_quat(quat_mul(rob_anc_quat, quat_conj(ref_anc_quat)))
+        R_delta = quat_to_rotmat(delta_ori_single).unsqueeze(1)
         delta_ori_w = delta_ori_single.unsqueeze(1).expand(-1, nb, -1)
 
         body_quat_rel_w = quat_mul(delta_ori_w, ref.body_quat_w)
-        body_pos_rel_w = delta_pos_w + quat_apply(
-            delta_ori_w, ref.body_pos_w - ref_anc_pos.unsqueeze(1)
-        )
+        body_pos_rel_w = delta_pos_w + mat_vec(R_delta, ref.body_pos_w - ref_anc_pos.unsqueeze(1))
         return body_pos_rel_w, body_quat_rel_w
 
     def compute_reward_and_termination(
@@ -801,14 +830,19 @@ class SugarHOITask:
             raise ValueError("`ref_cur` (current step reference frame) must be provided.")
 
         if fk_next is None:
-            fk_next = self.run_fk(s_next)
+            fk_next = self.run_fk(s_next, with_quat=False)
 
         _, _, q_prev, _, _, qd_prev, _, _, _, _ = self.unpack_state(s_prev)
         _, _, q_next, _, _, qd_next, obj_pos_w, obj_quat_w, obj_v_w, obj_w_w = self.unpack_state(s_next)
 
         ref_anc_pos = ref_target.body_pos_w[:, self.anchor_idx]
         ref_anc_quat = ref_target.body_quat_w[:, self.anchor_idx]
-        body_pos_rel_w, body_quat_rel_w = self._compute_relative_ref_bodies(fk_next, ref_target)
+        ref_anc_rotmat = (
+            ref_target.body_rotmat_w[:, self.anchor_idx]
+            if ref_target.body_rotmat_w is not None
+            else quat_to_rotmat(ref_anc_quat)
+        )
+        body_pos_rel_w, body_rotmat_rel_w = self._compute_relative_ref_bodies_mat(fk_next, ref_target)
 
         # ---- A. Tracking rewards (exact weights & stds from BaseRewardsCfg) ----
         err_jpos = ((ref_target.joint_pos - q_next) ** 2).sum(dim=-1)
@@ -817,13 +851,13 @@ class SugarHOITask:
         err_anc_p = ((ref_anc_pos - fk_next.anchor_pos_w) ** 2).sum(dim=-1)
         r_anc_pos = 0.25 * torch.exp(-err_anc_p / (0.3**2))
 
-        err_anc_q = quat_error_magnitude(ref_anc_quat, fk_next.anchor_quat_w) ** 2
+        err_anc_q = rotmat_error_magnitude(ref_anc_rotmat, fk_next.anchor_rotmat_w) ** 2
         r_anc_ori = 0.25 * torch.exp(-err_anc_q / (0.4**2))
 
         err_bpos = ((body_pos_rel_w - fk_next.tracked_pos_w) ** 2).sum(dim=-1).mean(dim=-1)
         r_body_pos = 0.25 * torch.exp(-err_bpos / (0.3**2))
 
-        err_bori = (quat_error_magnitude(body_quat_rel_w, fk_next.tracked_quat_w) ** 2).mean(dim=-1)
+        err_bori = (rotmat_error_magnitude(body_rotmat_rel_w, fk_next.tracked_rotmat_w) ** 2).mean(dim=-1)
         r_body_ori = 0.25 * torch.exp(-err_bori / (0.4**2))
 
         err_bv = ((ref_target.body_lin_vel_w - fk_next.tracked_lin_vel_w) ** 2).sum(dim=-1).mean(dim=-1)
@@ -833,10 +867,12 @@ class SugarHOITask:
         r_body_ang = 0.25 * torch.exp(-err_bw / (3.14**2))
 
         # ---- B. Object global tracking rewards ----
+        R_obj_w = quat_to_rotmat(obj_quat_w)
+        R_ref_obj_w = quat_to_rotmat(ref_target.obj_quat_w)
         err_op = ((obj_pos_w - ref_target.obj_pos_w) ** 2).sum(dim=-1)
         r_obj_pos = 0.5 * torch.exp(-err_op / (0.3**2))
 
-        err_oq = quat_error_magnitude(obj_quat_w, ref_target.obj_quat_w) ** 2
+        err_oq = rotmat_error_magnitude(R_obj_w, R_ref_obj_w) ** 2
         r_obj_ori = 0.5 * torch.exp(-err_oq / (0.4**2))
 
         err_ov = ((obj_v_w - ref_target.obj_lin_vel_w) ** 2).sum(dim=-1)
@@ -846,23 +882,23 @@ class SugarHOITask:
         r_obj_ang = 0.5 * torch.exp(-err_ow / (3.14**2))
 
         # ---- C. Human-object relative interaction rewards (`obj2body_pos`, `obj2body_ori`) ----
-        nb = len(SUGAR_TRACKED_BODY_NAMES)
-        o2b_p, o2b_q = subtract_frame_transforms(
-            fk_next.tracked_pos_w,
-            fk_next.tracked_quat_w,
-            obj_pos_w.unsqueeze(1).expand(-1, nb, -1),
-            obj_quat_w.unsqueeze(1).expand(-1, nb, -1),
-        )
-        ref_o2b_p, ref_o2b_q = subtract_frame_transforms(
-            ref_target.body_pos_w,
-            ref_target.body_quat_w,
-            ref_target.obj_pos_w.unsqueeze(1).expand(-1, nb, -1),
-            ref_target.obj_quat_w.unsqueeze(1).expand(-1, nb, -1),
-        )
+        o2b_p = mat_t_vec(fk_next.tracked_rotmat_w, obj_pos_w.unsqueeze(1) - fk_next.tracked_pos_w)
+        o2b_R = mat_t_mul(fk_next.tracked_rotmat_w, R_obj_w.unsqueeze(1))
+        if ref_target.o2b_pos_ref is not None and ref_target.o2b_rotmat_ref is not None:
+            ref_o2b_p = ref_target.o2b_pos_ref
+            ref_o2b_R = ref_target.o2b_rotmat_ref
+        else:
+            R_ref_b = (
+                ref_target.body_rotmat_w
+                if ref_target.body_rotmat_w is not None
+                else quat_to_rotmat(ref_target.body_quat_w)
+            )
+            ref_o2b_p = mat_t_vec(R_ref_b, ref_target.obj_pos_w.unsqueeze(1) - ref_target.body_pos_w)
+            ref_o2b_R = mat_t_mul(R_ref_b, R_ref_obj_w.unsqueeze(1))
         err_o2b_p = ((o2b_p - ref_o2b_p) ** 2).sum(dim=-1).mean(dim=-1)
         r_o2b_pos = 0.25 * torch.exp(-err_o2b_p / (0.3**2))
 
-        err_o2b_q = (quat_error_magnitude(o2b_q, ref_o2b_q) ** 2).mean(dim=-1)
+        err_o2b_q = (rotmat_error_magnitude(o2b_R, ref_o2b_R) ** 2).mean(dim=-1)
         r_o2b_ori = 0.25 * torch.exp(-err_o2b_q / (0.4**2))
 
         # ---- D. Expected contact rewards (WM head + smooth kinematic proximity) ----
@@ -982,9 +1018,12 @@ class SugarHOITask:
         surv_anc_pos = torch.sigmoid((0.30 - d_anc_pos) / self.pos_term_temp)
 
         # 2. bad_anchor_ori (|proj_grav_z_ref - proj_grav_z_rob| > 0.8)
-        grav_w = s_next.new_tensor([0.0, 0.0, -1.0]).expand(s_next.shape[0], 3)
-        pg_ref_z = quat_apply_inverse(ref_anc_quat, grav_w)[:, 2]
-        pg_rob_z = quat_apply_inverse(fk_next.anchor_quat_w, grav_w)[:, 2]
+        if ref_target.anc_pg_z_ref is not None:
+            pg_ref_z = ref_target.anc_pg_z_ref
+        else:
+            q_anc_n = quat_normalize(ref_anc_quat)
+            pg_ref_z = 2.0 * (q_anc_n[:, 1] ** 2 + q_anc_n[:, 2] ** 2) - 1.0
+        pg_rob_z = -fk_next.anchor_rotmat_w[:, 2, 2]
         d_anc_ori = torch.sqrt((pg_ref_z - pg_rob_z) ** 2 + 1e-10)
         surv_anc_ori = torch.sigmoid((0.80 - d_anc_ori) / self.ori_term_temp)
 

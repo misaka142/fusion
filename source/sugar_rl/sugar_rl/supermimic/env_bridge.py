@@ -14,6 +14,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import functools
 import re
 from typing import Any
@@ -33,6 +34,7 @@ from .hoi_task import (
     XI_DIM,
     resolve_task_profile,
 )
+from .rotations import mat_t_mul, mat_t_vec, quat_normalize, quat_to_rotmat
 from .urdf_kinematics import FastTreeKinematics
 
 
@@ -143,6 +145,31 @@ def assert_privileged_obs_aligned(
     return worst_err, worst_name
 
 
+@dataclass
+class MotionImaginationSlice:
+    """Pre-sliced reference tensors over an entire H-step imagination horizon (+K lookahead)."""
+
+    fut_joint_pos: Tensor         # (B, H+K, 29)
+    fut_joint_vel: Tensor         # (B, H+K, 29)
+    fut_anchor_pos_w: Tensor      # (B, H+K, 3)
+    fut_anchor_quat_w: Tensor     # (B, H+K, 4)
+    fut_obj_pos_w: Tensor         # (B, H+K, 3)
+    fut_obj_quat_w: Tensor        # (B, H+K, 4)
+    fut_obj_lin_vel_w: Tensor     # (B, H+K, 3)
+    fut_obj_ang_vel_w: Tensor     # (B, H+K, 3)
+
+    body_pos_w: Tensor | None = None        # (B, H, 14, 3)
+    body_quat_w: Tensor | None = None       # (B, H, 14, 4)
+    body_rotmat_w: Tensor | None = None     # (B, H, 14, 3, 3)
+    body_lin_vel_w: Tensor | None = None    # (B, H, 14, 3)
+    body_ang_vel_w: Tensor | None = None    # (B, H, 14, 3)
+    contact_label: Tensor | None = None     # (B, H)
+    o2b_pos_ref: Tensor | None = None       # (B, H, 14, 3)
+    o2b_rotmat_ref: Tensor | None = None    # (B, H, 14, 3, 3)
+    anc_pg_z_ref: Tensor | None = None      # (B, H)
+    traj_done: Tensor | None = None         # (B, H) bool
+
+
 class MotionReferenceAdapter:
     """Fast batched slicer over SUGAR's `MotionLoader` tensors with one-time GPU tensor caching."""
 
@@ -172,6 +199,11 @@ class MotionReferenceAdapter:
         self.obj_ang_vel: Tensor = motion_loader.obj_ang_vel
         self.contact_label: Tensor = motion_loader.contact_label
 
+        self.body_rotmat_w: Tensor | None = None
+        self.o2b_pos_ref: Tensor | None = None
+        self.o2b_rotmat_ref: Tensor | None = None
+        self.anc_pg_z_ref: Tensor | None = None
+
         if anchor_only and hasattr(motion_loader, "_body_pos_w") and hasattr(motion_loader, "_body_indexes"):
             raw_anc_idx = int(motion_loader._body_indexes[anchor_body_idx])
             self.body_pos_w: Tensor | None = None
@@ -187,6 +219,19 @@ class MotionReferenceAdapter:
             self.body_ang_vel_w = motion_loader.body_ang_vel_w.contiguous()
             self.anchor_pos_w = self.body_pos_w[:, :, anchor_body_idx]
             self.anchor_quat_w = self.body_quat_w[:, :, anchor_body_idx]
+
+            # Precompute static object-to-body transforms & anchor gravity Z once for reward speedups
+            total_frames = int(self.body_pos_w.shape[0] * self.body_pos_w.shape[1])
+            if total_frames <= 250_000:
+                with torch.no_grad():
+                    self.body_rotmat_w = quat_to_rotmat(self.body_quat_w)
+                    R_obj_all = quat_to_rotmat(self.obj_quat)
+                    self.o2b_pos_ref = mat_t_vec(
+                        self.body_rotmat_w, self.obj_pos.unsqueeze(2) - self.body_pos_w
+                    )
+                    self.o2b_rotmat_ref = mat_t_mul(self.body_rotmat_w, R_obj_all.unsqueeze(2))
+                    q_anc_n = quat_normalize(self.anchor_quat_w)
+                    self.anc_pg_z_ref = 2.0 * (q_anc_n[..., 1] ** 2 + q_anc_n[..., 2] ** 2) - 1.0
 
     def clamp_timesteps(self, motion_ids: Tensor, time_steps: Tensor) -> Tensor:
         max_t = (self.lengths[motion_ids] - 1).clamp_min(0)
@@ -211,6 +256,10 @@ class MotionReferenceAdapter:
             obj_lin_vel_w=self.obj_lin_vel[motion_ids, t],
             obj_ang_vel_w=self.obj_ang_vel[motion_ids, t],
             contact_label=self.contact_label[motion_ids, t].float(),
+            body_rotmat_w=self.body_rotmat_w[motion_ids, t] if self.body_rotmat_w is not None else None,
+            o2b_pos_ref=self.o2b_pos_ref[motion_ids, t] if self.o2b_pos_ref is not None else None,
+            o2b_rotmat_ref=self.o2b_rotmat_ref[motion_ids, t] if self.o2b_rotmat_ref is not None else None,
+            anc_pg_z_ref=self.anc_pg_z_ref[motion_ids, t] if self.anc_pg_z_ref is not None else None,
         )
 
     def get_future_window(self, motion_ids: Tensor, time_steps: Tensor) -> RefFutureWindow:
@@ -230,6 +279,46 @@ class MotionReferenceAdapter:
             obj_lin_vel_w=self.obj_lin_vel[m_ids, fut_t],
             obj_ang_vel_w=self.obj_ang_vel[m_ids, fut_t],
         )
+
+    @torch.no_grad()
+    def get_imagination_slice(
+        self, motion_ids: Tensor, t_0: Tensor, horizon: int, need_ref_cur: bool = True
+    ) -> MotionImaginationSlice:
+        """Gather all horizon (+ lookahead) reference tensors in one batched GPU lookup."""
+        L_fut = horizon + self.future_frames
+        offsets = torch.arange(L_fut, device=self.device, dtype=torch.long).unsqueeze(0)
+        lens = self.lengths[motion_ids].unsqueeze(1)
+        max_t = (lens - 1).clamp_min(0)
+        raw_t = t_0.unsqueeze(1) + offsets
+        fut_t = raw_t.clamp(min=0).minimum(max_t)
+        m_fut = motion_ids.unsqueeze(1).expand(-1, L_fut)
+
+        out = MotionImaginationSlice(
+            fut_joint_pos=self.joint_pos[m_fut, fut_t],
+            fut_joint_vel=self.joint_vel[m_fut, fut_t],
+            fut_anchor_pos_w=self.anchor_pos_w[m_fut, fut_t],
+            fut_anchor_quat_w=self.anchor_quat_w[m_fut, fut_t],
+            fut_obj_pos_w=self.obj_pos[m_fut, fut_t],
+            fut_obj_quat_w=self.obj_quat[m_fut, fut_t],
+            fut_obj_lin_vel_w=self.obj_lin_vel[m_fut, fut_t],
+            fut_obj_ang_vel_w=self.obj_ang_vel[m_fut, fut_t],
+        )
+        if need_ref_cur:
+            if self.body_pos_w is None:
+                raise RuntimeError("`need_ref_cur=True` on an `anchor_only=True` MotionReferenceAdapter.")
+            cur_t = fut_t[:, :horizon]
+            m_cur = m_fut[:, :horizon]
+            out.body_pos_w = self.body_pos_w[m_cur, cur_t]
+            out.body_quat_w = self.body_quat_w[m_cur, cur_t]
+            out.body_lin_vel_w = self.body_lin_vel_w[m_cur, cur_t]
+            out.body_ang_vel_w = self.body_ang_vel_w[m_cur, cur_t]
+            out.contact_label = self.contact_label[m_cur, cur_t].float()
+            out.body_rotmat_w = self.body_rotmat_w[m_cur, cur_t] if self.body_rotmat_w is not None else None
+            out.o2b_pos_ref = self.o2b_pos_ref[m_cur, cur_t] if self.o2b_pos_ref is not None else None
+            out.o2b_rotmat_ref = self.o2b_rotmat_ref[m_cur, cur_t] if self.o2b_rotmat_ref is not None else None
+            out.anc_pg_z_ref = self.anc_pg_z_ref[m_cur, cur_t] if self.anc_pg_z_ref is not None else None
+            out.traj_done = (t_0.unsqueeze(1) + 1 + offsets[:, :horizon]) >= lens
+        return out
 
 
 class SugarEnvBridge:

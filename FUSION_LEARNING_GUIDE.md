@@ -14,7 +14,7 @@
    - **SuperMimic 算法包（非官方自研重构实现）**：**SuperMimic 原论文官方代码尚未开源**。本项目中的核心算法目录 `source/sugar_rl/sugar_rl/supermimic/` 是依据 SuperMimic 论文原理（可微世界模型 + 多步想象展开 BPTT + 集成 Critic 价值引导）结合全身人-物交互（HOI）场景自行编写的**非官方融合实现**。
    - **MuJoCo Sim-to-Sim 模块（本地零依赖部署实现）**：`scripts/sim2sim/` 是为脱离重型 Isaac Sim 依赖、在本地电脑直接验证与交互而构建的跨物理引擎部署工具。
 2. **当前验证状态**：
-   - **已在本地实际运行验证通过的部分**：`tests/test_supermimic_fusion.py`（14 项纯 PyTorch GPU/CPU 核心数学、运动学、观测对齐、32 步 BPTT 梯度、防抖残差掩码、前沿采样、起升平滑与断点续训单元测试）与 `tests/test_mujoco_sim2sim.py`（6 项全 6 任务 MuJoCo 场景编译、双格式权重加载、`1e-7` 级观测同构对齐、500Hz 隐式 PD 站立稳定、闭环录屏及 `OmniCarryBox` 质心/防滑移校验端到端测试）。
+   - **已在本地实际运行验证通过的部分**：`tests/test_supermimic_fusion.py`（15 项纯 PyTorch GPU/CPU 核心数学、运动学、观测对齐、32 步 BPTT 梯度、防抖残差掩码、前沿采样、起升平滑、零断点编译等价性与断点续训单元测试）与 `tests/test_mujoco_sim2sim.py`（6 项全 6 任务 MuJoCo 场景编译、双格式权重加载、`1e-7` 级观测同构对齐、500Hz 隐式 PD 站立稳定、闭环录屏及 `OmniCarryBox` 质心/防滑移校验端到端测试）。
    - **需在云端 GPU 实际跑通验证的部分**：完整的 5001 轮 Isaac Sim 5.1.0 长周期强化学习训练与 1001 轮扩散生成器训练需通过 `SuperMimic_SUGAR_Repro.ipynb` 在 Google Colab GPU 上执行验证；在拿到云端完整训练收敛的权重前，不宣称某组超参已完成最终任务指标收敛。
 
 ---
@@ -157,7 +157,7 @@ D:\robot\rework\fusion\
 │           └── wrapper/sugar_il_wrapper.py # GeneratorWrapper：供 Stage 6 和 Sim2Sim 调用的 50Hz<->10Hz 插值推理外壳
 │
 └── tests/                                # 【板块三：本地自动化回归测试套件】
-    ├── test_supermimic_fusion.py         # 14 项核心算法、运动学、观测切片、32步BPTT、v2去抖与断点续训测试
+    ├── test_supermimic_fusion.py         # 15 项核心算法、运动学、观测切片、32步BPTT、v2去抖与编译加速测试
     └── test_mujoco_sim2sim.py            # 6 项全 6 任务 MuJoCo Sim-to-Sim 场景编译、观测同构、闭环控制与数据集校验测试
 ```
 
@@ -441,13 +441,13 @@ sequenceDiagram
 
 > **环境安全说明**：以下命令直接调用本机已配好的 `DRL_env` Python 解释器只读运行测试，**不会修改或覆盖任何现有包版本**。请依次串行运行下方两个测试（避免在笔记本 4GB 显存 GPU 上并行抢占 CUDA 显存）。
 
-#### （1）运行 14 项 SuperMimic × SUGAR 核心算法与断点续训回归测试
+#### （1）运行 15 项 SuperMimic × SUGAR 核心算法与断点续训回归测试
 ```powershell
 & "D:\anaconda\envs\DRL_env\python.exe" "D:\robot\rework\fusion\tests\test_supermimic_fusion.py"
 ```
-- **命令作用**：在不依赖 Isaac Sim 的前提下，使用本地 GPU（或 CPU）测试四元数零角安全梯度、URDF/MJCF 正向运动学与质心速度递推、890 维特权观测 18 项切片对齐断言、6 大任务奖励与软终止、123 维世界模型 `SE(2)` 不变性、`delta_rms` 归一化、下肢残差掩码解耦、环形缓冲区 `done/push` 隔离与前沿采样、32 步人-物耦合 BPTT 梯度传导、起升平滑拉伸以及 Colab 中断自动续训逻辑。
+- **命令作用**：在不依赖 Isaac Sim 的前提下，使用本地 GPU（或 CPU）测试四元数零角安全梯度、URDF/MJCF 正向运动学与质心速度递推、890 维特权观测 18 项切片对齐断言、6 大任务奖励与软终止、123 维世界模型 `SE(2)` 不变性、`delta_rms` 归一化、下肢残差掩码解耦、环形缓冲区 `done/push` 隔离与前沿采样、32 步人-物耦合 BPTT 梯度传导、起升平滑拉伸、整步编译等价性（0 Graph Break）以及 Colab 中断自动续训逻辑。
 - **关键参数含义**：直接运行测试脚本，内部自动检测 `cuda` 并构造临时测试目录，运行完毕自动清理。
-- **预期结果**：依次打印 `[PASS] Test 1` 至 `[PASS] Test 14`，末尾输出 `ALL 14 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!`。
+- **预期结果**：依次打印 `[PASS] Test 1` 至 `[PASS] Test 15`，末尾输出 `ALL 15 SUPERMIMIC x SUGAR TESTS PASSED SUCCESSFULLY!`。
 
 #### （2）运行 6 项本地 MuJoCo Sim-to-Sim 跨引擎端到端验证测试
 ```powershell
@@ -518,7 +518,7 @@ bash train_fusion.sh CarryBox colab_verify 301 512 256 101
 > **核心工作**：
 > 1. **人-物耦合可微世界模型与正向运动学构建**：手写纯 PyTorch 向量化 29-DoF 树状正向运动学（FK）与零角泰勒安全四元数算子；设计包含 7 接触点与 5 个躯干/前臂防碰撞连杆物体局部坐标（共 36 维）及 37 维物理域随机化上下文的 123 维 `SE(2)` 航向不变特征（配合 `delta_rms` 输出标准化），通过 8 步自回归残差状态积分与辅助接触头联合建模人-物接触动力学。
 > 2. **双阶段确定性 32 步想象展开 BPTT 与动态退火师生蒸馏**：使用冻结世界模型下的确定性 32 步解析奖励 BPTT、上下肢 `residual_mask` 解耦控制、5 项 Sigmoid 平滑软终止、0.98 状态雅可比衰减及双头悲观截断 Critic 尾部自举替换原版 Stage 1 PPO；在 Stage 2（510 维盲观测 + 5 帧可微滚动历史）中融合世界模型策略梯度与冻结 Refiner 教师的动态退火行为克隆蒸馏，兼容 10Hz Transformer 扩散指令生成器。
-> 3. **工程可靠性与 MuJoCo 跨引擎 Sim-to-Sim 对齐**：实现 GPU 驻留环形回放缓冲（解耦回合 ID 与推搡/重置连续掩码，并支持 `frontier_frac` 前沿优先级采样）及启动时 890 维特权观测 18 项切片级对齐硬断言；构建 10Hz 规划 + 50Hz 跟踪 + 500Hz 隐式 PD 的本地 MuJoCo 部署器，解决 BFS↔SDK 关节双射、转子惯量与局部系观测同构（对齐误差 `< 1e-6`）问题，通过 20 项（14+6）自动化单元与集成测试验证。
+> 3. **工程可靠性与 MuJoCo 跨引擎 Sim-to-Sim 对齐**：实现 GPU 驻留环形回放缓冲（解耦回合 ID 与推搡/重置连续掩码，并支持 `frontier_frac` 前沿优先级采样）及启动时 890 维特权观测 18 项切片级对齐硬断言；构建 10Hz 规划 + 50Hz 跟踪 + 500Hz 隐式 PD 的本地 MuJoCo 部署器，解决 BFS↔SDK 关节双射、转子惯量与局部系观测同构（对齐误差 `< 1e-6`）问题，通过 21 项（15+6）自动化单元与集成测试验证。
 
 ---
 

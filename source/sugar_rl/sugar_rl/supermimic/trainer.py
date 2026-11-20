@@ -31,11 +31,15 @@ from torch import Tensor
 
 from .hoi_task import (
     PRIVILEGED_OBS_DIM,
+    RefFrame,
+    RefFutureWindow,
     TRACKER_OBS_DIM,
+    TrackerHistoryState,
     resolve_task_profile,
 )
 from .networks import JointWorldModel, SuperMimicCritic, SuperMimicPolicy
 from .replay import HOIReplayBuffer
+from .urdf_kinematics import FKResult
 
 
 @dataclass
@@ -97,6 +101,26 @@ class SuperMimicTrainCfg:
     enable_tensorboard: bool = True
     compile_models: bool = False                     # Optional torch.compile; False by default for IsaacSim safety
     compile_backend: str = "inductor"                # Backend passed to `torch.compile` when `compile_models=True`
+    compile_mode: str = "default"                    # Inductor mode ('default' is safe with IsaacLab/PhysX)
+
+
+def _has_triton() -> bool:
+    try:
+        import triton  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _build_adamw(
+    params, lr: float, weight_decay: float, device: torch.device
+) -> torch.optim.AdamW:
+    if device.type == "cuda":
+        try:
+            return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=True)
+        except (TypeError, RuntimeError):
+            pass
+    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
 
 def _unwrap_compiled(module: nn.Module) -> nn.Module:
@@ -244,14 +268,42 @@ class SuperMimicTrainer:
             print(f"[SuperMimic Trainer] Loading frozen Refiner Teacher from: {teacher_ckpt}")
             self.teacher_policy = load_supermimic_policy(teacher_ckpt, device=self.device)
 
-        if self.cfg.compile_models and hasattr(torch, "compile"):
-            self._raw_world_model.enable_compile(backend=self.cfg.compile_backend)
-            self._raw_policy.enable_compile(backend=self.cfg.compile_backend)
-            self._raw_critic.enable_compile(backend=self.cfg.compile_backend)
+        self._wm_loss_fn = self._wm_window_loss_core
+        self._img_step_fn = self._img_step_core
+        self._zero_scalar = torch.zeros((), dtype=torch.float32, device=self.device)
+        self._one_scalar = torch.ones((), dtype=torch.float32, device=self.device)
 
-        self.wm_opt = torch.optim.AdamW(self._raw_world_model.parameters(), lr=self.cfg.wm_lr, weight_decay=1e-5)
-        self.policy_opt = torch.optim.AdamW(self._raw_policy.parameters(), lr=self.cfg.policy_lr, weight_decay=1e-5)
-        self.critic_opt = torch.optim.AdamW(self._raw_critic.parameters(), lr=self.cfg.critic_lr, weight_decay=1e-5)
+        if self.cfg.compile_models and hasattr(torch, "compile"):
+            if self.cfg.compile_backend == "inductor" and (
+                self.device.type != "cuda" or not _has_triton()
+            ):
+                print(
+                    "[SuperMimic Trainer] WARNING: Triton/CUDA Inductor unavailable on this host; "
+                    "running compiled step functions in eager mode."
+                )
+            else:
+                compile_kwargs: dict[str, Any] = {
+                    "dynamic": False,
+                    "backend": self.cfg.compile_backend,
+                }
+                if self.cfg.compile_backend == "inductor" and self.cfg.compile_mode:
+                    compile_kwargs["mode"] = self.cfg.compile_mode
+                self._wm_loss_fn = torch.compile(self._wm_window_loss_core, **compile_kwargs)
+                self._img_step_fn = torch.compile(self._img_step_core, **compile_kwargs)
+                print(
+                    f"[SuperMimic Trainer] Whole-step torch.compile enabled "
+                    f"(backend={self.cfg.compile_backend}, mode={self.cfg.compile_mode})"
+                )
+
+        self.wm_opt = _build_adamw(
+            self._raw_world_model.parameters(), lr=self.cfg.wm_lr, weight_decay=1e-5, device=self.device
+        )
+        self.policy_opt = _build_adamw(
+            self._raw_policy.parameters(), lr=self.cfg.policy_lr, weight_decay=1e-5, device=self.device
+        )
+        self.critic_opt = _build_adamw(
+            self._raw_critic.parameters(), lr=self.cfg.critic_lr, weight_decay=1e-5, device=self.device
+        )
 
         # GPU Ring Replay Buffer + Domain Randomization Context xi
         self.replay = HOIReplayBuffer(
@@ -449,6 +501,51 @@ class SuperMimicTrainer:
     # Phase 2: Autoregressive Joint World Model Update
     # ------------------------------------------------------------------
 
+    def _wm_window_loss_core(
+        self,
+        s_init: Tensor,
+        actions: Tensor,
+        next_states: Tensor,
+        contacts: Tensor,
+        xi: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Pure-tensor multi-step world-model autoregressive rollout loss (compilable)."""
+        eff_k = int(actions.shape[1])
+        s_cur = s_init
+        loss_state_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+        loss_contact_sum = torch.zeros((), dtype=torch.float32, device=self.device)
+        last_metrics: dict[str, Tensor] = {}
+
+        for t in range(eff_k):
+            s_cur, c_logits = self._raw_world_model.step(
+                self.task,
+                s_cur,
+                actions[:, t],
+                xi,
+                update_rms=False,
+            )
+            l_s, last_metrics = self.task.world_model_state_loss(
+                s_cur,
+                next_states[:, t],
+                self.joint_weights,
+                obj_loss_weight=self.cfg.wm_obj_loss_weight,
+            )
+            l_c = F.binary_cross_entropy_with_logits(c_logits, contacts[:, t])
+            loss_state_sum = loss_state_sum + l_s
+            loss_contact_sum = loss_contact_sum + l_c
+
+        denom_k = float(eff_k)
+        total_loss = (loss_state_sum + self.cfg.wm_contact_loss_weight * loss_contact_sum) / denom_k
+        c_avg = (loss_contact_sum / denom_k).detach()
+        return (
+            total_loss,
+            c_avg,
+            last_metrics["wm/loss_robot"],
+            last_metrics["wm/loss_obj"],
+            last_metrics["wm/pos_err_mm"],
+            last_metrics["wm/obj_err_mm"],
+        )
+
     def update_world_model(self) -> dict[str, float]:
         if self.replay.size < 2:
             return {}
@@ -467,30 +564,15 @@ class SuperMimicTrainer:
                 s_prev_seq = torch.cat([batch.s_init.unsqueeze(1), batch.next_states[:, :-1]], dim=1)
                 true_deltas = self.task.compute_state_delta(s_prev_seq, batch.next_states)
                 self._raw_world_model.delta_rms.update(true_deltas)
-            s_cur = batch.s_init
-            loss_state_sum = torch.zeros((), dtype=torch.float32, device=self.device)
-            loss_contact_sum = torch.zeros((), dtype=torch.float32, device=self.device)
-            last_metrics: dict[str, Tensor] = {}
+                fk_init = self.task.run_fk(batch.s_init, with_quat=False)
+                sf_init = self.task.state_features(batch.s_init, fk_res=fk_init)
+                self._raw_world_model.feat_rms.update(sf_init)
+                self._raw_world_model.xi_rms.update(batch.xi)
 
-            for t in range(eff_k):
-                s_cur, c_logits = self._raw_world_model.step(
-                    self.task,
-                    s_cur,
-                    batch.actions[:, t],
-                    batch.xi,
-                    update_rms=(t == 0),
-                )
-                l_s, last_metrics = self.task.world_model_state_loss(
-                    s_cur,
-                    batch.next_states[:, t],
-                    self.joint_weights,
-                    obj_loss_weight=self.cfg.wm_obj_loss_weight,
-                )
-                l_c = F.binary_cross_entropy_with_logits(c_logits, batch.contacts[:, t])
-                loss_state_sum = loss_state_sum + l_s
-                loss_contact_sum = loss_contact_sum + l_c
-
-            total_loss = (loss_state_sum + self.cfg.wm_contact_loss_weight * loss_contact_sum) / float(eff_k)
+            loss_fn = self._wm_loss_fn if eff_k == k_req else self._wm_window_loss_core
+            total_loss, c_avg, l_rob, l_obj, pos_mm, obj_mm = loss_fn(
+                batch.s_init, batch.actions, batch.next_states, batch.contacts, batch.xi
+            )
 
             self.wm_opt.zero_grad(set_to_none=True)
             total_loss.backward()
@@ -499,12 +581,14 @@ class SuperMimicTrainer:
                 self.wm_opt.step()
 
             actual_updates += 1
-            agg_tensors["wm/total_loss"] = agg_tensors.get(
-                "wm/total_loss", torch.zeros_like(total_loss)
-            ) + total_loss.detach()
-            c_avg = (loss_contact_sum / float(eff_k)).detach()
-            agg_tensors["wm/contact_bce"] = agg_tensors.get("wm/contact_bce", torch.zeros_like(c_avg)) + c_avg
-            for key, val in last_metrics.items():
+            for key, val in (
+                ("wm/total_loss", total_loss.detach()),
+                ("wm/contact_bce", c_avg),
+                ("wm/loss_robot", l_rob),
+                ("wm/loss_obj", l_obj),
+                ("wm/pos_err_mm", pos_mm),
+                ("wm/obj_err_mm", obj_mm),
+            ):
                 agg_tensors[key] = agg_tensors.get(key, torch.zeros_like(val)) + val
 
         if actual_updates == 0:
@@ -549,6 +633,215 @@ class SuperMimicTrainer:
     # Phase 4: 32-Step Differentiable World-Model BPTT (+ Tracker BC)
     # ------------------------------------------------------------------
 
+    def _img_step_core(
+        self,
+        s_cur: Tensor,
+        prev_a: Tensor,
+        fk_tpos: Tensor,
+        fk_tmat: Tensor,
+        fk_tvel: Tensor,
+        fk_tang: Tensor,
+        fk_cpos: Tensor,
+        fk_cvel: Tensor,
+        fk_aquat: Tensor,
+        fk_rmat: Tensor,
+        prev_res: Tensor,
+        step0_flag: Tensor,
+        feet_air_cur: Tensor,
+        prev_feet_gnd: Tensor,
+        t_cur: Tensor,
+        xi: Tensor,
+        ref_jpos: Tensor,
+        ref_jvel: Tensor,
+        ref_bpos: Tensor,
+        ref_bquat: Tensor,
+        ref_brot: Tensor | None,
+        ref_bv: Tensor,
+        ref_bw: Tensor,
+        ref_opos: Tensor,
+        ref_oquat: Tensor,
+        ref_ov: Tensor,
+        ref_ow: Tensor,
+        ref_contact: Tensor,
+        ref_o2b_pos: Tensor | None,
+        ref_o2b_rot: Tensor | None,
+        ref_anc_pg_z: Tensor | None,
+        fut_jpos: Tensor,
+        fut_jvel: Tensor,
+        fut_anc_pos: Tensor,
+        fut_anc_quat: Tensor,
+        fut_obj_pos: Tensor,
+        fut_obj_quat: Tensor,
+        fut_obj_v: Tensor,
+        fut_obj_w: Tensor,
+        hist_ang: Tensor | None = None,
+        hist_q: Tensor | None = None,
+        hist_qd: Tensor | None = None,
+        hist_act: Tensor | None = None,
+        hist_grav: Tensor | None = None,
+        t_fut_jpos: Tensor | None = None,
+        t_fut_jvel: Tensor | None = None,
+        t_fut_anc_pos: Tensor | None = None,
+        t_fut_anc_quat: Tensor | None = None,
+        t_fut_obj_pos: Tensor | None = None,
+        t_fut_obj_quat: Tensor | None = None,
+        t_fut_obj_v: Tensor | None = None,
+        t_fut_obj_w: Tensor | None = None,
+    ) -> tuple[Any, ...]:
+        """Single branchless 50Hz imagination step (policy + WM + FK + reward), ready for torch.compile."""
+        anc_i = self.fk.anchor_tracked_idx
+        fk_cur = FKResult(
+            tracked_pos_w=fk_tpos,
+            tracked_rotmat_w=fk_tmat,
+            tracked_quat_w=None,
+            tracked_lin_vel_w=fk_tvel,
+            tracked_ang_vel_w=fk_tang,
+            contact_pos_w=fk_cpos,
+            contact_lin_vel_w=fk_cvel,
+            anchor_pos_w=fk_tpos[:, anc_i],
+            anchor_quat_w=fk_aquat,
+            anchor_rotmat_w=fk_tmat[:, anc_i],
+            anchor_lin_vel_w=fk_tvel[:, anc_i],
+            anchor_ang_vel_w=fk_tang[:, anc_i],
+            root_rotmat_w=fk_rmat,
+        )
+        ref_cur = RefFrame(
+            joint_pos=ref_jpos,
+            joint_vel=ref_jvel,
+            body_pos_w=ref_bpos,
+            body_quat_w=ref_bquat,
+            body_lin_vel_w=ref_bv,
+            body_ang_vel_w=ref_bw,
+            obj_pos_w=ref_opos,
+            obj_quat_w=ref_oquat,
+            obj_lin_vel_w=ref_ov,
+            obj_ang_vel_w=ref_ow,
+            contact_label=ref_contact,
+            body_rotmat_w=ref_brot,
+            o2b_pos_ref=ref_o2b_pos,
+            o2b_rotmat_ref=ref_o2b_rot,
+            anc_pg_z_ref=ref_anc_pg_z,
+        )
+        ref_fut_cur = RefFutureWindow(
+            joint_pos=fut_jpos,
+            joint_vel=fut_jvel,
+            anchor_pos_w=fut_anc_pos,
+            anchor_quat_w=fut_anc_quat,
+            obj_pos_w=fut_obj_pos,
+            obj_quat_w=fut_obj_quat,
+            obj_lin_vel_w=fut_obj_v,
+            obj_ang_vel_w=fut_obj_w,
+        )
+
+        is_tracker = self.stage == "tracker"
+        if is_tracker:
+            hist_cur = TrackerHistoryState(
+                base_ang_vel=hist_ang,
+                joint_pos_rel=hist_q,
+                joint_vel_rel=hist_qd,
+                actions=hist_act,
+                project_gravity=hist_grav,
+            )
+            cmd_36 = ref_cur.tracker_command_36()
+            obs_pol = self.task.build_tracker_obs(
+                s_cur, cmd_36, hist_cur, fk_res=fk_cur, add_noise=True
+            )
+        else:
+            obs_pol = self.task.build_privileged_obs(
+                s_cur, prev_a, ref_fut_cur, fk_res=fk_cur, xi=xi
+            )
+
+        a_mean, res_cur = self._raw_policy.forward_mean_and_residual(obs_pol, update_rms=False)
+        a_cur = a_mean
+
+        if self.teacher_policy is not None:
+            t_fut_win = (
+                RefFutureWindow(
+                    joint_pos=t_fut_jpos,
+                    joint_vel=t_fut_jvel,
+                    anchor_pos_w=t_fut_anc_pos,
+                    anchor_quat_w=t_fut_anc_quat,
+                    obj_pos_w=t_fut_obj_pos,
+                    obj_quat_w=t_fut_obj_quat,
+                    obj_lin_vel_w=t_fut_obj_v,
+                    obj_ang_vel_w=t_fut_obj_w,
+                )
+                if t_fut_jpos is not None
+                else ref_fut_cur
+            )
+            with torch.no_grad():
+                obs_teacher = self.task.build_privileged_obs(
+                    s_cur, prev_a, t_fut_win, fk_res=fk_cur, xi=xi
+                )
+                a_teacher = self.teacher_policy.act_inference(obs_teacher)
+            step_bc = ((a_mean - a_teacher) ** 2).mean(dim=-1)
+        else:
+            step_bc = self._zero_scalar
+
+        step_res_rate = ((res_cur - prev_res) ** 2).sum(dim=-1) * (1.0 - step0_flag)
+        next_prev_res = res_cur * (1.0 - step0_flag) + res_cur.detach() * step0_flag
+
+        s_next, c_logits = self._raw_world_model.step(
+            self.task, s_cur, a_cur, xi, fk_res=fk_cur, update_rms=False
+        )
+        fk_next = self.task.run_fk(s_next, with_quat=False)
+
+        r_step, p_term, r_info = self.task.compute_reward_and_termination(
+            s_prev=s_cur,
+            s_next=s_next,
+            raw_action=a_cur,
+            prev_raw_action=prev_a,
+            ref_cur=ref_cur,
+            contact_logits=c_logits,
+            fk_next=fk_next,
+            xi=xi,
+            feet_air_time=feet_air_cur,
+            prev_feet_gnd=prev_feet_gnd,
+            time_steps=t_cur,
+            imagination_shaping=True,
+        )
+
+        if is_tracker:
+            hist_next = self.task.advance_tracker_history(hist_cur, s_next, a_cur, xi=xi)
+            h_ang_n: Tensor | None = hist_next.base_ang_vel
+            h_q_n: Tensor | None = hist_next.joint_pos_rel
+            h_qd_n: Tensor | None = hist_next.joint_vel_rel
+            h_act_n: Tensor | None = hist_next.actions
+            h_grav_n: Tensor | None = hist_next.project_gravity
+        else:
+            h_ang_n = h_q_n = h_qd_n = h_act_n = h_grav_n = None
+
+        alpha = self.cfg.bptt_grad_decay
+        s_next_scaled = s_next * alpha + s_next.detach() * (1.0 - alpha)
+        fk_next_scaled = fk_next.scale_grad(alpha, anc_i)
+
+        return (
+            s_next,
+            s_next_scaled,
+            fk_next_scaled.tracked_pos_w,
+            fk_next_scaled.tracked_rotmat_w,
+            fk_next_scaled.tracked_lin_vel_w,
+            fk_next_scaled.tracked_ang_vel_w,
+            fk_next_scaled.contact_pos_w,
+            fk_next_scaled.contact_lin_vel_w,
+            fk_next_scaled.anchor_quat_w,
+            fk_next_scaled.root_rotmat_w,
+            a_cur,
+            next_prev_res,
+            r_info["next_feet_air_time"],
+            r_info["curr_feet_gnd"],
+            r_step,
+            p_term,
+            step_bc,
+            step_res_rate,
+            r_info["rew/tracking_obj"].mean(),
+            h_ang_n,
+            h_q_n,
+            h_qd_n,
+            h_act_n,
+            h_grav_n,
+        )
+
     def update_policy(self, iteration: int) -> dict[str, float]:
         if self.replay.size < 2:
             return {}
@@ -565,9 +858,10 @@ class SuperMimicTrainer:
 
         is_tracker = self.stage == "tracker"
         bc_coef = self.current_bc_coef(iteration)
-        H = 1 if warmup_only else self.cfg.imagination_horizon
+        H = self.cfg.imagination_horizon
+        K = self.bridge.motion_ref.future_frames
         v_min, v_max = self.cfg.value_clip_range
-        alpha = self.cfg.bptt_grad_decay
+        has_slice_api = hasattr(self.bridge.motion_ref, "get_imagination_slice")
 
         ret_accum = torch.zeros((), dtype=torch.float32, device=self.device)
         bc_accum = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -588,7 +882,7 @@ class SuperMimicTrainer:
                 t_0 = starts.time_steps
                 xi = starts.xi
                 feet_air_cur = starts.feet_air_time
-                prev_feet_gnd: Tensor | None = None
+                prev_feet_gnd = (feet_air_cur <= 1e-4).float()
 
                 hist_cur = (
                     self.task.init_tracker_history_from_states(
@@ -597,127 +891,304 @@ class SuperMimicTrainer:
                     if is_tracker
                     else None
                 )
-                # Compute initial FK once outside the horizon loop; reuse `fk_next` across steps
-                fk_cur = self.task.run_fk(s_cur)
+                fk_cur = self.task.run_fk(s_cur, with_quat=False)
+
+                if warmup_only:
+                    # Pure 1-step Teacher BC during early WM warmup iterations
+                    ref0 = self.bridge.motion_ref.get_frame(m_ids, t_0)
+                    obs_pol = self.task.build_tracker_obs(
+                        s_cur, ref0.tracker_command_36(), hist_cur, fk_res=fk_cur, add_noise=True
+                    )
+                    a_mean, _ = self._raw_policy.forward_mean_and_residual(obs_pol, update_rms=False)
+                    t_ref_adapter = self.bridge.teacher_motion_ref or self.bridge.motion_ref
+                    t_fut = t_ref_adapter.get_future_window(m_ids, t_0)
+                    with torch.no_grad():
+                        obs_teacher = self.task.build_privileged_obs(
+                            s_cur, prev_a, t_fut, fk_res=fk_cur, xi=xi
+                        )
+                        a_teacher = self.teacher_policy.act_inference(obs_teacher)
+                    bc_term = ((a_mean - a_teacher) ** 2).mean()
+                    policy_loss = bc_term
+                    self.policy_opt.zero_grad(set_to_none=True)
+                    policy_loss.backward()
+                    if self.cfg.grad_value_clip > 0.0:
+                        nn.utils.clip_grad_value_(self._raw_policy.parameters(), self.cfg.grad_value_clip)
+                    grad_norm = nn.utils.clip_grad_norm_(self._raw_policy.parameters(), self.cfg.max_grad_norm)
+                    if torch.isfinite(grad_norm):
+                        self.policy_opt.step()
+                    bc_accum = bc_accum + bc_term.detach()
+                    surv_accum = surv_accum + 1.0
+                    continue
+
+                if has_slice_api:
+                    ref_slice = self.bridge.motion_ref.get_imagination_slice(
+                        m_ids, t_0, H, need_ref_cur=True
+                    )
+                    done_taus = set(
+                        torch.nonzero(ref_slice.traj_done.any(dim=0), as_tuple=False).flatten().tolist()
+                    )
+                    t_slice = None
+                    if self.teacher_policy is not None:
+                        t_ref_adapter = self.bridge.teacher_motion_ref or self.bridge.motion_ref
+                        if t_ref_adapter is not self.bridge.motion_ref:
+                            t_slice = t_ref_adapter.get_imagination_slice(
+                                m_ids, t_0, H, need_ref_cur=False
+                            )
+                else:
+                    ref_slice = None
+                    t_slice = None
+                    done_taus = set()
 
                 imagined_return = torch.zeros(B, dtype=torch.float32, device=self.device)
                 bc_loss_sum = torch.zeros((), dtype=torch.float32, device=self.device)
                 res_smooth_sum = torch.zeros((), dtype=torch.float32, device=self.device)
                 discount_weight = torch.ones(B, dtype=torch.float32, device=self.device)
                 step_obj_rew_sum = torch.zeros((), dtype=torch.float32, device=self.device)
-                prev_res: Tensor | None = None
+                prev_res = torch.zeros_like(prev_a)
+
+                fk_tpos = fk_cur.tracked_pos_w
+                fk_tmat = fk_cur.tracked_rotmat_w
+                fk_tvel = fk_cur.tracked_lin_vel_w
+                fk_tang = fk_cur.tracked_ang_vel_w
+                fk_cpos = fk_cur.contact_pos_w
+                fk_cvel = fk_cur.contact_lin_vel_w
+                fk_aquat = fk_cur.anchor_quat_w
+                fk_rmat = fk_cur.root_rotmat_w
+
+                h_ang = hist_cur.base_ang_vel if hist_cur is not None else None
+                h_q = hist_cur.joint_pos_rel if hist_cur is not None else None
+                h_qd = hist_cur.joint_vel_rel if hist_cur is not None else None
+                h_act = hist_cur.actions if hist_cur is not None else None
+                h_grav = hist_cur.project_gravity if hist_cur is not None else None
 
                 for tau in range(H):
                     t_cur = t_0 + tau
-                    ref_cur = self.bridge.motion_ref.get_frame(m_ids, t_cur)
-
-                    if is_tracker:
-                        cmd_36 = ref_cur.tracker_command_36()
-                        obs_pol = self.task.build_tracker_obs(
-                            s_cur, cmd_36, hist_cur, fk_res=fk_cur, add_noise=True
-                        )
+                    if ref_slice is not None:
+                        ref_jpos = ref_slice.fut_joint_pos[:, tau]
+                        ref_jvel = ref_slice.fut_joint_vel[:, tau]
+                        ref_bpos = ref_slice.body_pos_w[:, tau]
+                        ref_bquat = ref_slice.body_quat_w[:, tau]
+                        ref_brot = ref_slice.body_rotmat_w[:, tau] if ref_slice.body_rotmat_w is not None else None
+                        ref_bv = ref_slice.body_lin_vel_w[:, tau]
+                        ref_bw = ref_slice.body_ang_vel_w[:, tau]
+                        ref_opos = ref_slice.fut_obj_pos_w[:, tau]
+                        ref_oquat = ref_slice.fut_obj_quat_w[:, tau]
+                        ref_ov = ref_slice.fut_obj_lin_vel_w[:, tau]
+                        ref_ow = ref_slice.fut_obj_ang_vel_w[:, tau]
+                        ref_contact = ref_slice.contact_label[:, tau]
+                        ref_o2b_pos = ref_slice.o2b_pos_ref[:, tau] if ref_slice.o2b_pos_ref is not None else None
+                        ref_o2b_rot = ref_slice.o2b_rotmat_ref[:, tau] if ref_slice.o2b_rotmat_ref is not None else None
+                        ref_anc_pg_z = ref_slice.anc_pg_z_ref[:, tau] if ref_slice.anc_pg_z_ref is not None else None
+                        fut_jpos = ref_slice.fut_joint_pos[:, tau : tau + K]
+                        fut_jvel = ref_slice.fut_joint_vel[:, tau : tau + K]
+                        fut_anc_pos = ref_slice.fut_anchor_pos_w[:, tau : tau + K]
+                        fut_anc_quat = ref_slice.fut_anchor_quat_w[:, tau : tau + K]
+                        fut_obj_pos = ref_slice.fut_obj_pos_w[:, tau : tau + K]
+                        fut_obj_quat = ref_slice.fut_obj_quat_w[:, tau : tau + K]
+                        fut_obj_v = ref_slice.fut_obj_lin_vel_w[:, tau : tau + K]
+                        fut_obj_w = ref_slice.fut_obj_ang_vel_w[:, tau : tau + K]
                     else:
-                        ref_fut_cur = self.bridge.motion_ref.get_future_window(m_ids, t_cur)
-                        obs_pol = self.task.build_privileged_obs(
-                            s_cur, prev_a, ref_fut_cur, fk_res=fk_cur, xi=xi
-                        )
+                        rc = self.bridge.motion_ref.get_frame(m_ids, t_cur)
+                        rf = self.bridge.motion_ref.get_future_window(m_ids, t_cur)
+                        ref_jpos, ref_jvel = rc.joint_pos, rc.joint_vel
+                        ref_bpos, ref_bquat, ref_brot = rc.body_pos_w, rc.body_quat_w, rc.body_rotmat_w
+                        ref_bv, ref_bw = rc.body_lin_vel_w, rc.body_ang_vel_w
+                        ref_opos, ref_oquat, ref_ov, ref_ow = rc.obj_pos_w, rc.obj_quat_w, rc.obj_lin_vel_w, rc.obj_ang_vel_w
+                        ref_contact = rc.contact_label
+                        ref_o2b_pos, ref_o2b_rot, ref_anc_pg_z = rc.o2b_pos_ref, rc.o2b_rotmat_ref, rc.anc_pg_z_ref
+                        fut_jpos, fut_jvel = rf.joint_pos, rf.joint_vel
+                        fut_anc_pos, fut_anc_quat = rf.anchor_pos_w, rf.anchor_quat_w
+                        fut_obj_pos, fut_obj_quat = rf.obj_pos_w, rf.obj_quat_w
+                        fut_obj_v, fut_obj_w = rf.obj_lin_vel_w, rf.obj_ang_vel_w
 
-                    # Deterministic 32-step imagination rollout (prevents 50Hz white-noise chattering)
-                    a_mean, res_cur = self._raw_policy.forward_mean_and_residual(obs_pol, update_rms=False)
-                    a_cur = a_mean
+                    if t_slice is not None:
+                        t_fut_jpos = t_slice.fut_joint_pos[:, tau : tau + K]
+                        t_fut_jvel = t_slice.fut_joint_vel[:, tau : tau + K]
+                        t_fut_anc_pos = t_slice.fut_anchor_pos_w[:, tau : tau + K]
+                        t_fut_anc_quat = t_slice.fut_anchor_quat_w[:, tau : tau + K]
+                        t_fut_obj_pos = t_slice.fut_obj_pos_w[:, tau : tau + K]
+                        t_fut_obj_quat = t_slice.fut_obj_quat_w[:, tau : tau + K]
+                        t_fut_obj_v = t_slice.fut_obj_lin_vel_w[:, tau : tau + K]
+                        t_fut_obj_w = t_slice.fut_obj_ang_vel_w[:, tau : tau + K]
+                    else:
+                        t_fut_jpos = t_fut_jvel = t_fut_anc_pos = t_fut_anc_quat = None
+                        t_fut_obj_pos = t_fut_obj_quat = t_fut_obj_v = t_fut_obj_w = None
 
-                    # Stage 2 Teacher Distillation in Imagination (SuperMimic Refiner -> SuperMimic Tracker)
+                    step0_flag = self._one_scalar if tau == 0 else self._zero_scalar
+                    (
+                        s_next_raw,
+                        s_cur,
+                        fk_tpos,
+                        fk_tmat,
+                        fk_tvel,
+                        fk_tang,
+                        fk_cpos,
+                        fk_cvel,
+                        fk_aquat,
+                        fk_rmat,
+                        prev_a,
+                        prev_res,
+                        feet_air_cur,
+                        prev_feet_gnd,
+                        r_step,
+                        p_term,
+                        step_bc,
+                        step_res_rate,
+                        step_obj_rew,
+                        h_ang,
+                        h_q,
+                        h_qd,
+                        h_act,
+                        h_grav,
+                    ) = self._img_step_fn(
+                        s_cur,
+                        prev_a,
+                        fk_tpos,
+                        fk_tmat,
+                        fk_tvel,
+                        fk_tang,
+                        fk_cpos,
+                        fk_cvel,
+                        fk_aquat,
+                        fk_rmat,
+                        prev_res,
+                        step0_flag,
+                        feet_air_cur,
+                        prev_feet_gnd,
+                        t_cur,
+                        xi,
+                        ref_jpos,
+                        ref_jvel,
+                        ref_bpos,
+                        ref_bquat,
+                        ref_brot,
+                        ref_bv,
+                        ref_bw,
+                        ref_opos,
+                        ref_oquat,
+                        ref_ov,
+                        ref_ow,
+                        ref_contact,
+                        ref_o2b_pos,
+                        ref_o2b_rot,
+                        ref_anc_pg_z,
+                        fut_jpos,
+                        fut_jvel,
+                        fut_anc_pos,
+                        fut_anc_quat,
+                        fut_obj_pos,
+                        fut_obj_quat,
+                        fut_obj_v,
+                        fut_obj_w,
+                        h_ang,
+                        h_q,
+                        h_qd,
+                        h_act,
+                        h_grav,
+                        t_fut_jpos,
+                        t_fut_jvel,
+                        t_fut_anc_pos,
+                        t_fut_anc_quat,
+                        t_fut_obj_pos,
+                        t_fut_obj_quat,
+                        t_fut_obj_v,
+                        t_fut_obj_w,
+                    )
+
                     if self.teacher_policy is not None:
-                        t_ref_adapter = self.bridge.teacher_motion_ref or self.bridge.motion_ref
-                        teacher_fut = t_ref_adapter.get_future_window(m_ids, t_cur)
-                        with torch.no_grad():
-                            obs_teacher = self.task.build_privileged_obs(
-                                s_cur, prev_a, teacher_fut, fk_res=fk_cur, xi=xi
-                            )
-                            a_teacher = self.teacher_policy.act_inference(obs_teacher)
-                        step_bc = ((a_mean - a_teacher) ** 2).mean(dim=-1)
                         bc_loss_sum = bc_loss_sum + (discount_weight.detach() * step_bc).mean()
-
-                    if warmup_only:
-                        break
-
-                    if prev_res is None:
-                        prev_res = res_cur.detach()
-                    else:
-                        step_res_rate = ((res_cur - prev_res) ** 2).sum(dim=-1)
-                        res_smooth_sum = res_smooth_sum + (discount_weight.detach() * step_res_rate).mean()
-                        prev_res = res_cur
-
-                    # Differentiable 1-step human-object rollout
-                    s_next, c_logits = self._raw_world_model.step(
-                        self.task, s_cur, a_cur, xi, fk_res=fk_cur, update_rms=False
-                    )
-                    fk_next = self.task.run_fk(s_next)
-
-                    # Evaluate `s_next` against `ref_cur = ref[t_cur]` (exact SUGAR post-step reward/term order)
-                    r_step, p_term, r_info = self.task.compute_reward_and_termination(
-                        s_prev=s_cur,
-                        s_next=s_next,
-                        raw_action=a_cur,
-                        prev_raw_action=prev_a,
-                        ref_cur=ref_cur,
-                        contact_logits=c_logits,
-                        fk_next=fk_next,
-                        xi=xi,
-                        feet_air_time=feet_air_cur,
-                        prev_feet_gnd=prev_feet_gnd,
-                        time_steps=t_cur,
-                        imagination_shaping=True,
-                    )
-                    step_obj_rew_sum = step_obj_rew_sum + r_info["rew/tracking_obj"].mean()
-                    feet_air_cur = r_info["next_feet_air_time"]
-                    prev_feet_gnd = r_info["curr_feet_gnd"]
-
-                    t_next = t_cur + 1
-                    traj_done = self.bridge.motion_ref.is_done(m_ids, t_next)
+                    res_smooth_sum = res_smooth_sum + (discount_weight.detach() * step_res_rate).mean()
+                    step_obj_rew_sum = step_obj_rew_sum + step_obj_rew
                     imagined_return = imagined_return + discount_weight * r_step
 
-                    # If reference clip finishes naturally (`t_cur + 1 >= len`), value-clipped bootstrap
-                    if traj_done.any():
-                        ref_fut_done = self.bridge.motion_ref.get_future_window(m_ids, t_next)
-                        obs_crit_done = self.task.build_privileged_obs(
-                            s_next, a_cur, ref_fut_done, fk_res=fk_next, xi=xi
-                        )
-                        v_done = self.critic(obs_crit_done, update_rms=False, pessimistic=True).clamp(v_min, v_max)
-                        imagined_return = (
-                            imagined_return
-                            + discount_weight * self.cfg.gamma * (1.0 - p_term) * v_done * traj_done.float()
+                    if ref_slice is not None:
+                        if tau in done_taus:
+                            traj_done = ref_slice.traj_done[:, tau]
+                            ref_fut_done = RefFutureWindow(
+                                joint_pos=ref_slice.fut_joint_pos[:, tau + 1 : tau + 1 + K],
+                                joint_vel=ref_slice.fut_joint_vel[:, tau + 1 : tau + 1 + K],
+                                anchor_pos_w=ref_slice.fut_anchor_pos_w[:, tau + 1 : tau + 1 + K],
+                                anchor_quat_w=ref_slice.fut_anchor_quat_w[:, tau + 1 : tau + 1 + K],
+                                obj_pos_w=ref_slice.fut_obj_pos_w[:, tau + 1 : tau + 1 + K],
+                                obj_quat_w=ref_slice.fut_obj_quat_w[:, tau + 1 : tau + 1 + K],
+                                obj_lin_vel_w=ref_slice.fut_obj_lin_vel_w[:, tau + 1 : tau + 1 + K],
+                                obj_ang_vel_w=ref_slice.fut_obj_ang_vel_w[:, tau + 1 : tau + 1 + K],
+                            )
+                            fk_done = self.task.run_fk(s_next_raw, with_quat=False)
+                            obs_crit_done = self.task.build_privileged_obs(
+                                s_next_raw, prev_a, ref_fut_done, fk_res=fk_done, xi=xi
+                            )
+                            v_done = self.critic(obs_crit_done, update_rms=False, pessimistic=True).clamp(v_min, v_max)
+                            imagined_return = (
+                                imagined_return
+                                + discount_weight * self.cfg.gamma * (1.0 - p_term) * v_done * traj_done.float()
+                            )
+                            discount_weight = (
+                                discount_weight
+                                * self.cfg.gamma
+                                * (1.0 - p_term)
+                                * (~traj_done).float()
+                            )
+                        else:
+                            discount_weight = discount_weight * self.cfg.gamma * (1.0 - p_term)
+                    else:
+                        t_next = t_cur + 1
+                        traj_done = self.bridge.motion_ref.is_done(m_ids, t_next)
+                        if traj_done.any():
+                            ref_fut_done = self.bridge.motion_ref.get_future_window(m_ids, t_next)
+                            fk_done = self.task.run_fk(s_next_raw, with_quat=False)
+                            obs_crit_done = self.task.build_privileged_obs(
+                                s_next_raw, prev_a, ref_fut_done, fk_res=fk_done, xi=xi
+                            )
+                            v_done = self.critic(obs_crit_done, update_rms=False, pessimistic=True).clamp(v_min, v_max)
+                            imagined_return = (
+                                imagined_return
+                                + discount_weight * self.cfg.gamma * (1.0 - p_term) * v_done * traj_done.float()
+                            )
+                        discount_weight = (
+                            discount_weight
+                            * self.cfg.gamma
+                            * (1.0 - p_term)
+                            * (~traj_done).float()
                         )
 
-                    discount_weight = (
-                        discount_weight
-                        * self.cfg.gamma
-                        * (1.0 - p_term)
-                        * (~traj_done).float()
+                # Value-clipped tail bootstrap V(s_H) via frozen ensemble Critic
+                anc_i = self.fk.anchor_tracked_idx
+                fk_tail = FKResult(
+                    tracked_pos_w=fk_tpos,
+                    tracked_rotmat_w=fk_tmat,
+                    tracked_quat_w=None,
+                    tracked_lin_vel_w=fk_tvel,
+                    tracked_ang_vel_w=fk_tang,
+                    contact_pos_w=fk_cpos,
+                    contact_lin_vel_w=fk_cvel,
+                    anchor_pos_w=fk_tpos[:, anc_i],
+                    anchor_quat_w=fk_aquat,
+                    anchor_rotmat_w=fk_tmat[:, anc_i],
+                    anchor_lin_vel_w=fk_tvel[:, anc_i],
+                    anchor_ang_vel_w=fk_tang[:, anc_i],
+                    root_rotmat_w=fk_rmat,
+                )
+                if ref_slice is not None:
+                    ref_fut_tail = RefFutureWindow(
+                        joint_pos=ref_slice.fut_joint_pos[:, H : H + K],
+                        joint_vel=ref_slice.fut_joint_vel[:, H : H + K],
+                        anchor_pos_w=ref_slice.fut_anchor_pos_w[:, H : H + K],
+                        anchor_quat_w=ref_slice.fut_anchor_quat_w[:, H : H + K],
+                        obj_pos_w=ref_slice.fut_obj_pos_w[:, H : H + K],
+                        obj_quat_w=ref_slice.fut_obj_quat_w[:, H : H + K],
+                        obj_lin_vel_w=ref_slice.fut_obj_lin_vel_w[:, H : H + K],
+                        obj_ang_vel_w=ref_slice.fut_obj_ang_vel_w[:, H : H + K],
                     )
-
-                    if is_tracker:
-                        hist_cur = self.task.advance_tracker_history(hist_cur, s_next, a_cur, xi=xi)
-
-                    # Mild Jacobian decay across 32 steps prevents exploding gradients (mathematically identical FK reuse)
-                    s_cur = s_next * alpha + s_next.detach() * (1.0 - alpha)
-                    fk_cur = fk_next.scale_grad(alpha, self.fk.anchor_tracked_idx)
-                    prev_a = a_cur
-
-                if not warmup_only:
-                    # Value-clipped tail bootstrap V(s_H) via frozen ensemble Critic
+                else:
                     ref_fut_tail = self.bridge.motion_ref.get_future_window(m_ids, t_0 + H)
-                    obs_tail = self.task.build_privileged_obs(s_cur, prev_a, ref_fut_tail, fk_res=fk_cur, xi=xi)
-                    v_tail = self.critic(obs_tail, update_rms=False, pessimistic=True).clamp(v_min, v_max)
-                    imagined_return = imagined_return + discount_weight * v_tail
+                obs_tail = self.task.build_privileged_obs(s_cur, prev_a, ref_fut_tail, fk_res=fk_tail, xi=xi)
+                v_tail = self.critic(obs_tail, update_rms=False, pessimistic=True).clamp(v_min, v_max)
+                imagined_return = imagined_return + discount_weight * v_tail
 
                 bc_term = bc_loss_sum / float(H)
                 res_rate_loss = self.cfg.residual_rate_weight * self.task.step_dt * res_smooth_sum
-
-                if warmup_only:
-                    policy_loss = bc_term
-                else:
-                    policy_loss = -imagined_return.mean() + bc_coef * bc_term + res_rate_loss
+                policy_loss = -imagined_return.mean() + bc_coef * bc_term + res_rate_loss
 
                 self.policy_opt.zero_grad(set_to_none=True)
                 policy_loss.backward()
