@@ -68,13 +68,14 @@ class SuperMimicTrainCfg:
     init_noise_std: float = 0.20
     leg_explore_std_init: float = 0.12
     arm_explore_std_init: float = 0.30
+    explore_std_scale: float = 1.0                   # Global multiplier (<1.0 for low-noise fine-tuning)
     explore_std_final_scale: float = 0.25
     imagination_horizon: int = 32                    # H=32 step differentiable imagination rollout
     policy_updates_per_iter: int = 8
     policy_batch_size: int = 2048
     frontier_sample_frac: float = 0.40               # 40% imagination starts prioritize highest reached trajectory steps
-    residual_rate_weight: float = 0.15               # Smoothness penalty on 1st-order residual rate (dampens oscillation)
-    residual_jerk_weight: float = 0.10               # 2nd-order residual jerk penalty (suppresses 25Hz sawtooth chatter)
+    residual_rate_weight: float = 0.22               # Smoothness penalty on 1st-order residual rate (dampens oscillation)
+    residual_jerk_weight: float = 0.25               # 2nd-order residual jerk penalty (suppresses high-freq chatter)
     policy_lr: float = 3e-4
     lr_min_scale: float = 0.15                       # Cosine LR decay floor multiplier
     bptt_grad_decay: float = 0.98                    # Mild state Jacobian damping across 32 steps for stability
@@ -257,7 +258,10 @@ class SuperMimicTrainer:
             else self.cfg.arm_explore_std_init
             for n in self.fk.env_joint_names
         ]
-        self._explore_std_base = torch.tensor(explore_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        self._explore_std_base = (
+            torch.tensor(explore_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+            * float(self.cfg.explore_std_scale)
+        )
 
         self.world_model: nn.Module = self._raw_world_model
         self.policy: nn.Module = self._raw_policy
@@ -1273,7 +1277,9 @@ class SuperMimicTrainer:
         torch.save(payload, tmp_path)
         os.replace(tmp_path, str(path))
 
-    def load_checkpoint(self, path: str | Path) -> int:
+    def load_checkpoint(
+        self, path: str | Path, *, reset_iter: bool = False, load_optimizers: bool = True
+    ) -> int:
         payload = torch.load(str(path), map_location=self.device, weights_only=False)
         raw_pol = _unwrap_compiled(self._raw_policy)
         raw_pol.load_state_dict(
@@ -1283,14 +1289,17 @@ class SuperMimicTrainer:
         _unwrap_compiled(self._raw_world_model).load_state_dict(
             _strip_compiled_prefix(payload["world_model_state_dict"])
         )
-        if "policy_opt_state_dict" in payload:
-            self.policy_opt.load_state_dict(payload["policy_opt_state_dict"])
-        if "critic_opt_state_dict" in payload:
-            self.critic_opt.load_state_dict(payload["critic_opt_state_dict"])
-        if "wm_opt_state_dict" in payload:
-            self.wm_opt.load_state_dict(payload["wm_opt_state_dict"])
+        if load_optimizers:
+            if "policy_opt_state_dict" in payload:
+                self.policy_opt.load_state_dict(payload["policy_opt_state_dict"])
+            if "critic_opt_state_dict" in payload:
+                self.critic_opt.load_state_dict(payload["critic_opt_state_dict"])
+            if "wm_opt_state_dict" in payload:
+                self.wm_opt.load_state_dict(payload["wm_opt_state_dict"])
 
-        if "next_iteration" in payload:
+        if reset_iter:
+            self.current_iter = 0
+        elif "next_iteration" in payload:
             self.current_iter = int(payload["next_iteration"])
         else:
             self.current_iter = int(payload.get("iteration", -1)) + 1

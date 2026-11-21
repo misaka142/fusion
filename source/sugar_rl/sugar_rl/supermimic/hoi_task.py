@@ -852,16 +852,16 @@ class SugarHOITask:
 
         # ---- A. Tracking rewards (exact weights & stds from BaseRewardsCfg) ----
         err_jpos = ((ref_target.joint_pos - q_next) ** 2).sum(dim=-1)
-        r_joint_pos = 0.125 * torch.exp(-err_jpos / (0.6**2))
+        r_joint_pos = 0.20 * torch.exp(-err_jpos / (0.6**2))
 
         err_anc_p = ((ref_anc_pos - fk_next.anchor_pos_w) ** 2).sum(dim=-1)
-        r_anc_pos = 0.25 * torch.exp(-err_anc_p / (0.3**2))
+        r_anc_pos = 0.45 * torch.exp(-err_anc_p / (0.3**2))
 
         err_anc_q = rotmat_error_magnitude(ref_anc_rotmat, fk_next.anchor_rotmat_w) ** 2
         r_anc_ori = 0.25 * torch.exp(-err_anc_q / (0.4**2))
 
         err_bpos = ((body_pos_rel_w - fk_next.tracked_pos_w) ** 2).sum(dim=-1).mean(dim=-1)
-        r_body_pos = 0.25 * torch.exp(-err_bpos / (0.3**2))
+        r_body_pos = 0.45 * torch.exp(-err_bpos / (0.3**2))
 
         err_bori = (rotmat_error_magnitude(body_rotmat_rel_w, fk_next.tracked_rotmat_w) ** 2).mean(dim=-1)
         r_body_ori = 0.25 * torch.exp(-err_bori / (0.4**2))
@@ -972,14 +972,14 @@ class SugarHOITask:
             )
 
         # ---- E. Regularization rewards (action rate, joint limits, joint acc, PD torque) ----
-        r_act_rate = -0.1 * ((raw_action - prev_raw_action) ** 2).sum(dim=-1)
+        r_act_rate = -0.18 * ((raw_action - prev_raw_action) ** 2).sum(dim=-1)
 
         out_low = (self.fk.soft_joint_lower.unsqueeze(0) - q_next).clamp_min(0.0)
         out_high = (q_next - self.fk.soft_joint_upper.unsqueeze(0)).clamp_min(0.0)
         r_jlimit = -10.0 * (out_low + out_high).sum(dim=-1)
 
         qdd_approx = (qd_next - qd_prev) / self.step_dt
-        r_jacc = -2.5e-7 * (qdd_approx**2).sum(dim=-1)
+        r_jacc = -1.0e-6 * (qdd_approx**2).sum(dim=-1)
 
         q_sp = self.raw_action_to_setpoint(raw_action, xi=xi)
         tau_pd = (

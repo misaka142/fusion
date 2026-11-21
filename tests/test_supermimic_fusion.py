@@ -6,6 +6,7 @@ Run standalone without Isaac Sim (requires only `torch` and `numpy`):
 
 from __future__ import annotations
 
+import copy
 import math
 import pathlib
 import sys
@@ -857,7 +858,18 @@ def test_9_timeout_bootstrap_resume_and_compile() -> None:
         act_check = loaded_pol.act_inference(ref_bridge.current_obs_dict["policy"])
         assert act_check.shape == (8, 29) and torch.isfinite(act_check).all()
 
-    print("[PASS] Test 9: Timeout bootstrap safety, value clipping, it+1 resume & torch.compile interop")
+        # Verify warm-start fine-tune mode (`reset_iter=True`, `load_optimizers=False`, `explore_std_scale=0.45`)
+        cfg_ft = copy.deepcopy(cfg_comp)
+        cfg_ft.compile_models = False
+        cfg_ft.explore_std_scale = 0.45
+        cfg_ft.policy_lr = 1e-4
+        trainer_ft = SuperMimicTrainer(ref_bridge, log_dir=tmp / "ft_refiner", cfg=cfg_ft)
+        reset_it = trainer_ft.load_checkpoint(out_ckpt, reset_iter=True, load_optimizers=False)
+        assert reset_it == 0 and trainer_ft.current_iter == 0
+        assert abs(trainer_ft.policy_opt.param_groups[0]["lr"] - 1e-4) < 1e-8
+        assert abs(float(trainer_ft._explore_std_base.max().item()) - 0.30 * 0.45) < 1e-6
+
+    print("[PASS] Test 9: Timeout bootstrap safety, value clipping, it+1/ft-reset resume & torch.compile interop")
 
 
 class _SyntheticGeneratorDataset(torch.utils.data.Dataset):

@@ -124,6 +124,30 @@ parser.add_argument("--policy_hidden", type=str, default="512,256,128", help="Po
 parser.add_argument("--wm_lr", type=float, default=1e-3, help="World model learning rate.")
 parser.add_argument("--policy_lr", type=float, default=3e-4, help="Policy BPTT learning rate.")
 parser.add_argument("--critic_lr", type=float, default=5e-4, help="Critic learning rate.")
+parser.add_argument(
+    "--residual_rate_weight",
+    type=float,
+    default=None,
+    help="Override 1st-order residual rate smoothness weight (defaults to SuperMimicTrainCfg).",
+)
+parser.add_argument(
+    "--residual_jerk_weight",
+    type=float,
+    default=None,
+    help="Override 2nd-order residual jerk smoothness weight (defaults to SuperMimicTrainCfg).",
+)
+parser.add_argument(
+    "--explore_std_scale",
+    type=float,
+    default=1.0,
+    help="Multiplier on initial rollout exploration std (use <1.0 e.g. 0.45 for warm-start fine-tuning).",
+)
+parser.add_argument(
+    "--finetune_reset_iter",
+    action="store_true",
+    default=False,
+    help="When initializing from --resume_ckpt, reset iteration to 0 and start fresh optimizer/LR schedules.",
+)
 parser.add_argument("--bc_coef", type=float, default=1.0, help="Initial Teacher BC weight in Tracker mode.")
 parser.add_argument(
     "--bc_anneal_iters",
@@ -253,6 +277,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
     def _dims(text: str) -> tuple[int, ...]:
         return tuple(int(x) for x in text.split(",") if x.strip())
 
+    default_sm_cfg = SuperMimicTrainCfg()
     sm_cfg = SuperMimicTrainCfg(
         replay_capacity=args_cli.replay_capacity,
         wm_hidden_dims=_dims(args_cli.wm_hidden),
@@ -261,9 +286,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
         wm_batch_size=wm_bs,
         wm_lr=args_cli.wm_lr,
         policy_hidden_dims=_dims(args_cli.policy_hidden),
+        explore_std_scale=args_cli.explore_std_scale,
         imagination_horizon=args_cli.horizon,
         policy_updates_per_iter=args_cli.policy_updates,
         policy_batch_size=pol_bs,
+        residual_rate_weight=(
+            args_cli.residual_rate_weight
+            if args_cli.residual_rate_weight is not None
+            else default_sm_cfg.residual_rate_weight
+        ),
+        residual_jerk_weight=(
+            args_cli.residual_jerk_weight
+            if args_cli.residual_jerk_weight is not None
+            else default_sm_cfg.residual_jerk_weight
+        ),
         policy_lr=args_cli.policy_lr,
         critic_lr=args_cli.critic_lr,
         use_ref_residual=not args_cli.no_ref_residual,
@@ -288,11 +324,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg, _agent_cfg) -> None:
         teacher_ckpt=args_cli.teacher_ckpt,
     )
 
-    if args_cli.resume_ckpt is not None:
-        resumed_it = trainer.load_checkpoint(args_cli.resume_ckpt)
-        print(f"[SuperMimic] Resumed from {args_cli.resume_ckpt} at iteration {resumed_it}")
-    elif args_cli.auto_resume:
-        trainer.auto_resume()
+    resumed_local = trainer.auto_resume() if args_cli.auto_resume else None
+    if resumed_local is None and args_cli.resume_ckpt is not None:
+        reset_ft = bool(args_cli.finetune_reset_iter)
+        resumed_it = trainer.load_checkpoint(
+            args_cli.resume_ckpt, reset_iter=reset_ft, load_optimizers=not reset_ft
+        )
+        mode_tag = "Fine-tuned (iter reset to 0)" if reset_ft else f"Resumed at iteration {resumed_it}"
+        print(f"[SuperMimic] {mode_tag} from {args_cli.resume_ckpt}")
 
     final_ckpt = trainer.learn(max_iterations=args_cli.max_iterations)
     print(f"[SuperMimic] Training complete! Final checkpoint saved at: {final_ckpt}")

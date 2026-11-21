@@ -298,9 +298,9 @@ class BaseRewardsCfg:
     """Reward terms for the MDP."""
 
     # regularization
-    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-1.0e-6)
     joint_torque = RewTerm(func=mdp.joint_torques_l2, weight=-1e-5)
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-1)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.18)
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
@@ -329,12 +329,12 @@ class BaseRewardsCfg:
     # tracking
     motion_joint_pos = RewTerm(
         func=mdp.motion_joint_pos_error_exp,
-        weight=0.125,
+        weight=0.20,
         params={"command_name": "motion", "std": 0.6},
     )
     motion_global_anchor_pos = RewTerm(
         func=mdp.motion_global_anchor_position_error_exp,
-        weight=0.25,
+        weight=0.45,
         params={"command_name": "motion", "std": 0.3},
     )
     motion_global_anchor_ori = RewTerm(
@@ -344,7 +344,7 @@ class BaseRewardsCfg:
     )
     motion_body_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
-        weight=0.25,
+        weight=0.45,
         params={"command_name": "motion", "std": 0.3},
     )
     motion_body_ori = RewTerm(
