@@ -540,20 +540,20 @@ class _MuJoCoHygieneAuditor:
         q_bfs: np.ndarray,
         o_pos: np.ndarray,
         o_quat_wxyz: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Retarget arms from handless DiPLO wrists to flush rubber-palm lower-mid box cradle IK."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Retarget arms from handless DiPLO wrists to symmetric level rubber-palm box cradle IK."""
         T = len(r_pos)
         z0 = float(o_pos[0, 2])
         lifted = np.flatnonzero(o_pos[:, 2] > z0 + 0.010)
         if len(lifted) < 15:
-            return q_bfs.copy(), o_pos.copy()
+            return q_bfs.copy(), o_pos.copy(), o_quat_wxyz.copy()
 
         tg, tp = int(lifted[0]), int(lifted[-1])
         t0_c, t1_c = max(0, tg - 20), min(T - 1, tp + 20)
 
         m, d = self.model, self.data
         arm_bfs, arm_dofs, arm_rng = self.arm_bfs_idx, self.arm_dofs_mj, self.arm_rng
-        torso_z = np.zeros(T, dtype=np.float64)
+        torso_pos = np.zeros((T, 3), dtype=np.float64)
         fwd_seq = np.zeros((T, 3), dtype=np.float64)
         left_seq = np.zeros((T, 3), dtype=np.float64)
         for t in range(T):
@@ -561,7 +561,7 @@ class _MuJoCoHygieneAuditor:
             d.qpos[self.p_adr + 3 : self.p_adr + 7] = r_quat_wxyz[t]
             d.qpos[self.b_adrs] = q_bfs[t]
             mujoco.mj_forward(m, d)
-            torso_z[t] = float(d.xpos[self.torso_id, 2])
+            torso_pos[t] = d.xpos[self.torso_id].copy()
             fwd_seq[t], left_seq[t], _ = self._get_torso_horiz_axes(r_quat_wxyz[t])
 
         lift_frac = np.clip((o_pos[:, 2] - z0) / 0.22, 0.0, 1.0)
@@ -569,18 +569,55 @@ class _MuJoCoHygieneAuditor:
         lift_smooth[: max(1, tg - 3)] = 0.0
         lift_smooth[min(T, tp + 4) :] = 0.0
 
-        desired_dz = np.clip((torso_z - 0.01) - o_pos[:, 2], 0.0, 0.095)
+        # Smoothly level box lateral roll, align horizontal box faces with torso C4, and center laterally
+        R_orig = _quat_to_rotmat(o_quat_wxyz)
+        rotvec_corr = np.zeros((T, 3), dtype=np.float64)
+        lat_corr = np.zeros((T, 2), dtype=np.float64)
+        for t in range(T):
+            Ro = R_orig[t]
+            lw = left_seq[t]
+            u_orig = Ro[:, 2]
+            u_sag = u_orig - float(np.dot(u_orig, lw)) * lw
+            u_sag /= np.linalg.norm(u_sag) + 1e-8
+            axis = np.cross(u_orig, u_sag)
+            sa = float(np.linalg.norm(axis))
+            ca = float(np.clip(np.dot(u_orig, u_sag), -1.0, 1.0))
+            R_lvl = (_rotvec_to_rotmat(axis / sa * np.arctan2(sa, ca)) @ Ro) if sa > 1e-6 else Ro.copy()
+            f_sag = np.cross(lw, u_sag)
+            f_sag /= np.linalg.norm(f_sag) + 1e-8
+            psi = np.arctan2(float(np.dot(R_lvl[:, 0], lw)), float(np.dot(R_lvl[:, 0], f_sag)))
+            dpsi = round(psi / (0.5 * np.pi)) * (0.5 * np.pi) - psi
+            R_sq = _rotvec_to_rotmat(dpsi * u_sag) @ R_lvl
+            rotvec_corr[t] = _rotmat_to_rotvec(R_sq @ Ro.T)
+            y_lat = float(np.dot(o_pos[t, :2] - torso_pos[t, :2], lw[:2]))
+            lat_corr[t] = -0.75 * y_lat * lw[:2]
+
+        rv_smooth = _smooth_savgol_np(rotvec_corr * lift_smooth[:, None], window=17, polyorder=2)
+        rv_smooth[: max(1, tg - 3)] = 0.0
+        rv_smooth[min(T, tp + 4) :] = 0.0
+        o_quat_out = _rotmat_to_quat_wxyz(
+            np.stack([_rotvec_to_rotmat(rv_smooth[t]) @ R_orig[t] for t in range(T)], axis=0)
+        )
+
+        lat_smooth = _smooth_savgol_np(lat_corr * lift_smooth[:, None], window=17, polyorder=2)
+        lat_smooth[: max(1, tg - 3)] = 0.0
+        lat_smooth[min(T, tp + 4) :] = 0.0
+
+        desired_dz = np.clip((torso_pos[:, 2] - 0.01) - o_pos[:, 2], 0.0, 0.095)
         dz_smooth = _smooth_savgol_np((desired_dz * lift_smooth)[:, None], window=15, polyorder=2)[:, 0]
         dz_smooth[: max(1, tg - 3)] = 0.0
         dz_smooth[min(T, tp + 4) :] = 0.0
 
         o_pos_out = o_pos.copy()
         o_pos_out[:, 2] += dz_smooth
-        o_pos_out[:, :2] += (0.028 * lift_smooth)[:, None] * fwd_seq[:, :2]
+        o_pos_out[:, :2] += (0.036 * lift_smooth)[:, None] * fwd_seq[:, :2] + lat_smooth
 
         q_ik = q_bfs.copy()
         jacp = np.zeros((3, m.nv), dtype=np.float64)
         jacr = np.zeros((3, m.nv), dtype=np.float64)
+        jacp_le = np.zeros((3, m.nv), dtype=np.float64)
+        jacp_re = np.zeros((3, m.nv), dtype=np.float64)
+        arm_mir_signs = np.array([1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0], dtype=np.float64)
 
         try:
             for g in range(m.ngeom):
@@ -602,7 +639,7 @@ class _MuJoCoHygieneAuditor:
                 d.qpos[self.p_adr : self.p_adr + 3] = r_pos[t]
                 d.qpos[self.p_adr + 3 : self.p_adr + 7] = r_quat_wxyz[t]
                 d.qpos[self.o_adr : self.o_adr + 3] = o_pos_out[t]
-                d.qpos[self.o_adr + 3 : self.o_adr + 7] = o_quat_wxyz[t]
+                d.qpos[self.o_adr + 3 : self.o_adr + 7] = o_quat_out[t]
                 d.qpos[self.b_adrs] = q_bfs[t]
                 mujoco.mj_forward(m, d)
                 o_R = d.xmat[self.obj_id].reshape(3, 3)
@@ -616,16 +653,26 @@ class _MuJoCoHygieneAuditor:
                 loc_R, nloc_R = self._smooth_rounded_box_surf(dir_R_box[:2], hext_flared, z_tgt)
                 surf_L, norm_L = o_pos_out[t] + o_R @ loc_L, o_R @ nloc_L
                 surf_R, norm_R = o_pos_out[t] + o_R @ loc_R, o_R @ nloc_R
+                z_mid = 0.5 * (surf_L[2] + surf_R[2])
+                surf_L[2] = (1.0 - float(lift_smooth[t])) * surf_L[2] + float(lift_smooth[t]) * z_mid
+                surf_R[2] = (1.0 - float(lift_smooth[t])) * surf_R[2] + float(lift_smooth[t]) * z_mid
                 n_des_L = -norm_L + 0.28 * np.array([0.0, 0.0, 1.0], dtype=np.float64)
                 n_des_L /= np.linalg.norm(n_des_L)
                 n_des_R = -norm_R + 0.28 * np.array([0.0, 0.0, 1.0], dtype=np.float64)
                 n_des_R /= np.linalg.norm(n_des_R)
 
+                q_raw_arm = q_bfs[t, arm_bfs]
+                q_sym_ref = np.concatenate(
+                    [
+                        0.5 * (q_raw_arm[:7] + arm_mir_signs * q_raw_arm[7:]),
+                        0.5 * (arm_mir_signs * q_raw_arm[:7] + q_raw_arm[7:]),
+                    ]
+                )
                 q_seed = q_ik[t - 1].copy() if t > t0_c else q_bfs[t].copy()
                 q_cur = q_bfs[t].copy()
-                q_cur[arm_bfs] = w_ik * q_seed[arm_bfs] + (1.0 - w_ik) * q_bfs[t, arm_bfs]
+                q_cur[arm_bfs] = w_ik * q_seed[arm_bfs] + (1.0 - w_ik) * q_raw_arm
 
-                for _ in range(14):
+                for _ in range(16):
                     d.qpos[self.b_adrs] = q_cur
                     mujoco.mj_forward(m, d)
                     rows_J, rows_e = [], []
@@ -639,13 +686,22 @@ class _MuJoCoHygieneAuditor:
                         jacp.fill(0.0)
                         jacr.fill(0.0)
                         mujoco.mj_jac(m, d, jacp, jacr, p_pw, bid)
-                        rows_J.append(jacp[:, arm_dofs])
-                        rows_e.append(w_ik * (surf_p - p_pw))
+                        rows_J.append(1.5 * jacp[:, arm_dofs])
+                        rows_e.append(1.5 * w_ik * (surf_p - p_pw))
                         f_des = fwd_w - np.dot(fwd_w, n_des) * n_des
                         f_des /= np.linalg.norm(f_des) + 1e-8
                         rot_err = np.cross(n_pw, n_des) + 0.5 * np.cross(Rb[:, 0], f_des)
                         rows_J.append(0.55 * jacr[:, arm_dofs])
                         rows_e.append(0.55 * w_ik * rot_err)
+
+                    # World-Z elbow height equality via arm nullspace (absorbs torso roll during walking)
+                    jacp_le.fill(0.0)
+                    jacp_re.fill(0.0)
+                    jacr.fill(0.0)
+                    mujoco.mj_jac(m, d, jacp_le, jacr, d.xpos[self.le_id], self.le_id)
+                    mujoco.mj_jac(m, d, jacp_re, jacr, d.xpos[self.re_id], self.re_id)
+                    rows_J.append(1.2 * w_ik * (jacp_le[2, arm_dofs] - jacp_re[2, arm_dofs])[None, :])
+                    rows_e.append(np.array([1.2 * w_ik * float(d.xpos[self.re_id, 2] - d.xpos[self.le_id, 2])], dtype=np.float64))
 
                     # Keep 100% unilateral collision repulsion (no w_ik scaling) on approach/release ramps
                     rep_J, rep_e = self._collect_box_repulsion(
@@ -656,8 +712,8 @@ class _MuJoCoHygieneAuditor:
 
                     J = np.vstack(rows_J)
                     e = np.concatenate(rows_e)
-                    q_reg = w_ik * (q_ik[t - 1, arm_bfs] if t > t0_c else q_bfs[t, arm_bfs]) + (1.0 - w_ik) * q_bfs[t, arm_bfs]
-                    dq = np.linalg.solve(J.T @ J + 0.06 * np.eye(14), J.T @ e + 0.05 * (q_reg - q_cur[arm_bfs]))
+                    q_reg = w_ik * (q_ik[t - 1, arm_bfs] if t > t0_c else q_sym_ref) + (1.0 - w_ik) * q_raw_arm
+                    dq = np.linalg.solve(J.T @ J + 0.05 * np.eye(14), J.T @ e + 0.03 * (q_reg - q_cur[arm_bfs]))
                     q_cur[arm_bfs] = np.clip(
                         q_cur[arm_bfs] + np.clip(dq, -0.14, 0.14),
                         arm_rng[:, 0] * 0.93,
@@ -679,7 +735,7 @@ class _MuJoCoHygieneAuditor:
                     d.qpos[self.p_adr : self.p_adr + 3] = r_pos[t]
                     d.qpos[self.p_adr + 3 : self.p_adr + 7] = r_quat_wxyz[t]
                     d.qpos[self.o_adr : self.o_adr + 3] = o_pos_out[t]
-                    d.qpos[self.o_adr + 3 : self.o_adr + 7] = o_quat_wxyz[t]
+                    d.qpos[self.o_adr + 3 : self.o_adr + 7] = o_quat_out[t]
                     q_cur = q_out[t].copy()
                     for _ in range(8):
                         d.qpos[self.b_adrs] = q_cur
@@ -707,7 +763,7 @@ class _MuJoCoHygieneAuditor:
         finally:
             m.geom_margin[:] = self.orig_geom_margins
 
-        return q_out, o_pos_out
+        return q_out, o_pos_out, o_quat_out
 
     def evaluate_sequence(
         self,
@@ -729,6 +785,9 @@ class _MuJoCoHygieneAuditor:
         min_elbow_dy = 999.0
         max_lifted_hdx = 0.0
         max_lifted_hdz = 0.0
+        max_palm_dz = 0.0
+        max_elbow_dz = 0.0
+        max_box_roll_deg = 0.0
         max_palm_detach = 0.0
         min_box_x = 999.0
         max_box_y = 0.0
@@ -759,7 +818,7 @@ class _MuJoCoHygieneAuditor:
             mujoco.mj_forward(self.model, self.data)
 
             t_pos = self.data.xpos[self.torso_id]
-            _, _, R_tyaw = self._get_torso_horiz_axes(r_quat_wxyz[t])
+            _, left_w, R_tyaw = self._get_torso_horiz_axes(r_quat_wxyz[t])
             lh_w = self.data.xpos[self.lh_id]
             rh_w = self.data.xpos[self.rh_id]
             lh_loc = R_tyaw.T @ (lh_w - t_pos)
@@ -782,6 +841,12 @@ class _MuJoCoHygieneAuditor:
 
                 lh_R = self.data.xmat[self.lh_id].reshape(3, 3)
                 rh_R = self.data.xmat[self.rh_id].reshape(3, 3)
+                p_pad_L = lh_w + lh_R @ self.palm_pad_L_pts[1]
+                p_pad_R = rh_w + rh_R @ self.palm_pad_R_pts[1]
+                max_palm_dz = max(max_palm_dz, abs(float(p_pad_L[2] - p_pad_R[2])))
+                max_elbow_dz = max(max_elbow_dz, abs(float(self.data.xpos[self.le_id, 2] - self.data.xpos[self.re_id, 2])))
+                roll_deg = abs(float(np.degrees(np.arcsin(np.clip(np.dot(o_R[:, 2], left_w), -1.0, 1.0)))))
+                max_box_roll_deg = max(max_box_roll_deg, roll_deg)
                 gL = float(_box_obb_surface_distance(lh_w + self.palm_pad_L_pts @ lh_R.T, o_pos[t], o_R, DIPLO_BOX_HALF_EXT).min())
                 gR = float(_box_obb_surface_distance(rh_w + self.palm_pad_R_pts @ rh_R.T, o_pos[t], o_R, DIPLO_BOX_HALF_EXT).min())
                 cur_gap = max(gL, gR)
@@ -839,7 +904,7 @@ class _MuJoCoHygieneAuditor:
 
         if (check_palm_grasp and min_hand_dy < 0.24) or min_elbow_dy < (0.24 if check_palm_grasp else 0.22):
             return False, f"crossed_or_narrow_arms(dy={min_hand_dy:.3f}m)", {}
-        if (check_palm_grasp and (max_lifted_hdx > 0.11 or max_lifted_hdz > 0.15)) or max_box_y > (0.12 if check_palm_grasp else 0.14) or min_box_x < (0.16 if check_palm_grasp else 0.14):
+        if (check_palm_grasp and (max_lifted_hdx > 0.075 or max_lifted_hdz > 0.055)) or max_box_y > (0.12 if check_palm_grasp else 0.14) or min_box_x < (0.16 if check_palm_grasp else 0.14):
             return False, f"asymmetric_grasp(dx={max_lifted_hdx:.2f},dz={max_lifted_hdz:.2f},by={max_box_y:.2f})", {}
         if min_box_up_z < 0.75:
             return False, f"tilted_box(up_z={min_box_up_z:.3f})", {}
@@ -858,6 +923,10 @@ class _MuJoCoHygieneAuditor:
         mean_palm_z_rel = float(np.mean(palm_z_rels)) if palm_z_rels else 0.0
         max_jvel = float(np.abs(np.gradient(q_bfs, DT, axis=0)).max())
         if check_palm_grasp:
+            if max_palm_dz > 0.045 or max_elbow_dz > 0.065:
+                return False, f"height_asymmetry(palm_dz={max_palm_dz*100:.2f}cm,elbow_dz={max_elbow_dz*100:.2f}cm)", {}
+            if max_box_roll_deg > 5.0:
+                return False, f"box_roll_tilt({max_box_roll_deg:.2f}deg)", {}
             if max_rubber_hand_pen > 0.008:
                 return False, f"rubber_hand_pen({max_rubber_hand_pen*100:.2f}cm)", {}
             if max_wrist_pen > 0.004:
@@ -909,6 +978,9 @@ class _MuJoCoHygieneAuditor:
             "mean_palm_gap_cm": round(mean_palm_gap * 100.0, 2),
             "max_palm_detach_cm": round(max_palm_detach * 100.0, 2),
             "mean_palm_z_rel_cm": round(mean_palm_z_rel * 100.0, 2),
+            "max_palm_dz_cm": round(max_palm_dz * 100.0, 2),
+            "max_elbow_dz_cm": round(max_elbow_dz * 100.0, 2),
+            "max_box_roll_deg": round(max_box_roll_deg, 2),
             "max_joint_vel_rads": round(max_jvel, 2),
         }
         return True, "OK", stats
@@ -1084,7 +1156,7 @@ def main() -> None:
     #    prepend coupled `12x15` Double-Sole Welded Stand-to-Bend, smoothly stretch the pickup-to-standup phase,
     #    and retarget hands onto lower-middle rubber-palm cradle contacts!
     stretch_tag = f"{float(args.pickup_stretch):.2f}".replace(".", "p")
-    core_cache_file = diplo_dir / f".clean_sbto_cores_v7_palmgrasp_{stretch_tag}.pkl"
+    core_cache_file = diplo_dir / f".clean_sbto_cores_v8_sympalmgrasp_{stretch_tag}.pkl"
     all_clean_by_base: dict[str, list[dict]] = {}
     drop_summary: dict[str, int] = {}
 
@@ -1211,8 +1283,8 @@ def main() -> None:
                     n_pre_bend=n_pre_wb,
                     stretch_factor=float(args.pickup_stretch),
                 )
-                # Retarget arms from handless DiPLO wrists to flush rubber-palm lower-mid cradle IK
-                qb_wb, op_wb = auditor.retarget_arms_to_rubber_palm_cradle(
+                # Retarget arms from handless DiPLO wrists to symmetric level rubber-palm box cradle IK
+                qb_wb, op_wb, oq_wb = auditor.retarget_arms_to_rubber_palm_cradle(
                     rp_wb, rq_wb, qb_wb, op_wb, oq_wb
                 )
                 l_idx_wb = np.flatnonzero(op_wb[:, 2] > (float(op_wb[0, 2]) + 0.035))

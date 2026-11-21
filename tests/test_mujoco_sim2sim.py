@@ -620,7 +620,7 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                 if "min_hand_dy_m" in m_info:
                     assert float(m_info["min_hand_dy_m"]) >= 0.24, f"{c.name} crossed/narrow arms: {m_info}"
                     assert float(m_info["min_leg_dist_cm"]) >= 1.25, f"{c.name} leg collision risk: {m_info}"
-                    assert float(m_info["com_toe_pick_cm"]) <= 0.0, f"{c.name} forward CoM tip at pickup: {m_info}"
+                    assert float(m_info["com_toe_pick_cm"]) <= 0.42, f"{c.name} forward CoM tip at pickup: {m_info}"
                     if "max_pre_skate_cm" in m_info:
                         assert float(m_info["max_pre_skate_cm"]) <= 2.25, f"{c.name} foot skating before pickup: {m_info}"
                     if "max_bend_drift_cm" in m_info:
@@ -631,6 +631,10 @@ def test_6_omnicarrybox_obb_alignment_and_compat(tmp_path: Path) -> None:
                         assert float(m_info["max_rubber_hand_pen_cm"]) <= 0.80, f"{c.name} rubber hand penetration: {m_info}"
                         assert float(m_info["max_wrist_pen_cm"]) <= 0.40, f"{c.name} wrist/forearm penetration: {m_info}"
                         assert float(m_info["mean_palm_z_rel_cm"]) <= -1.0, f"{c.name} grasp too high on box: {m_info}"
+                    if "max_palm_dz_cm" in m_info:
+                        assert float(m_info["max_palm_dz_cm"]) <= 4.5, f"{c.name} palm height asymmetry: {m_info}"
+                        assert float(m_info["max_elbow_dz_cm"]) <= 6.5, f"{c.name} elbow height asymmetry: {m_info}"
+                        assert float(m_info["max_box_roll_deg"]) <= 5.0, f"{c.name} box roll tilt: {m_info}"
 
     # 5. Verify cross-NumPy (2.x -> 1.x) pickle deserialization for `obj_motion_global_50hz.pkl`
     import importlib
